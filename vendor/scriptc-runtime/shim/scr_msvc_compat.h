@@ -67,6 +67,18 @@ typedef unsigned int mode_t;
 #ifndef S_ISLNK
 #define S_ISLNK(m) (0) /* UCRT stat never reports links */
 #endif
+#ifndef S_ISFIFO
+#define S_ISFIFO(m) (((m) & _S_IFMT) == _S_IFIFO)
+#endif
+#ifndef S_ISCHR
+#define S_ISCHR(m) (((m) & _S_IFMT) == _S_IFCHR)
+#endif
+#ifndef S_ISBLK
+#define S_ISBLK(m) (0) /* no block-device type in the CRT's stat (no _S_IFBLK) */
+#endif
+#ifndef S_ISSOCK
+#define S_ISSOCK(m) (0) /* no socket bits in the CRT's stat */
+#endif
 
 /* ── fcntl.h gaps ───────────────────────────────────────────────────── */
 #include <fcntl.h>

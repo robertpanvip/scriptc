@@ -34,6 +34,16 @@ extern "C" {
     /// versioned ABI marker — mismatched runtime links fail here
     pub fn scr_runtime_abi_v1();
 
+    // ── program TU entry ────────────────────────────────────────────
+    /// The scriptc-generated program TU (`scriptc build *.ts --backend=c`)
+    /// is compiled with `/Dmain=scr_program_main` (see build.rs), renaming
+    /// its generated `main` so it can be invoked from Rust. Calling it runs
+    /// the full generated preamble: scr_init() → error-vts stamping →
+    /// scr_lib_init(argc, argv) → the mangled TS entry. Provided the TS
+    /// program's top-level/main path terminates, this returns its exit code.
+    /// Provided by the `scriptc-program` static lib (runtime-lab/hello.c).
+    pub fn scr_program_main(argc: std::os::raw::c_int, argv: *mut *mut c_char) -> std::os::raw::c_int;
+
     // ── strings ─────────────────────────────────────────────────────
     pub fn scr_str_new(bytes: *const c_char, len: usize) -> *mut ScrStr; /* +1 */
     pub fn scr_str_release(s: *mut ScrStr); /* NULL-tolerant */
