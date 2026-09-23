@@ -1,0 +1,10 @@
+[package]
+name = "scriptc-runtime-sys"
+version = "0.1.0"
+edition = "2021"
+links = "scriptc-runtime"
+build = "build.rs"
+description = "MSVC-native build of the scriptc (vercel-labs) C runtime for embedding in Rust"
+
+[build-dependencies]
+cc = "1.2"

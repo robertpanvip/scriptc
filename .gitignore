@@ -1,0 +1,22 @@
+# Build artifacts
+target/
+out/
+*.obj
+*.o
+*.lib
+*.a
+
+# Logs
+*.log
+
+# Probe leftovers
+temp-*.obj
+probe*.obj
+
+# Vendored third-party sources are committed intentionally (Apache-2.0/Boost/zlib
+# licenses included) — do NOT ignore vendor/.
+
+# Editor
+.vs/
+.idea/
+.workbuddy/
