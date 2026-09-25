@@ -1,3 +1,49 @@
+# ── upstream (vercel-labs/scriptc) ────────────────────────────────────
+node_modules/
+.pnpm-store/
+# test-fixture packages are TEST DATA, committed on purpose
+!tests/diagnostics/npm-imports/node_modules/
+!tests/fixtures/commander-calc/node_modules/
+!tests/fixtures/npm/node_modules/
+!tests/corpus/*/node_modules/
+!tests/fixtures/npm-static/node_modules/
+!tests/fixtures/npm-static/nested/inner/node_modules/
+!tests/fixtures/npm/store/*/node_modules/
+!tests/fixtures/npm/cases/*/node_modules/
+!tests/library-mode/*/node_modules/
+!tests/fixtures/provenance/node_modules/
+!tests/fixtures/fetch/node_modules/
+!tests/fixtures/gateway-e2e/node_modules/
+!tests/fixtures/node-types/node_modules/
+dist/
+/packages/llvm-darwin-arm64/bin/
+/packages/runtime-darwin-arm64/artifacts/
+/packages/runtime-darwin-arm64/runtime-pack.json
+/packages/runtime-darwin-arm64/.runtime-pack-*
+/packages/llvm-*/bin/
+/packages/runtime-*/artifacts/
+/packages/runtime-*/runtime-pack.json
+/packages/runtime-*/.runtime-pack-*
+!tests/fixtures/fetch/node_modules/eventsource-parser/dist/
+!tests/fixtures/npm/node_modules/*/dist/
+!tests/fixtures/npm/workspace/*/dist/
+!tests/fixtures/npm/cases/workspace-copied/members/*/dist/
+!tests/fixtures/npm/cases/workspace-copied/node_modules/*/dist/
+!tests/fixtures/provenance/node_modules/*/dist/
+.scriptc/
+.DS_Store
+packages/runtime/test/build/
+# lazily built engine archives for --dynamic (see packages/runtime/vendor/README.md)
+packages/runtime/vendor/.cache/
+# fs corpus scratch directories (created in the test cwd, removed on clean runs)
+tmp-*/
+.claude/
+.vercel/
+.env.local
+.env*
+.env*.local
+
+# ── Rust / MSVC embedding work (this fork) ───────────────────────────
 # Build artifacts
 target/
 out/

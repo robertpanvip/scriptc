@@ -1,0 +1,44 @@
+node-fallback-fence.ts:16:1 - error SC2020: 'process.stdin.setEncoding' is part of the standard library types but has no scriptc lowering yet
+
+  15 | process.off("exit", () => {});
+  16 | process.stdin.setEncoding("utf8"); // stays fenced: chunks are bytes
+     | ^~~~~~~~~~~~~~~~~~~~~~~~~
+  17 | const buf = Buffer.from("x", "utf8").reverse(); // from and fill lower; reverse fences
+
+  hint: isTTY, destroy(), on/once of the data/end/error events, and `for await (const chunk of process.stdin)` are the supported stdin surface (or read everything at once: readFileSync(0, "utf8") from node:fs)
+
+node-fallback-fence.ts:17:13 - error SC2020: 'Buffer<ArrayBufferLike>.reverse' is part of the standard library types but has no scriptc lowering yet
+
+  16 | process.stdin.setEncoding("utf8"); // stays fenced: chunks are bytes
+  17 | const buf = Buffer.from("x", "utf8").reverse(); // from and fill lower; reverse fences
+     |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  18 | const enc = new TextEncoder().encode("x");
+
+  hint: the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)
+
+node-fallback-fence.ts:30:28 - error SC2020: 'timers/promises.setInterval with 3 arguments' is part of the standard library types but has no scriptc lowering yet
+
+  29 | const raw = readFileSync("/etc/hosts").toString(tty ? "hex" : "latin1"); // runtime BufferEncoding selection lowers too
+  30 | const intervalWithSignal = promiseInterval(1, "tick", {}); // AbortSignal options stay fenced
+     |                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  31 | // The computed encoding is now part of the static Buffer surface. The
+
+  hint: the lowered form is setInterval(delay, value) with an explicit yielded value; AbortSignal options are not supported yet
+
+node-fallback-fence.ts:35:36 - error SC2020: 'deflateSync with explicit options' is part of the standard library types but has no scriptc lowering yet
+
+  34 | import { brotliCompressSync, deflateSync } from "node:zlib";
+  35 | const packed = deflateSync("data", { level: 9 }); // options remain fenced
+     |                                    ^~~~~~~~~~~~
+  36 | const brotli = brotliCompressSync(Buffer.from("data")); // outside the lowered family: fenced
+
+  hint: deflateSync(data) with Node's default options is supported
+
+node-fallback-fence.ts:36:16 - error SC2020: 'zlib.brotliCompressSync' is part of the standard library types but has no scriptc lowering yet
+
+  35 | const packed = deflateSync("data", { level: 9 }); // options remain fenced
+  36 | const brotli = brotliCompressSync(Buffer.from("data")); // outside the lowered family: fenced
+     |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  37 | // The remaining imports continue the declared-but-not-lowered surface.
+
+  hint: the default-options deflate/inflate, raw, gzip/gunzip, and unzip sync/callback forms plus crc32 are the lowered zlib surface
