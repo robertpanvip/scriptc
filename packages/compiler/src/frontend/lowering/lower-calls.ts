@@ -8,19 +8,19 @@ import type { Lowerer } from "./lowerer.js";
 import { lowerGenMethodCall } from "./lower-generators.js";
 import { BIGINT_T, BOOL, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, STRING, SYMBOL_T, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, canDynCheckTo, canMarshalTypedFuncIntoIsland, ffiClassType, ffiSourceParamTypes, funcOf, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isUnitType, shapeHasAccessorSlots, typeEquals } from "../../ir/ir.js";
 import type { IrFfiCallbackParam, IrFfiCallbackParamClass, IrFfiImport, IrFfiReleaseParam } from "../../ir/ir.js";
-import { isJsSourceFile, locOf } from "../program.js";
+import { isJsSourceFile, isNodeEsmFile, locOf } from "../program.js";
 import { genResultRecord, isGenericCallableMemberType, typeKey } from "../type-mapper.js";
 import { PoisonError, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, newFnCtx, nodeThrowExpr, staticImportNamespaceType } from "./lowerer.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
-import { NARROW_FIRST, builtinFenceHintOf, builtinModuleFnOf } from "./surfaces.js";
+import { NARROW_FIRST, STR_METHODS, builtinFenceHintOf, builtinModuleFnOf } from "./surfaces.js";
 import { ffiBindingDiag, ffiSignatureDiag, libCallbackDiag, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { mixinFnShapeOf } from "./lower-mixins.js";
 import { dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerTupleReadMethodCall } from "./lower-containers.js";
 import { bufEncoding } from "./containers/bytes.js";
-import { lowerRegexMethodCall, lowerStringMethodCall } from "./containers/string-and-regexp.js";
+import { lowerRegexMethodCall, lowerStringMethodCall, lowerStringPaddingCall, lowerStringSplitCall } from "./containers/string-and-regexp.js";
 import { lowerChildStreamMethodCall, lowerChildWriterMethodCall, lowerCreateRequireCall, lowerCryptoHashMethodCall, lowerDirentMethodCall, lowerFileHandleMethodCall, lowerImportMetaResolveCall, lowerNodeModuleCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerRequireResolveCall, lowerWatcherMethodCall } from "./lower-builtins.js";
-import { lowerAbsenceProbe, lowerPromiseAllTupleCall, lowerPromiseRejectCall, templateRawTextOf } from "./lower-exprs.js";
+import { lowerAbsenceProbe, lowerPromiseAllTupleCall, lowerPromiseRejectCall, stringWrapperToString, templateRawTextOf } from "./lower-exprs.js";
 import { isSafeToDiscard } from "./expressions/evaluation-safety.js";
 import { tryLowerExpression } from "./expressions/try-lower-expression.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerCompatReqStreamOptionalCall, lowerHttpClientFnCall } from "./lower-server.js";
@@ -35,7 +35,7 @@ import { npmStaticPackageOfPath } from "../npm-static.js";
 import { countedFor, varRef } from "../../ir/build.js";
 import { rejectStaticThis } from "./static-this.js";
 import { fenceNodeModuleMutationCall, lowerRequireCacheKeys } from "./lower-node-module.js";
-import { lowerOptionalArgument } from "./optional-arguments.js";
+import { defaultAfterUndefined, lowerOptionalArgument, lowerStaticallyUndefinedArgument, positionNumber } from "./optional-arguments.js";
 
 /** How a parameter participates in CALL-SITE COMPLETION (the frontend
  * completes every call to the one full signature, so the IR and backends
@@ -43,8 +43,9 @@ import { lowerOptionalArgument } from "./optional-arguments.js";
  * `omittable` params (declared `x?: T` or `x: T = e`) may be omitted by a
  * trailing-suffix call, and the frontend appends the interned undefined arm;
  * `rest` (always last) receives the surplus arguments packed into one array
- * literal at each call site. */
-export type ParamMode = "required" | "omittable" | "rest" | "dynRest" | "islandRest";
+ * literal at each call site. `arguments` is a hidden slot containing every
+ * actual argument, including those bound to named parameters. */
+export type ParamMode = "required" | "omittable" | "rest" | "dynRest" | "islandRest" | "arguments";
 
 /** One parameter of a signature, as call sites and callee prologues see it.
  * `type` is the ABI type — what the emitted C parameter carries: the
@@ -86,12 +87,14 @@ export function funcTypeFromParamShapes(
 ): IrType & { kind: "func" } {
   const typedRest = shapes.some((shape) => shape.mode === "rest");
   const dynRest = shapes.some((shape) => shape.mode === "dynRest");
+  const argumentsAll = shapes.some((shape) => shape.mode === "arguments");
   const islandRest = shapes.some((shape) => shape.mode === "islandRest");
   return {
     kind: "func",
-    params: shapes.filter((shape) => shape.mode !== "dynRest").map((shape) => shape.type),
+    params: shapes.filter((shape) => shape.mode !== "dynRest" && shape.mode !== "arguments").map((shape) => shape.type),
     ret,
-    ...(typedRest || dynRest || islandRest ? { rest: true as const } : {}),
+    ...(typedRest || dynRest || islandRest || argumentsAll ? { rest: true as const } : {}),
+    ...(argumentsAll ? { argumentsAll: true as const } : {}),
     ...(typedRest
       ? { restAbi: "typed" as const }
       : islandRest
@@ -543,8 +546,39 @@ export interface GenericInstance {
         });
       });
     }
-    const restAt = shapes.findIndex((s) => s.mode === "rest" || s.mode === "dynRest" || s.mode === "islandRest");
+    const restAt = shapes.findIndex((s) => s.mode === "rest" || s.mode === "dynRest" || s.mode === "islandRest" || s.mode === "arguments");
     const positional = restAt >= 0 ? shapes.slice(0, restAt) : [...shapes];
+    if (restAt >= 0 && shapes[restAt]!.mode === "arguments") {
+      // JS `arguments` contains every supplied value, including fixed
+      // parameters. Store each call expression once, in source order, so
+      // both the native parameter slots and the full array read it.
+      const stmts: IrStmt[] = [];
+      const passed: IrExpr[] = sources.map((source, i) => {
+        if (!isIr(source) && ts.isSpreadElement(source)) {
+          lowerer.unsupported("SC1090", source, "spread arguments into fixed parameter positions (a spread can only fill a rest parameter)");
+        }
+        const slotType = i < restAt ? positional[i]!.type : DYN;
+        const value = isIr(source)
+          ? lowerer.coerceInto(blame, source.ir, slotType)
+          : lowerer.lowerExprExpecting(source, slotType);
+        const saved = lowerer.declareHiddenLocal("%callArg", slotType);
+        stmts.push({ kind: "varDecl", localId: saved.id, init: value, loc: value.loc });
+        return { kind: "varRef", localId: saved.id, type: slotType, loc: value.loc };
+      });
+      const fixed = positional.map((shape, i): IrExpr => {
+        if (i < passed.length) return passed[i]!;
+        if (shape.mode === "omittable") return shape.callDefault ?? lowerer.undefinedArgFor(shape.type, loc, blame);
+        if (shape.type.kind === "dyn") return { kind: "dynFrom", value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc }, type: DYN, loc };
+        lowerer.unsupported("SC1090", blame, "this call form");
+      });
+      const elems = passed.map((value) => lowerer.coerceInto(blame, value, DYN));
+      const full: IrExpr = { kind: "dynArrLit", elems, type: DYN, loc };
+      const out = [...fixed, full];
+      if (stmts.length > 0) {
+        out[0] = { kind: "seqExpr", stmts, result: out[0]!, type: out[0]!.type, loc };
+      }
+      return out;
+    }
     const out: IrExpr[] = positional.map((shape, i) => {
       const src = sources[i];
       if (isIr(src)) return lowerer.coerceInto(blame, src.ir, shape.type);
@@ -796,6 +830,7 @@ function completeFuncValueArgs(
         (s) =>
           s.mode === "required" ||
           s.mode === "dynRest" ||
+          s.mode === "arguments" ||
           s.mode === "islandRest" ||
           (s.mode === "omittable" && (s.type.kind === "dyn" || s.type.kind === "jsval")),
       )
@@ -1120,24 +1155,18 @@ export function collectSignatureInner(lowerer: Lowerer, decl: ts.FunctionDeclara
     }
 
     const params = lowerer.paramShapes(decl.parameters);
-    // The VARIADIC `arguments` form on a DECLARED function: same rule as
-    // lambdas (lambdaSignature) — zero declared params, the body reads
-    // `arguments`, a synthetic trailing dynRest shape carries the call's
-    // arguments (completeArgs packs direct calls; the boxed thunk packs
-    // indirect ones; lowerFunction declares the `arguments` local).
+    // A declared function reading `arguments` receives a hidden dyn array.
+    // The zero-parameter form uses the existing rest pack; named parameters
+    // use the full argument pack for both direct and boxed calls.
     if (
-      !params.some((sh) => sh.mode === "dynRest") &&
+      !params.some((sh) => sh.mode === "rest" || sh.mode === "dynRest" || sh.mode === "islandRest") &&
       isJsSourceFile(decl.getSourceFile()) &&
       bodyReadsArguments(decl)
     ) {
-      if (decl.parameters.length > 0) {
-        lowerer.unsupported(
-          "SC1090",
-          decl,
-          "'arguments' in functions with declared parameters (use a rest parameter: (...args))",
-        );
+      if (decl.parameters.length > 0 && !isNodeEsmFile(decl.getSourceFile())) {
+        lowerer.unsupported("SC1090", decl, "parameterized 'arguments' outside an ES module (sloppy-mode parameter aliases)");
       }
-      params.push({ type: DYN, mode: "dynRest" });
+      params.push({ type: DYN, mode: decl.parameters.length > 0 ? "arguments" : "dynRest" });
     }
     const nameBlame: ts.Node = decl.name ?? decl;
     const returnType = lowerer.declaredReturnType(decl, nameBlame);
@@ -3736,13 +3765,12 @@ export function lowerCall(lowerer: Lowerer, expr: ts.CallExpression): IrExpr {
     // String(x) is exactly the template-literal ToString, Boolean(x) is
     // exactly the condition ToBoolean (union arms included), Number(x) is
     // ToNumber where it lowers exactly: numbers pass through, booleans
-    // become 1/0, and strings run the runtime's ECMA-exact
-    // StringToNumber (num.fromString — the full StringNumericLiteral
-    // grammar, scr_string.c). Other argument types (unions included —
-    // narrow first) keep the fence.
+    // become 1/0, null becomes 0, and undefined becomes NaN. Strings use
+    // the runtime's StringToNumber parser (num.fromString — the full
+    // StringNumericLiteral grammar in scr_string.c).
     // Provenance-checked like setTimeout; zero-arg forms are the JS
-    // constants ("", false, 0). `new String(...)` (wrapper objects) stays
-    // on the SC2020 fence.
+    // constants ("", false, 0). Wrapper objects stay fenced except where
+    // the receiver is immediately converted by a direct String method call.
     if (
       ts.isIdentifier(expr.expression) &&
       expr.expression.text === "BigInt" &&
@@ -3803,34 +3831,9 @@ export function lowerCall(lowerer: Lowerer, expr: ts.CallExpression): IrExpr {
       // representation (`Boolean(rec && list.some(f))` — a record and a
       // bool) that a value lowering of the `&&` would fence on.
       if (name === "Boolean") return lowerer.lowerCondition(argNode);
+      if (name === "Number") return lowerNumberConstructorValue(lowerer, argNode, loc);
       const arg = lowerer.lowerExpr(argNode);
       if (name === "String") return lowerer.ensureString(arg, argNode);
-      if (name === "Number" && arg.type.kind === "bigint") {
-        return { kind: "libCall", fn: "bigint.toF64", args: [arg], type: F64, loc };
-      }
-      if (arg.type.kind === "f64") return arg;
-      if (arg.type.kind === "bool") {
-        return {
-          kind: "ternary",
-          cond: arg,
-          then: { kind: "numLit", value: 1, type: F64, loc },
-          else_: { kind: "numLit", value: 0, type: F64, loc },
-          type: F64,
-          loc,
-        };
-      }
-      if (arg.type.kind === "string") {
-        return { kind: "libCall", fn: "num.fromString", args: [arg], type: F64, loc };
-      }
-      const optionalNumber = lowerOptionalStringNumber(lowerer, arg, loc);
-      if (optionalNumber) return optionalNumber;
-      lowerer.noLowering(
-        `Number of ${lowerer.fmt(arg.type)} values`,
-        argNode,
-        arg.type.kind === "union"
-          ? "numbers, booleans, and strings lower (the full ToNumber string grammar included) — narrow the union first"
-          : undefined,
-      );
     }
 
     // __island_eval: the internal island testing hook (eval in the embedded
@@ -4617,11 +4620,12 @@ export function lowerCall(lowerer: Lowerer, expr: ts.CallExpression): IrExpr {
         // TestContext surface (t.test/t.skip/t.diagnostic), t.assert.*.
         lowerer.lowerTestMethodCall(expr, expr.expression) ??
         lowerer.lowerTimeoutMethodCall(expr, expr.expression) ??
+        lowerStringPrototypeCall(lowerer, expr, expr.expression) ??
         lowerStringMethodCallWithOptionalArgs(lowerer, expr, expr.expression) ??
         // Typed-array/Buffer receivers and the Buffer statics — before the
         // island path (bytes never cross the boundary).
         lowerer.lowerBytesMethodCall(expr, expr.expression) ??
-        lowerBufferStaticCallWithOptionalArg(lowerer, expr, expr.expression) ??
+        lowerBufferStaticCallWithNarrowedArg(lowerer, expr, expr.expression) ??
         // URL.revokeObjectURL's zero-argument contract (the one-argument
         // form keeps the fence — createObjectURL does too).
         lowerUrlStaticCall(lowerer, expr, expr.expression) ??
@@ -4914,25 +4918,34 @@ function optionalCallValue(lowerer: Lowerer, node: ts.Expression): IrExpr | null
   return lowerer.runtimeOptionalIdentifierValue(node)?.value ?? lowerAbsenceProbe(lowerer, node);
 }
 
-function lowerBufferStaticCallWithOptionalArg(
+function lowerBufferStaticCallWithNarrowedArg(
   lowerer: Lowerer,
   call: ts.CallExpression,
   access: ts.PropertyAccessExpression,
 ): IrExpr | null {
   const lowered = lowerer.lowerBufferStaticCall(call, access);
   if (lowered?.kind !== "bytesNew" || !lowered.source || lowered.source.type.kind !== "union") return lowered;
-  const present = lowerer.stripUndefinedArm(lowered.source.type);
-  const validSource =
-    (present.kind === "array" && present.elem.kind === "f64") ||
-    (present.kind === "bytes" && present.elem === "u8");
-  if (!validSource) return lowered;
-  const helper = lowerer.narrowedArmHelper(lowered.source.type.unionId, present, lowered.source.loc);
-  return helper
-    ? {
-        ...lowered,
-        source: { kind: "call", callee: helper, args: [lowered.source], type: present, loc: lowered.source.loc },
-      }
-    : lowered;
+  // A callback can store a wider union than the checker sees at this use
+  // (including an added undefined arm). Extract the exact arm proven by
+  // control-flow narrowing, not merely the union with undefined removed.
+  const narrowed = lowerer.mapTypeOf(lowerer.typeOf(call.arguments[0]!));
+  if (
+    !narrowed ||
+    !(narrowed.kind === "f64" ||
+      (narrowed.kind === "array" && narrowed.elem.kind === "f64") ||
+      (narrowed.kind === "bytes" && narrowed.elem === "u8")) ||
+    lowerer.armTag(lowered.source.type.unionId, narrowed) < 0
+  ) {
+    lowerer.unsupported("SC1090", call.arguments[0]!, "a Buffer constructor argument whose narrowed type is not a stored source arm");
+  }
+  const helper = lowerer.narrowedArmHelper(lowered.source.type.unionId, narrowed, lowered.source.loc);
+  if (!helper) {
+    lowerer.unsupported("SC1090", call.arguments[0]!, "a Buffer constructor argument whose narrowed type is not a stored source arm");
+  }
+  return {
+    ...lowered,
+    source: { kind: "call", callee: helper, args: [lowered.source], type: narrowed, loc: lowered.source.loc },
+  };
 }
 
 function lowerOptionalNumberDefault(
@@ -4981,14 +4994,16 @@ function lowerStringMethodCallWithOptionalArgs(
   lowerer: Lowerer,
   call: ts.CallExpression,
   access: ts.PropertyAccessExpression,
+  receiver?: () => IrExpr,
+  argumentNodes: readonly ts.Expression[] = call.arguments,
 ): IrExpr | null {
-  const lowered = lowerer.lowerStringMethodCall(call, access);
+  const lowered = lowerStringMethodCall(lowerer, call, access, receiver, argumentNodes);
   if (lowered?.kind !== "strIntrinsic") return lowered;
   const args = [...lowered.args];
   let changed = false;
   const zeroDefaultArgs =
     lowered.method === "charCodeAt" || lowered.method === "charAt" ||
-      lowered.method === "repeat" || lowered.method === "padStart" || lowered.method === "padEnd"
+      lowered.method === "repeat"
       ? [0]
       : lowered.method === "slice" || lowered.method === "substring"
         ? [0]
@@ -5010,10 +5025,170 @@ function lowerStringMethodCallWithOptionalArgs(
     args[0]?.type.kind === "union" &&
     lowerer.runtimeOptionalWidening(args[0].type, STRING) !== null
   ) {
-    args[0] = lowerer.ensureString(args[0], call.arguments[0]!);
+    args[0] = lowerer.ensureString(args[0], argumentNodes[0]!);
     changed = true;
   }
   return changed ? { ...lowered, args } : lowered;
+}
+
+function lowerNumberConstructorValue(lowerer: Lowerer, argNode: ts.Expression, loc: SrcLoc): IrExpr {
+  const undefinedArg = lowerStaticallyUndefinedArgument(lowerer, argNode);
+  if (undefinedArg) {
+    return defaultAfterUndefined(undefinedArg, {
+      kind: "bin", op: "/", left: { kind: "numLit", value: 0, type: F64, loc },
+      right: { kind: "numLit", value: 0, type: F64, loc }, type: F64, loc,
+    });
+  }
+  const arg = lowerer.lowerExpr(argNode);
+  if (arg.type.kind === "nullT") return defaultAfterUndefined(arg, { kind: "numLit", value: 0, type: F64, loc });
+  if (arg.type.kind === "bigint") return { kind: "libCall", fn: "bigint.toF64", args: [arg], type: F64, loc };
+  if (arg.type.kind === "f64") return arg;
+  if (arg.type.kind === "bool") {
+    return {
+      kind: "ternary",
+      cond: arg,
+      then: { kind: "numLit", value: 1, type: F64, loc },
+      else_: { kind: "numLit", value: 0, type: F64, loc },
+      type: F64,
+      loc,
+    };
+  }
+  if (arg.type.kind === "string") return { kind: "libCall", fn: "num.fromString", args: [arg], type: F64, loc };
+  const optionalNumber = lowerOptionalStringNumber(lowerer, arg, loc);
+  if (optionalNumber) return optionalNumber;
+  const scalarUnionNumber = lowerScalarUnionNumber(lowerer, arg, argNode, loc);
+  if (scalarUnionNumber) return scalarUnionNumber;
+  return lowerer.noLowering(
+    `Number of ${lowerer.fmt(arg.type)} values`,
+    argNode,
+    arg.type.kind === "union"
+      ? "unions of numbers, booleans, strings, null, and undefined lower — narrow other arms first"
+      : undefined,
+  );
+}
+
+function immediatePrimitiveWrapperToString(lowerer: Lowerer, node: ts.Expression): IrExpr | null {
+  const stringValue = stringWrapperToString(lowerer, node);
+  if (stringValue) return stringValue;
+  let wrapped = node;
+  while (ts.isParenthesizedExpression(wrapped)) wrapped = wrapped.expression;
+  if (!ts.isNewExpression(wrapped) || !ts.isIdentifier(wrapped.expression)) return null;
+  const name = wrapped.expression.text;
+  if ((name !== "Boolean" && name !== "Number") ||
+      !lowerer.isStdlibSymbol(lowerer.resolveValueSymbol(wrapped.expression) ?? undefined)) return null;
+  const args = wrapped.arguments ?? [];
+  if (args.length > 1 || args.some(ts.isSpreadElement)) return null;
+  const loc = locOf(wrapped);
+  const primitive: IrExpr = name === "Boolean"
+    ? args.length ? lowerer.lowerCondition(args[0]!) : { kind: "boolLit", value: false, type: BOOL, loc }
+    : args.length ? lowerNumberConstructorValue(lowerer, args[0]!, loc) : { kind: "numLit", value: 0, type: F64, loc };
+  return lowerer.ensureString(primitive, wrapped);
+}
+
+function plainObjectCoercionReceiver(lowerer: Lowerer, node: ts.Expression): boolean {
+  const plainLiteral = (literal: ts.ObjectLiteralExpression): boolean => literal.properties.every((prop) =>
+    ts.isPropertyAssignment(prop) &&
+    (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name) || ts.isNumericLiteral(prop.name)) &&
+    prop.name.text !== "__proto__");
+  let value = node;
+  while (ts.isParenthesizedExpression(value)) value = value.expression;
+  if (ts.isObjectLiteralExpression(value)) return plainLiteral(value);
+  if (!ts.isIdentifier(value)) return false;
+  const symbol = lowerer.resolveValueSymbol(value);
+  const decl = symbol ? lowerer.checker.valueDeclarationOf(symbol) : undefined;
+  if (!symbol || !decl || !ts.isVariableDeclaration(decl) || !decl.initializer ||
+      !ts.isObjectLiteralExpression(decl.initializer) || !plainLiteral(decl.initializer)) return false;
+  return bindingNeverReassigned(lowerer, symbol, decl);
+}
+
+function lowerStringPrototypeCall(
+  lowerer: Lowerer,
+  call: ts.CallExpression,
+  access: ts.PropertyAccessExpression,
+): IrExpr | null {
+  if (access.name.text !== "call" || !ts.isPropertyAccessExpression(access.expression)) return null;
+  const methodAccess = access.expression;
+  const prototypeAccess = methodAccess.expression;
+  if (!ts.isPropertyAccessExpression(prototypeAccess) || prototypeAccess.name.text !== "prototype" ||
+      !ts.isIdentifier(prototypeAccess.expression) || prototypeAccess.expression.text !== "String" ||
+      !Object.hasOwn(STR_METHODS, methodAccess.name.text) || !lowerer.isStdlibMember(methodAccess)) return null;
+  if (call.arguments.some(ts.isSpreadElement)) return null;
+  const entry = STR_METHODS[methodAccess.name.text]!;
+  const method = methodAccess.name.text === "trimStart" ? "trimLeft" :
+    methodAccess.name.text === "trimEnd" ? "trimRight" : methodAccess.name.text;
+  const loc = locOf(call);
+  const nullishError = nodeThrowExpr(1, "", `String.prototype.${method} called on null or undefined`, entry.result, loc);
+  const receiverNode = call.arguments[0];
+  if (!receiverNode) return nullishError;
+  // Receiver coercion runs after .call has evaluated its arguments; keep
+  // contextual wrapper lowering on forms without later method arguments.
+  const immediateWrapper = entry.maxArgs === 0 && call.arguments.length === 1
+    ? immediatePrimitiveWrapperToString(lowerer, receiverNode) : null;
+  const receiverValue = immediateWrapper ?? lowerer.lowerExpr(receiverNode);
+  const receiverType = receiverValue.type;
+  const nullish = isUnitType(receiverType) || receiverType.kind === "void" ||
+    (receiverType.kind === "union" && (lowerer.unions.get(receiverType.unionId)?.arms.every((arm) =>
+      isUnitType(arm) || arm.kind === "void") ?? false));
+  if (nullish) {
+    const values = [receiverValue, ...call.arguments.slice(1).map((arg) => lowerer.lowerExpr(arg))];
+    return {
+      kind: "seqExpr",
+      stmts: values.filter((value) => !isSafeToDiscard(value)).map((value) => ({ kind: "exprStmt", expr: value, loc: value.loc })),
+      result: nullishError,
+      type: entry.result,
+      loc,
+    };
+  }
+  const padding = entry.method === "padStart" || entry.method === "padEnd";
+  const scalar = receiverType.kind === "string" || receiverType.kind === "f64" ||
+    receiverType.kind === "bool" || receiverType.kind === "bigint" ||
+    (receiverType.kind === "union" && (lowerer.unions.get(receiverType.unionId)?.arms.every((arm) =>
+      arm.kind === "string" || arm.kind === "f64" || arm.kind === "bool" || arm.kind === "bigint") ?? false));
+  // Other methods convert object receivers before lowering their arguments;
+  // padding uses a helper that delays conversion until every argument is ready.
+  const objectWithoutMethodArgs = entry.maxArgs === 0 && call.arguments.length === 1 &&
+    (receiverType.kind === "record" || receiverType.kind === "array" || receiverType.kind === "object");
+  const dynObjectWithoutMethodArgs = entry.maxArgs === 0 && call.arguments.length === 1 &&
+    receiverType.kind === "dyn" && plainObjectCoercionReceiver(lowerer, receiverNode);
+  if (!scalar && !objectWithoutMethodArgs && !dynObjectWithoutMethodArgs && !(padding && receiverType.kind === "dyn")) {
+    return lowerer.noLowering(`String.prototype.${methodAccess.name.text}.call with ${lowerer.fmt(receiverType)} receivers`, call);
+  }
+  if (padding) {
+    return lowerStringPaddingCall(lowerer, call, entry.method as "padStart" | "padEnd", receiverValue, receiverNode, call.arguments.slice(1));
+  }
+  if (entry.method === "split") {
+    return lowerStringSplitCall(lowerer, call, receiverValue, receiverNode, call.arguments.slice(1));
+  }
+  const receiver: IrExpr = dynObjectWithoutMethodArgs
+    ? { kind: "libCall", fn: "dyn.toStringCoerce", args: [receiverValue], type: STRING, loc }
+    : lowerer.ensureString(receiverValue, receiverNode);
+  return lowerStringMethodCallWithOptionalArgs(lowerer, call, methodAccess, () => receiver, call.arguments.slice(1));
+}
+
+function lowerScalarUnionNumber(lowerer: Lowerer, arg: IrExpr, node: ts.Expression, loc: SrcLoc): IrExpr | null {
+  if (arg.type.kind !== "union" || !lowerer.unions.get(arg.type.unionId)?.arms.every(
+    (arm) => arm.kind === "f64" || arm.kind === "string" || arm.kind === "bool" || isUnitType(arm)
+  )) return null;
+  const key = `number.scalar:${arg.type.unionId}`;
+  let helper = lowerer.widthHelpers.get(key);
+  if (!helper) {
+    helper = `%number.scalar.${lowerer.widthHelpers.size}`;
+    lowerer.widthHelpers.set(key, helper);
+    const value = varRef("value.0", arg.type, loc);
+    const nan: IrExpr = {
+      kind: "bin", op: "/", left: { kind: "numLit", value: 0, type: F64, loc },
+      right: { kind: "numLit", value: 0, type: F64, loc }, type: F64, loc,
+    };
+    lowerer.liftedFns.push({
+      name: helper,
+      params: [{ localId: "value.0", name: "value", type: arg.type }],
+      returnType: F64,
+      locals: [{ id: "value.0", name: "value", type: arg.type, mutable: false }],
+      body: [{ kind: "return", value: positionNumber(lowerer, value, nan, node, "Number argument"), loc }],
+      loc,
+    });
+  }
+  return { kind: "call", callee: helper, args: [arg], type: F64, loc };
 }
 
 function lowerOptionalStringNumber(
@@ -6423,31 +6598,24 @@ function loweredTemplateStrings(
         ret = VOID;
       }
     }
-    // VARIADIC JS functions: a dynRest param (above), or a plain function
-    // whose body reads `arguments` (test/common's mustCall wrapper —
-    // `function() { ...; return fn.apply(this, arguments); }`). Both mark
-    // the func type `rest`: the lifted body takes one trailing dyn-array
-    // param, filled by the boxed call thunk with the call's arguments
-    // from index params.length on. `arguments` is only claimed in
-    // ZERO-param functions (there it IS the surplus array); alongside
-    // declared params the alias story has no model — the fence says to
-    // use a rest parameter. Arrows never claim it (JS: an arrow's
-    // `arguments` is the enclosing function's).
-    const hasDynRest = shapes.some((s) => s.mode === "dynRest");
+    // A plain JS function reading `arguments` receives one hidden dyn
+    // array. With named parameters, the array contains every actual
+    // argument and only ES modules are admitted: sloppy-mode arguments
+    // alias named parameters. Arrows inherit the enclosing `arguments`.
+    const hasRest = shapes.some((s) => s.mode === "rest" || s.mode === "dynRest" || s.mode === "islandRest");
     const usesArguments =
-      !hasDynRest &&
-      !ts.isArrowFunction(node) &&
+      !hasRest &&
+      (ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node)) &&
       isJsSourceFile(node.getSourceFile()) &&
       bodyReadsArguments(node);
     if (usesArguments && node.parameters.length > 0) {
-      lowerer.unsupported(
-        "SC1090",
-        node,
-        "'arguments' in functions with declared parameters (use a rest parameter: (...args))",
-      );
+      if (!isNodeEsmFile(node.getSourceFile())) {
+        lowerer.unsupported("SC1090", node, "parameterized 'arguments' outside an ES module (sloppy-mode parameter aliases)");
+      }
+      shapes.push({ type: DYN, mode: "arguments" });
     }
     const funcType = funcTypeFromParamShapes(shapes, ret);
-    if (usesArguments && !hasDynRest) funcType.rest = true;
+    if (usesArguments) funcType.rest = true;
     return { shapes, funcType };
   }
 
@@ -6535,9 +6703,9 @@ function loweredTemplateStrings(
     lowerer.fnStack.push(fnCtx);
     try {
       const { params, prologue } = lowerer.declareParams(node.parameters, shapes);
-      // The VARIADIC `arguments` form (rest-marked with no declared rest
-      // param): a synthetic trailing dyn-array param carries the call's
-      // arguments; `arguments` reads resolve to it (identifier lowering).
+      // The synthetic trailing dyn-array param carries `arguments`.
+      // Parameterized functions receive all actual arguments; zero-param
+      // functions receive the same array through their rest ABI.
       if (funcType.rest && !shapes.some((s) => s.mode === "dynRest" || s.mode === "islandRest")) {
         const argsLocal = lowerer.declareHiddenLocal("%arguments", DYN);
         params.push({ localId: argsLocal.id, name: "%arguments", type: DYN });
@@ -8742,10 +8910,9 @@ export function lowerFunction(lowerer: Lowerer, decl: ts.FunctionDeclaration): I
     lowerer.fnStack.push(ctx);
     try {
       const { params, prologue } = lowerer.declareParams(decl.parameters, sig.params);
-      // The synthetic `arguments` slot (a dynRest shape BEYOND the declared
-      // parameters — collectSignatureInner appended it): one trailing
-      // dyn-array param, resolved by `arguments` reads.
-      if (sig.params.length > decl.parameters.length && sig.params[sig.params.length - 1]!.mode === "dynRest") {
+      // The synthetic `arguments` slot follows the declared parameters;
+      // reads resolve to this dyn array.
+      if (sig.params.length > decl.parameters.length && (sig.params[sig.params.length - 1]!.mode === "dynRest" || sig.params[sig.params.length - 1]!.mode === "arguments")) {
         const argsLocal = lowerer.declareHiddenLocal("%arguments", DYN);
         params.push({ localId: argsLocal.id, name: "%arguments", type: DYN });
         ctx.argumentsLocal = argsLocal;

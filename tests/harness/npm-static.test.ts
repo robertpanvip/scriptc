@@ -384,6 +384,62 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
     expect(coverage.diagnostics[0]?.message).toMatch(/console\.log of 'any'/);
   }, 120_000);
 
+  test("opted-in npm packages retain imports deeper than four JavaScript modules", async () => {
+    const entry = join(pilotRoot, "deepchain-cli.ts");
+    const { coverage } = analyze(entry, { npmStatic: ["deepchain"] });
+    expect(coverage.npmStatic).toEqual([{ package: "deepchain", status: "static" }]);
+    expect(coverage.preflightFailed).toBe(false);
+    expect(coverage.diagnostics).toHaveLength(0);
+    const binary = await buildStatic(entry, ["deepchain"]);
+    const [nodeRes, nativeRes] = await Promise.all([runBinary("node", [entry]), runBinary(binary, [])]);
+    expect(nativeRes.stdout).toEqual(nodeRes.stdout);
+    expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  }, 180_000);
+
+  test("the published Effect Function subpath initializes and runs statically", async () => {
+    const entry = join(pilotRoot, "effect-function-cli.ts");
+    const { coverage } = analyze(entry, { npmStatic: ["effect"] });
+    expect(coverage.npmStatic).toEqual([{ package: "effect", status: "static" }]);
+    expect(coverage.preflightFailed).toBe(false);
+    expect(coverage.diagnostics).toHaveLength(0);
+    const binary = await buildStatic(entry, ["effect"]);
+    const [nodeRes, nativeRes] = await Promise.all([runBinary("node", [entry]), runBinary(binary, [])]);
+    expect(nativeRes.stdout).toEqual(nodeRes.stdout);
+    expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  }, 180_000);
+
+  test.for([
+    ["purebarrel", "purebarrel-cli.ts"],
+    ["statefulbarrel", "statefulbarrel-cli.ts"],
+    ["statefulbarrel", "statefulbarrel-empty-cli.ts"],
+  ] as const)("%s namespace re-exports byte-match Node", async ([pkg, file]) => {
+    const entry = join(pilotRoot, file);
+    const { coverage } = analyze(entry, { npmStatic: [pkg] });
+    expect(coverage.npmStatic).toEqual([{ package: pkg, status: "static" }]);
+    expect(coverage.preflightFailed).toBe(false);
+    expect(coverage.diagnostics).toHaveLength(0);
+    const binary = await buildStatic(entry, [pkg]);
+    const [nodeRes, nativeRes] = await Promise.all([runBinary("node", [entry]), runBinary(binary, [])]);
+    expect(nativeRes.stdout).toEqual(nodeRes.stdout);
+    expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  }, 180_000);
+
+  test("a cyclic package tree retains an impure dependency through an unused namespace re-export", async () => {
+    const entry = join(pilotRoot, "cycle-cli.ts");
+    const packages = ["cycle-a", "cycle-b", "cycle-impure"];
+    const { coverage } = analyze(entry, { npmStatic: packages });
+    expect(coverage.preflightFailed).toBe(false);
+    expect(coverage.diagnostics).toHaveLength(0);
+    const binary = await buildStatic(entry, packages);
+    const [nodeRes, nativeRes] = await Promise.all([runBinary("node", [entry]), runBinary(binary, [])]);
+    expect(nativeRes.stdout).toEqual(nodeRes.stdout);
+    expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  }, 180_000);
+
   // WORKSPACE-LINKED packages: node_modules/wslinked is a symlink whose
   // realpath lies outside every node_modules (the monorepo-internal
   // install every workspace tool produces). The opt-in compiles its

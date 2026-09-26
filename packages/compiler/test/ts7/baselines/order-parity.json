@@ -6895,15 +6895,153 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/3021-buffer-union-narrow-callback.ts": {
+   "order": [
+    "<repo>/tests/corpus/3021-buffer-union-narrow-callback.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3022-string-affix-positions.ts": {
+   "order": [
+    "<repo>/tests/corpus/3022-string-affix-positions.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3023-string-affix-position-coercion.js": {
+   "order": [
+    "<repo>/tests/corpus/3023-string-affix-position-coercion.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3024-string-number-narrow-for-in.ts": {
+   "order": [
+    "<repo>/tests/corpus/3024-string-number-narrow-for-in.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3025-string-search-position-coercion.js": {
+   "order": [
+    "<repo>/tests/corpus/3025-string-search-position-coercion.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3026-array-last-index-of.js": {
+   "order": [
+    "<repo>/tests/corpus/3026-array-last-index-of.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3027-array-last-index-of-records.ts": {
+   "order": [
+    "<repo>/tests/corpus/3027-array-last-index-of-records.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3028-string-search-dynamic-needle.js": {
+   "order": [
+    "<repo>/tests/corpus/3028-string-search-dynamic-needle.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3029-string-search-union-needle.js": {
+   "order": [
+    "<repo>/tests/corpus/3029-string-search-union-needle.js"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/303-break-continue.ts": {
    "order": [
     "<repo>/tests/corpus/303-break-continue.ts"
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/3030-array-search-no-arg.js": {
+   "order": [
+    "<repo>/tests/corpus/3030-array-search-no-arg.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3031-string-last-index-search-value.js": {
+   "order": [
+    "<repo>/tests/corpus/3031-string-last-index-search-value.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3032-string-search-value.js": {
+   "order": [
+    "<repo>/tests/corpus/3032-string-search-value.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3033-string-search-needle-coercion.js": {
+   "order": [
+    "<repo>/tests/corpus/3033-string-search-needle-coercion.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3034-arguments-with-parameters.js": {
+   "order": [
+    "<repo>/tests/corpus/3034-arguments-with-parameters.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3035-string-positioned-search-value.js": {
+   "order": [
+    "<repo>/tests/corpus/3035-string-positioned-search-value.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3036-string-object-search-value.js": {
+   "order": [
+    "<repo>/tests/corpus/3036-string-object-search-value.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3037-number-nullish-conversion.js": {
+   "order": [
+    "<repo>/tests/corpus/3037-number-nullish-conversion.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3038-number-scalar-unions.ts": {
+   "order": [
+    "<repo>/tests/corpus/3038-number-scalar-unions.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3039-string-repeat-count.js": {
+   "order": [
+    "<repo>/tests/corpus/3039-string-repeat-count.js"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/304-compound-incdec.ts": {
    "order": [
     "<repo>/tests/corpus/304-compound-incdec.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3040-string-prototype-call.js": {
+   "order": [
+    "<repo>/tests/corpus/3040-string-prototype-call.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3041-string-prototype-object-call.js": {
+   "order": [
+    "<repo>/tests/corpus/3041-string-prototype-object-call.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3042-string-padding-coercion.js": {
+   "order": [
+    "<repo>/tests/corpus/3042-string-padding-coercion.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3043-string-split-arguments.js": {
+   "order": [
+    "<repo>/tests/corpus/3043-string-split-arguments.js"
    ],
    "diags": []
   },
@@ -7578,6 +7716,12 @@
   "<repo>/tests/corpus/916-unknown-bytes.ts": {
    "order": [
     "<repo>/tests/corpus/916-unknown-bytes.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/917-record-array-index-dot.ts": {
+   "order": [
+    "<repo>/tests/corpus/917-record-array-index-dot.ts"
    ],
    "diags": []
   },
@@ -9334,6 +9478,12 @@
   "<repo>/tests/fixtures/npm/cases/crypto-shims/main.ts": {
    "order": [
     "<repo>/tests/fixtures/npm/cases/crypto-shims/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/fixtures/npm/cases/dotfolder/main.ts": {
+   "order": [
+    "<repo>/tests/fixtures/npm/cases/dotfolder/main.ts"
    ],
    "diags": []
   },

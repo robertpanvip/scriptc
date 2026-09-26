@@ -36,6 +36,7 @@ import { conditionalSpreadOf, foldedStringKeyOf } from "./expressions/object-lit
 import { tryLowerExpression } from "./expressions/try-lower-expression.js";
 import { fenceNodeModuleMutation, isNodeModuleValue, lowerNodeModuleIdentifier, lowerNodeModuleProperty, lowerRequireCacheElement, lowerRequireCacheHas, lowerRequireMainProperty } from "./lower-node-module.js";
 import { lowerAbstractEquality } from "./abstract-equality.js";
+import { coerceStringSearchValue, defaultAfterUndefined, lowerStaticallyUndefinedArgument } from "./optional-arguments.js";
 
 /** An assignable `obj.field` target — a class field, a record field, or a
  * class ACCESSOR property (reads become getter calls, writes setter calls;
@@ -5393,6 +5394,24 @@ export function ensureString(lowerer: Lowerer, e: IrExpr, node: ts.Node): IrExpr
       if (stringable) {
         return { kind: "toString", operand: e, type: STRING, loc: e.loc };
       }
+      // Runtime-optional locals can retain their stored union after the
+      // checker has narrowed this use to a primitive arm. Validate that
+      // arm before converting it; an unguarded object arm stays fenced.
+      const narrowed = lowerer.mapTypeOf(lowerer.typeOf(node));
+      if (
+        narrowed &&
+        (narrowed.kind === "string" || narrowed.kind === "f64" ||
+          narrowed.kind === "bool" || narrowed.kind === "bigint")
+      ) {
+        const helper = lowerer.narrowedArmHelper(e.type.unionId, narrowed, e.loc);
+        if (helper) {
+          return ensureString(
+            lowerer,
+            { kind: "call", callee: helper, args: [e], type: narrowed, loc: e.loc },
+            node,
+          );
+        }
+      }
       lowerer.unsupported(
         "SC1090",
         node,
@@ -5459,7 +5478,7 @@ export function ensureString(lowerer: Lowerer, e: IrExpr, node: ts.Node): IrExpr
    * neither is observable where the value immediately stringifies — so the
    * span lowers as the argument's own ToString (`new String()` is "").
    * Every other position keeps the wrapper-object constructor fence. */
-  function stringWrapperToString(lowerer: Lowerer, node: ts.Expression): IrExpr | null {
+  export function stringWrapperToString(lowerer: Lowerer, node: ts.Expression): IrExpr | null {
     let e = node;
     while (ts.isParenthesizedExpression(e)) e = e.expression;
     if (!ts.isNewExpression(e) || !ts.isIdentifier(e.expression)) return null;
@@ -5468,7 +5487,10 @@ export function ensureString(lowerer: Lowerer, e: IrExpr, node: ts.Node): IrExpr
     const args = e.arguments ?? [];
     if (args.length > 1 || args.some(ts.isSpreadElement)) return null;
     if (args.length === 0) return { kind: "strLit", value: "", type: STRING, loc: locOf(e) };
-    return lowerer.caughtToString(args[0]!) ?? lowerer.ensureString(lowerer.lowerExpr(args[0]!), args[0]!);
+    const undefinedArg = lowerStaticallyUndefinedArgument(lowerer, args[0]!);
+    if (undefinedArg) return defaultAfterUndefined(undefinedArg, { kind: "strLit", value: "undefined", type: STRING, loc: locOf(e) });
+    return lowerer.caughtToString(args[0]!) ??
+      coerceStringSearchValue(lowerer, lowerer.lowerExpr(args[0]!), args[0]!, locOf(e));
   }
 
 export function lowerTemplate(lowerer: Lowerer, expr: ts.TemplateExpression): IrExpr {
@@ -9316,7 +9338,24 @@ export function lowerBinary(lowerer: Lowerer, expr: ts.BinaryExpression): IrExpr
     // construction), typed as the index value armed with undefined under
     // noUncheckedIndexedAccess (mirroring lowerRecordKeyRead).
     if (target.container === "recordOvf") {
-      let t: IrType = target.fieldType;
+      let obj = target.obj;
+      if (obj.type.kind === "union" && ts.isPropertyAccessExpression(blame)) {
+        const present = lowerer.stripUndefinedArm(obj.type);
+        if (present.kind === "record") {
+          obj = lowerer.runtimeOptionalPropertyReceiver(
+            blame.expression,
+            obj,
+            present,
+            target.field,
+          ) ?? obj;
+        }
+      }
+      if (obj.type.kind !== "record") {
+        lowerer.unsupported("SC1090", blame, `reading '${target.field}' on a non-record receiver (narrow first)`);
+      }
+      const shape = lowerer.shapes.get(obj.type.shapeId);
+      if (!shape?.indexValue) lowerer.unsupported("SC1090", blame, `reading '${target.field}' on a record without an index signature`);
+      let t: IrType = shape.indexValue;
       if (lowerer.program.getCompilerOptions().noUncheckedIndexedAccess) {
         const armed = lowerer.withUndefinedArmOf(t);
         if (!armed) lowerer.badType(blame, lowerer.typeOf(blame));
@@ -9324,8 +9363,8 @@ export function lowerBinary(lowerer: Lowerer, expr: ts.BinaryExpression): IrExpr
       }
       return {
         kind: "recordKeyGet",
-        obj: target.obj,
-        shapeId: target.shapeId,
+        obj,
+        shapeId: obj.type.shapeId,
         key: { kind: "strLit", value: target.field, type: STRING, loc },
         overflowOnly: true,
         type: t,

@@ -315,6 +315,7 @@ export const ARRAY_METHODS = new Set([
   "reduce",
   "reduceRight",
   "indexOf",
+  "lastIndexOf",
   "includes",
   "join",
   "slice",
@@ -381,13 +382,13 @@ export const STR_METHODS: Record<
 > = {
   charCodeAt: { method: "charCodeAt", result: F64, minArgs: 0, maxArgs: 1 },
   charAt: { method: "charAt", result: STRING, minArgs: 0, maxArgs: 1 },
-  indexOf: { method: "indexOf", result: F64, minArgs: 1, maxArgs: 2 },
+  indexOf: { method: "indexOf", result: F64, minArgs: 0, maxArgs: 2 },
   // includes with a position argument is indexOf's clamp exactly (the
   // spec routes both through StringIndexOf) — the emitter composes
   // scr_str_index_of(...) != -1 for the two-argument form.
-  includes: { method: "includes", result: BOOL, minArgs: 1, maxArgs: 2 },
-  startsWith: { method: "startsWith", result: BOOL, minArgs: 1, maxArgs: 1 },
-  endsWith: { method: "endsWith", result: BOOL, minArgs: 1, maxArgs: 1 },
+  includes: { method: "includes", result: BOOL, minArgs: 0, maxArgs: 2 },
+  startsWith: { method: "startsWith", result: BOOL, minArgs: 0, maxArgs: 2 },
+  endsWith: { method: "endsWith", result: BOOL, minArgs: 0, maxArgs: 2 },
   slice: { method: "slice", result: STRING, minArgs: 0, maxArgs: 2 },
   // substring: slice's clamp-and-swap sibling (negatives clamp to 0
   // instead of counting from the end; start > end swaps).
@@ -406,11 +407,10 @@ export const STR_METHODS: Record<
   // Empty separator splits per UTF-16 code unit —
   // astral halves become U+FFFD (SEMANTICS.md divergence 2, the same
   // substitution the island's boundary marshal applied).
-  split: { method: "split", result: arrayOf(STRING), minArgs: 1, maxArgs: 2 },
-  // padStart/padEnd with the fill omitted: Node pads with " " — the
-  // lowering completes the default (lowerStringMethodCall).
-  padStart: { method: "padStart", result: STRING, minArgs: 1, maxArgs: 2 },
-  padEnd: { method: "padEnd", result: STRING, minArgs: 1, maxArgs: 2 },
+  split: { method: "split", result: arrayOf(STRING), minArgs: 0, maxArgs: 2 },
+  // Padding completes omitted lengths and fill strings in its lowering.
+  padStart: { method: "padStart", result: STRING, minArgs: 0, maxArgs: 2 },
+  padEnd: { method: "padEnd", result: STRING, minArgs: 0, maxArgs: 2 },
   // The lre-backed pair (ECMA Default Case Conversion, final sigma
   // included — scr_regex.c): static now, no island needed; their presence
   // flips the regex LINK switch (moduleUsesRegex).
