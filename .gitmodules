@@ -1,0 +1,3 @@
+[submodule "tools/oxc"]
+	path = tools/oxc
+	url = https://github.com/robertpanvip/oxc

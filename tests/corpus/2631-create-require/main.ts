@@ -36,6 +36,7 @@ console.log("inline:", inline.port);
 // A bare specifier nothing installed resolves: Node's MODULE_NOT_FOUND,
 // catchable at the call — the optional-dependency try/require pattern.
 try {
+  // oxlint-disable-next-line scriptc/corpus-no-bare-imports -- deliberate MODULE_NOT_FOUND case
   require("surely-not-installed-anywhere");
   console.log("SHOULD NOT PRINT");
 } catch (e) {

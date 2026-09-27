@@ -4,5 +4,6 @@
 // refuses the graph at startup (Cannot find package), and the program
 // compiles to exactly that crash: no output, exit 1.
 /// <reference path="./decl.d.ts" />
+// oxlint-disable-next-line scriptc/corpus-no-bare-imports -- deliberate unresolved-import case
 import amb from "ambpkg";
 console.log("never");

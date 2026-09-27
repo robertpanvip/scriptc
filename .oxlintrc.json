@@ -1,0 +1,30 @@
+{
+  "$schema": "./tools/oxc/npm/oxlint/configuration_schema.json",
+  "plugins": ["oxc", "typescript", "unicorn", "scriptc"],
+  "env": {
+    "node": true,
+    "es2024": true
+  },
+  "ignorePatterns": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/target/**",
+    "tools/**",
+    "vendor/**",
+    "msvc-probe/**",
+    "scriptc-runtime-sys/**",
+    "docs/**",
+    "tests/test262/**",
+    "tests/diagnostics/**",
+    "tests/corpus/1831-enum-string-const-reverse.ts",
+    "tests/corpus/1822-static-block-js.js",
+    "tests/corpus/2674-top-level-for-await-implicit-module.ts"
+  ],
+  "rules": {
+    "scriptc/corpus-no-nondeterminism": "warn",
+    "scriptc/corpus-no-bare-imports": "error",
+    "scriptc/colocated-test-naming": "warn",
+    "no-console": "off",
+    "no-unused-vars": "warn"
+  }
+}

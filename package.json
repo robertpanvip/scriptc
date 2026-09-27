@@ -17,6 +17,7 @@
     "test:sandbox:image": "node scripts/sandbox-image.mjs",
     "test:watch": "vitest",
     "lint": "eslint packages/compiler/src packages/cli/src",
+    "lint:ox": "tools/oxc/target/release/oxlint.exe -c .oxlintrc.json packages tests scripts",
     "manifest": "tsx scripts/surface-manifest.mjs",
     "node-compat": "pnpm --filter @internal/compatibility run update",
     "node-compat:backlog": "pnpm --filter @internal/compatibility run backlog --",
