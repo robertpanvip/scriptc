@@ -159,6 +159,25 @@ function jsoncSyntaxError(text: string): string | null {
   }
 }
 
+/** Preserve TypeScript 5.9's computed synthetic-default permission from the
+ * project's own module settings. Preflight later forces ESNext/Bundler for
+ * scriptc's checker, so those forced options must not decide which source
+ * import forms were legal in the original project. */
+function projectAllowsSyntheticDefaultImports(options: Record<string, unknown>): boolean {
+  const explicitSyntheticDefaultImports = options["allowSyntheticDefaultImports"];
+  if (explicitSyntheticDefaultImports !== undefined) return explicitSyntheticDefaultImports === true;
+  const moduleKind = options["module"];
+  const explicitEsModuleInterop = options["esModuleInterop"];
+  const esModuleInterop = explicitEsModuleInterop !== undefined
+    ? explicitEsModuleInterop === true
+    : moduleKind === ts.ModuleKind.Node16 ||
+      moduleKind === ts.ModuleKind.Node18 ||
+      moduleKind === ts.ModuleKind.Node20 ||
+      moduleKind === ts.ModuleKind.NodeNext ||
+      moduleKind === ts.ModuleKind.Preserve;
+  return esModuleInterop || moduleKind === ts.ModuleKind.System || options["moduleResolution"] === ts.ModuleResolutionKind.Bundler;
+}
+
 /** The project's tsconfig adoption in the 7 world: tsgo's own config parser
  * (extends chains resolved server-side), the ADOPTED_OPTIONS subset taken,
  * the rest forced, the strictNullChecks floor enforced. */
@@ -181,6 +200,9 @@ function adoptProjectConfig7(
   for (const key of ADOPTED_OPTIONS) {
     const value = parsed.options[key];
     if (value !== undefined) adopted[key] = value;
+  }
+  if (projectAllowsSyntheticDefaultImports(parsed.options)) {
+    adopted["allowSyntheticDefaultImports"] = true;
   }
   // TS 7 accepts `paths`, but no longer accepts `baseUrl` as a compiler
   // option. Translate the established baseUrl+paths spelling into absolute
@@ -477,6 +499,43 @@ function createRequireProgramRoots7(program: ts.Program): string[] {
   return [...roots].sort();
 }
 
+/** Classify the explicitly selected installed package's own sources. */
+export function entryPackageFilePredicate(entryPath: string): (file: string) => boolean {
+  const entryFile = tsgoPath(entryPath);
+  const installedAt = entryFile.lastIndexOf("/node_modules/");
+  const prefix = installedAt < 0
+    ? null
+    : entryFile.slice(0, installedAt) + "/node_modules/" + npmPackageNameOf(entryFile) + "/";
+  return (file) => {
+    const normalized = tsgoPath(file);
+    return normalized === entryFile || (
+      prefix !== null && normalized.startsWith(prefix) &&
+      !normalized.slice(prefix.length).split("/").includes("node_modules")
+    );
+  };
+}
+
+/** maxNodeModuleJsDepth omits even relative JS imports within an installed
+ * entry's own package. Add those sources as roots to the existing discovery
+ * fixpoint without raising the checker depth for other packages. */
+function entryPackageProgramRoots7(program: ts.Program, entryPath: string): string[] {
+  if (!isNodeModulesPath(entryPath)) return [];
+  const belongsToEntry = entryPackageFilePredicate(entryPath);
+  const roots = new Set<string>();
+  for (const sf of program.getSourceFiles()) {
+    if (sf.isDeclarationFile || !belongsToEntry(sf.fileName)) continue;
+    for (const specifier of sf.imports) {
+      if (!ts.isStringLiteralLike(specifier)) continue;
+      const target = resolveProjectModule(sf.fileName, specifier.text);
+      if (
+        target !== null && belongsToEntry(target) && isJsSourceFileName(target) &&
+        program.getSourceFile(target) === undefined
+      ) roots.add(target);
+    }
+  }
+  return [...roots].sort();
+}
+
 function loadProgram7(
   host: ts.Ts7Host,
   entryPath: string,
@@ -523,6 +582,7 @@ function loadProgram7(
   let program = ts.createProgram([...programRoots, overridesDtsPath()], options, host);
   for (let pass = 0; pass < 32; pass++) {
     const candidates = [
+      ...entryPackageProgramRoots7(program, entryPath),
       ...createRequireProgramRoots7(program),
       ...forkTargetPaths(program, program.getSourceFiles()),
     ];
@@ -1861,6 +1921,13 @@ function preflight7(load: LoadResult): {
   const { program, entry } = load;
   const diags: ScrDiagnostic[] = [...load.configDiags];
 
+  // An explicit entry can itself live in an installed package. Its own
+  // source files are program code, including relative barrels and sibling
+  // modules; their location must not silently erase the module graph.
+  // Match the full installed directory, not just the package name, and
+  // exclude nested installations so dependencies keep their npm policy.
+  const entryPackageFile = entryPackageFilePredicate(entry.fileName);
+
   // Workspace-linked packages register BEFORE the tsc gate. Their files
   // live at realpaths OUTSIDE node_modules (the monorepo-tool symlink
   // shape), so nothing path-shaped marks them as npm surface — yet their
@@ -1987,6 +2054,7 @@ function preflight7(load: LoadResult): {
    * program modules. */
   const islandJsFile = (file: string): boolean =>
     isJsSourceFileName(file) &&
+    !entryPackageFile(file) &&
     npmStaticPackageOfPath(file) === null &&
     (isNodeModulesPath(file) || workspacePackageOfPath(file) !== null);
   const nodeModulesJsSuppressed = (d: ts.Diagnostic): boolean =>
@@ -2089,7 +2157,7 @@ function preflight7(load: LoadResult): {
         sf.fileName !== ambient &&
         !sf.isDeclarationFile &&
         !sf.fileName.endsWith(".json") &&
-        (!isNodeModulesPath(sf.fileName) || npmStaticPackageOfPath(sf.fileName) !== null) &&
+        (!isNodeModulesPath(sf.fileName) || entryPackageFile(sf.fileName) || npmStaticPackageOfPath(sf.fileName) !== null) &&
         !islandJsFile(sf.fileName),
     );
   const userFiles = npmStaticActive()
@@ -2459,21 +2527,15 @@ function preflight7(load: LoadResult): {
         // surface and the lowering keys the same tables
         // (builtinNamespaceModuleOf's default-import twin). JS sources
         // always (Node never asks for interop flags); TS sources when the
-        // adopted interop knobs made the checker accept the spelling
-        // (the `import os from 'os'` spelling under esModuleInterop — the
-        // program TYPECHECKED, so the form is the project's own legal
-        // dialect). A TS project without interop flags keeps the fence:
-        // the SC1012 wording beats the raw TS1259 at the same site. The
-        // callable module objects (assert, events, test) stay allowed
-        // everywhere.
-        const opts = program.getCompilerOptions() as {
-          esModuleInterop?: boolean;
-          allowSyntheticDefaultImports?: boolean;
-        };
-        const interopOn = opts.esModuleInterop === true || opts.allowSyntheticDefaultImports === true;
+        // project's explicit or implied synthetic-default permission accepts
+        // the spelling. A TS project without that permission keeps the
+        // SC1012 fence. The callable module objects (assert, events, test)
+        // stay allowed everywhere.
+        const syntheticDefaultsOn =
+          (program.getCompilerOptions() as { allowSyntheticDefaultImports?: boolean }).allowSyntheticDefaultImports === true;
         const defaultOk =
           builtinDefaultImportModule(spec) !== null ||
-          ((isJsSourceFileName(sf.fileName) || interopOn) && canonicalBuiltinModule(spec) !== null);
+          ((isJsSourceFileName(sf.fileName) || syntheticDefaultsOn) && canonicalBuiltinModule(spec) !== null);
         if (clause.name && !isJson && dep === null && !defaultOk) {
           diags.push(unsupportedDiag("SC1012", locOf7(clause.name)));
         }

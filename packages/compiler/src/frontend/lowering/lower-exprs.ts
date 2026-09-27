@@ -12,11 +12,12 @@ import type { Lowerer } from "./lowerer.js";
 import { wasiGuestPath } from "../../wasi-paths.js";
 import { BIGINT_T, BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, funcOf, isDynTypedRefType, isJsonSafeType, isSupportedArrayElem, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/ir.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
-import { ARRAY_METHODS, builtinConstLit, builtinFenceHintOf, builtinModuleConstOf, builtinModulesArrayLit, builtinModuleFnOf, COMPOUND_ASSIGN_OPS, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
+import { ARRAY_METHODS, builtinConstLit, builtinFenceHintOf, builtinModuleConstOf, builtinModulesArrayLit, builtinModuleFnOf, COMPOUND_ASSIGN_OPS, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STRING_INDEX_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
 import { UNSUPPORTED, blockedBindingUseDiag, requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { PoisonError, dynUndefinedExpr, jsFuncNameOf, neverTaintedJsType, nodeThrowExpr, own } from "./lowerer.js";
 import { lowerNpmStaticSafeIndexRead, lowerSafeIndexRead, strCharsCall, tryLowerNumericIndexRead } from "./lower-containers.js";
 import { arrayValueRead, arrayValueStore } from "./array-values.js";
+import { tryLowerIndexedComparison } from "./indexed-comparison.js";
 import { npmStaticPackageOfPath } from "../npm-static.js";
 import { unsupportedModuleFeatureOf } from "../builtin-modules.js";
 import { fenceEnumObjectValue, lowerEnumAccess } from "./lower-enums.js";
@@ -615,6 +616,18 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
         return { kind: "strLit", value: "object", type: STRING, loc };
       }
       if (ts.isPropertyAccessExpression(expr.expression)) {
+        const member = expr.expression;
+        const prototype = member.expression;
+        if (STRING_INDEX_METHODS.has(member.name.text) && ts.isPropertyAccessExpression(prototype) &&
+            prototype.name.text === "prototype" && ts.isIdentifier(prototype.expression) &&
+            lowerer.isStdlibGlobal(prototype.expression, "String") && lowerer.isStdlibMember(member)) {
+          return { kind: "strLit", value: "function", type: STRING, loc };
+        }
+        if (member.name.text === "at" && ts.isPropertyAccessExpression(prototype) &&
+            prototype.name.text === "prototype" && ts.isIdentifier(prototype.expression) &&
+            lowerer.isStdlibGlobal(prototype.expression, "Array") && lowerer.isStdlibMember(member)) {
+          return { kind: "strLit", value: "function", type: STRING, loc };
+        }
         const presence = lowerPromiseThenPresence(
           lowerer,
           expr.expression,
@@ -1077,6 +1090,13 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
           if (isJsSourceFile(expr.getSourceFile())) {
             const canonical = stdlibGlobalNameOf(lowerer, expr) ?? expr.text;
             return { kind: "strLit", value: `[builtin ${canonical}]`, type: STRING, loc };
+          }
+          // In a dynamic TypeScript build, the real global object is the
+          // escape hatch for host capabilities without static lowering.
+          // Direct globalThis.member uses still take their static surface
+          // paths; an explicit `as any` or `: any` can reach engine ops.
+          if (lowerer.dynamic && expr.text === "globalThis") {
+            return { kind: "jsOp", op: "globalGet", name: "globalThis", args: [], type: JSVAL, loc };
           }
           // The families with a WHY: each hint states what makes the
           // surface genuinely non-static (or what to use instead).
@@ -2447,7 +2467,27 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
       return expr;
     }
     const tag = lowerer.armTag(expr.type.unionId, narrowed);
-    if (tag < 0) return expr;
+    if (tag < 0) {
+      // A proven-present optional base class can narrow further to a
+      // subclass. The payload is still stored under the base class tag;
+      // unwrap it before applying the ordinary class downcast.
+      const arms = lowerer.unions.get(expr.type.unionId)?.arms ?? [];
+      const valueTag = arms.findIndex((arm) => !isUnitType(arm));
+      const valueType = arms[valueTag];
+      if (
+        narrowed.kind === "object" && valueType?.kind === "object" &&
+        arms.every((arm, i) => i === valueTag || isUnitType(arm)) &&
+        lowerer.isSubclassOf(narrowed.className, valueType.className)
+      ) {
+        return {
+          kind: "downcast",
+          value: { kind: "unionNarrow", unionId: expr.type.unionId, tag: valueTag, value: expr, type: valueType, loc: expr.loc },
+          type: narrowed,
+          loc: expr.loc,
+        };
+      }
+      return expr;
+    }
     return {
       kind: "unionNarrow",
       unionId: expr.type.unionId,
@@ -2513,11 +2553,10 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
       }
       return { kind: "call", callee: helper, args: [varRef(local.id, local.type, loc)], type: narrowed, loc };
     }
-    const valueTag = lowerer.armTag(local.type.unionId, narrowed);
     const undefTag = lowerer.armTag(local.type.unionId, UNDEFINED_T);
-    if (valueTag < 0 || undefTag < 0) throw new InternalCompilerError("runtime-optional local is missing its value or undefined arm");
     const def = lowerer.unions.get(local.type.unionId);
-    if (!def || def.arms.length !== 2) {
+    if (!def || undefTag < 0) throw new InternalCompilerError("runtime-optional local is missing its undefined arm");
+    if (def.arms.length !== 2) {
       // The checker may narrow a runtime-optional capture to one arm of a
       // value union (`Circle | Square | undefined` -> `Circle`). The
       // two-arm fast path below cannot extract that arm safely: a later
@@ -2530,10 +2569,19 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
       }
       return { kind: "call", callee: helper, args: [varRef(local.id, local.type, loc)], type: narrowed, loc };
     }
+    // A predicate can strengthen a record's fields or narrow a base class
+    // to a subclass without changing the slot's stored value arm. Extract
+    // that actual arm first: record reads need its original field layout,
+    // and class reads apply the ordinary downcast bridge afterward.
+    const valueTag = undefTag === 0 ? 1 : 0;
+    const valueType = def.arms[valueTag];
+    if (!valueType || isUnitType(valueType)) {
+      lowerer.unsupported("SC1090", expr, "a runtime-optional receiver without a representable value arm");
+    }
     const message = property === null
       ? `${expr.text} is not a function`
       : `Cannot read properties of undefined (reading '${property}')`;
-    return {
+    return lowerer.maybeNarrow({
       kind: "ternary",
       cond: {
         kind: "unionIsTag",
@@ -2548,7 +2596,7 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
         1,
         "",
         message,
-        narrowed,
+        valueType,
         loc,
       ),
       else_: {
@@ -2556,12 +2604,12 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
         unionId: local.type.unionId,
         tag: valueTag,
         value: varRef(local.id, local.type, loc),
-        type: narrowed,
+        type: valueType,
         loc,
       },
-      type: narrowed,
+      type: valueType,
       loc,
-    };
+    }, narrowedNode);
   }
 
   type RuntimeOptionalUse =
@@ -3636,7 +3684,7 @@ function lowerPromiseThenPresence(
     }
     if (
       kind === "string"
-        ? own(STR_METHODS, name) !== undefined || own(ISLAND_SURFACE.string, name) !== undefined
+        ? own(STR_METHODS, name) !== undefined || STRING_INDEX_METHODS.has(name) || own(ISLAND_SURFACE.string, name) !== undefined
         : ARRAY_METHODS.has(name)
     ) {
       lowerer.unsupported("SC1090", expr, `${kind} methods as values (call '${name}' directly)`);
@@ -4683,6 +4731,15 @@ export function lowerOptionalNumber(
       // index value (and therefore validates it); ===/!==, ||, and ?? need
       // to observe the missing value instead of throwing during that check.
       return includeUndefined ? read : lowerer.maybeNarrow(read, expr);
+    }
+    // Predicates can strengthen optional fields without changing the
+    // receiver's stored layout. Use that layout for bracket reads just as
+    // fieldTarget does for the corresponding dot reads.
+    if (obj.type.kind === "record") {
+      const actualShape = lowerer.shapes.get(obj.type.shapeId);
+      if (!actualShape) throw new InternalCompilerError("record receiver is missing its stored shape");
+      shapeId = obj.type.shapeId;
+      shape = actualShape;
     }
     if (litKey !== null) {
       const field = shape.fields.find((f) => f.name === litKey);
@@ -6728,6 +6785,8 @@ export function lowerBinary(lowerer: Lowerer, expr: ts.BinaryExpression): IrExpr
       case ts.SyntaxKind.EqualsEqualsEqualsToken:
       case ts.SyntaxKind.ExclamationEqualsEqualsToken: {
         const negated = op === ts.SyntaxKind.ExclamationEqualsEqualsToken;
+        const indexed = tryLowerIndexedComparison(lowerer, left, right, negated, loc);
+        if (indexed) return indexed;
         if (plainBothNum) return { kind: "bin", op: negated ? "!==" : "===", left, right, type: BOOL, loc };
         if (bothStr) return { kind: "strEq", negated, left, right, type: BOOL, loc };
         // bool === bool: a plain value compare (the config-drift checks'

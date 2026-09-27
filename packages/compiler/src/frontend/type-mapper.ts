@@ -1,5 +1,6 @@
 import { InternalCompilerError } from "../errors.js";
 import * as ts from "./ts7/adapter.js";
+import { bodyReadsArguments } from "./arguments-usage.js";
 import type { IrRecordShape, IrType, IrUnionDef } from "../ir/ir.js";
 import { arrayOf, BOOL, bytesOf, canConvertToDyn, CHILD_T, CRYPTOHASH_T, CRYPTOHMAC_T, DATE_T, DYN, F64, funcOf, isSupportedArrayElem, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/ir.js";
 import { BIGINT_T } from "../ir/ir.js";
@@ -35,6 +36,16 @@ export const ISLAND_AMBIENT_TYPES = [
   "ReadableStreamReadValueResult",
   "ReadableStreamReadDoneResult",
 ] as const;
+
+function isAmbientAbortHandleType(type: ts.Type, ctx: TypeMapperCtx): boolean {
+  if (type.isUnionType()) return ts.constituentTypes(type).some((part) => isAmbientAbortHandleType(part, ctx));
+  const symbol = type.getSymbol();
+  return !!symbol &&
+    (symbol.name === "AbortSignal" || symbol.name === "AbortController") &&
+    ctx.checker.declarationsOf(symbol).some(
+      (d) => (ts.isInterfaceDeclaration(d) || ts.isClassDeclaration(d)) && ctx.isStdlibFile(d.getSourceFile()),
+    );
+}
 
 /** node:util.parseArgs's public and @types/node helper type names. Values
  * behind this surface use the checked-dynamic tree; see mapTypeInner. */
@@ -742,30 +753,6 @@ export interface TypeMapperCtx {
    * embedded engine there. */
   moduleNamespaceId?: (type: ts.Type) => string | null;
 }
-
-
-/** lower-calls.ts's bodyReadsArguments, duplicated here (type-mapper.ts must not
- * import from lowering/ — that edge is a module cycle): does the function's
- * OWN body read `arguments`? Nested plain functions/methods own theirs
- * (skipped); arrows see the enclosing one (descended). */
-function bodyReadsArgumentsLocal(fn: { body?: ts.Node | undefined }): boolean {
-  let found = false;
-  if (fn.body === undefined) return false;
-  // Iterative walk (walkPreorder): function bodies can hold pathologically
-  // deep expression chains that a recursive visit would die on.
-  ts.walkPreorder(fn.body, (n) => {
-    if (ts.isIdentifier(n) && n.text === "arguments" && !(ts.isPropertyAccessExpression(n.parent) && n.parent.name === n)) {
-      found = true;
-      return "stop";
-    }
-    if ((ts.isFunctionExpression(n) || ts.isFunctionDeclaration(n) || ts.isMethodDeclaration(n)) && (n as unknown) !== fn) {
-      return "skip"; // own `arguments` scope
-    }
-    return undefined;
-  });
-  return found;
-}
-
 /** A generator type's normalized value channels (Generator<T, TReturn,
  * TNext> and the IteratorResult alias share this):
  * - yield: `never` (a generator that never yields) rides the VOID
@@ -1218,8 +1205,8 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       // normalizer shape): the slot has the overflow map's RC/JSON/dyn
       // plumbing, values arrive dyn or convert via dynFrom.
       if (!et || et.kind === "void") return null;
-      // A jsval MEMBER absorbs the tuple (bare jsval fields have no shape
-      // slot — the record-field rule), exactly like record fields below.
+      // A jsval member keeps this tuple in the island as a real JS array.
+      // Object records may instead keep ambient abort handles in slots.
       if (et.kind === "jsval") return JSVAL;
       fields.push({ name: String(i), type: et });
     }
@@ -2582,7 +2569,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       // tsgo never SYNTHESIZES that rest param into the inferred signature
       // (5.9.3 did — the count mismatch above was the whole detector
       // there), so the declaration's own body answers directly.
-      if (sigDecl !== undefined && ts.isFunctionLike(sigDecl) && bodyReadsArgumentsLocal(sigDecl as { body?: ts.Node })) {
+      if (sigDecl !== undefined && ts.isFunctionLike(sigDecl) && bodyReadsArguments(sigDecl as { body?: ts.Node })) {
         return null;
       }
     }
@@ -3748,14 +3735,11 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
       // v }` — a string-literal key): mapping it would collide with the
       // accessor dispatch, so the shape stays unmapped.
       if (accessorSlotProp(p.name) !== null) return null;
-      // A bare jsval FIELD absorbs the record: shapes have no handle slot
-      // (the IR forbids jsval fields — no JSON story), while an island
-      // OBJECT holds engine values natively — `{ model: gateway(id),
-      // prompt }` is one island object, built field by field (jsval
-      // members as the same handle, static members marshaled). jsval-
-      // BEARING composite fields (`content: any[]`) keep their static
-      // shape — the lift covers them.
-      if (pt.kind === "jsval") return JSVAL;
+      // Keep ambient abort handles in a native record slot under --dynamic:
+      // an options record with `signal?: AbortSignal` must not turn its
+      // unrelated static fields into island properties. Other bare jsval
+      // fields still absorb the record into one island object.
+      if (pt.kind === "jsval" && !(ctx.dynamic && isAmbientAbortHandleType(fieldTs, ctx))) return JSVAL;
       fields.push({ name: p.name, type: pt });
     }
     // getPropertiesOfType yields DECLARATION order (interface/alias/literal
@@ -3968,7 +3952,7 @@ export function describeComponentBlocker(widened: ts.Type, ctx: TypeMapperCtx): 
       sigDecl !== undefined &&
       ts.isFunctionLike(sigDecl) &&
       (sigDecl.parameters.length !== sig.getParameters().length ||
-        bodyReadsArgumentsLocal(sigDecl as { body?: ts.Node }))
+        bodyReadsArguments(sigDecl as { body?: ts.Node }))
     ) {
       return `the function shape is supported, but its signature is variadic ('arguments'-reading), and a compiled signature is fixed-arity`;
     }
