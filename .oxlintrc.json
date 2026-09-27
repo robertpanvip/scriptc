@@ -24,7 +24,50 @@
     "scriptc/corpus-no-nondeterminism": "warn",
     "scriptc/corpus-no-bare-imports": "error",
     "scriptc/colocated-test-naming": "warn",
+    "scriptc/no-explicit-any": "warn",
+    "scriptc/no-fenced-globals": "warn",
+    "scriptc/no-date-fenced-usage": "error",
+    "scriptc/no-commonjs-metadata-mutation": "error",
+    "scriptc/no-computed-dynamic-import": "warn",
+    "scriptc/promise-all-inline-tuple": "warn",
+    "scriptc/no-locale-compare": "warn",
+    "scriptc/no-process-exitcode-misuse": "error",
     "no-console": "off",
     "no-unused-vars": "warn"
-  }
+  },
+  "overrides": [
+    {
+      "files": [
+        "packages/**",
+        "scripts/**",
+        "tests/harness/**",
+        "tests/fixtures/**",
+        "tests/coverage-fixtures/**",
+        "**/*.d.ts"
+      ],
+      "rules": {
+        "scriptc/no-explicit-any": "off",
+        "scriptc/no-fenced-globals": "off",
+        "scriptc/no-date-fenced-usage": "off",
+        "scriptc/no-commonjs-metadata-mutation": "off",
+        "scriptc/no-computed-dynamic-import": "off",
+        "scriptc/promise-all-inline-tuple": "off",
+        "scriptc/no-locale-compare": "off",
+        "scriptc/no-process-exitcode-misuse": "off"
+      }
+    },
+    {
+      "files": ["tests/corpus/**"],
+      "rules": {
+        "scriptc/no-explicit-any": "off",
+        "scriptc/no-fenced-globals": "off",
+        "scriptc/promise-all-inline-tuple": "off",
+        "scriptc/no-locale-compare": "off",
+        "scriptc/no-date-fenced-usage": "error",
+        "scriptc/no-commonjs-metadata-mutation": "error",
+        "scriptc/no-computed-dynamic-import": "warn",
+        "scriptc/no-process-exitcode-misuse": "error"
+      }
+    }
+  ]
 }
