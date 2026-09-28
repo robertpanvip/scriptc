@@ -32,7 +32,8 @@ extern "C" {
     /// called once at the top of main (console formatter, flush-at-exit)
     pub fn scr_init();
     /// versioned ABI marker — mismatched runtime links fail here
-    pub fn scr_runtime_abi_v1();
+    /// (v3: upstream #493 bumped the marker when the IR validator went native)
+    pub fn scr_runtime_abi_v3();
 
     // ── program TU entry ────────────────────────────────────────────
     /// The scriptc-generated program TU (`scriptc build *.ts --backend=c`)

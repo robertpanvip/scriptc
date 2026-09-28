@@ -1471,6 +1471,13 @@ ScrStr *scr_jsval_typeof(ScrJsval *a) {
   return s;
 }
 
+bool scr_jsval_is_object(ScrJsval *a) {
+  ScrStr *type = scr_jsval_typeof(a);
+  bool object = type->len == 6 && memcmp(type->data, "object", 6) == 0;
+  scr_str_release(type);
+  return object;
+}
+
 ScrStr *scr_jsval_to_str(ScrJsval *a) {
   isl_entry();
   return isl_js_to_str(a->v); /* NULL = bridged (e.g. a symbol) */
@@ -1768,7 +1775,9 @@ static JSValue isl_pending_to_value(JSContext *ctx) {
        * conversion failures at the typed-callback boundary rely on it.
        * Custom names ride an Error-rooted instance with the name set. */
       ScrError *err = (ScrError *)cell->payload;
-      static const char *const builtins[] = {"Error", "TypeError", "RangeError", "SyntaxError"};
+      static const char *const builtins[] = {
+          "Error", "TypeError", "RangeError", "SyntaxError",
+          "ReferenceError", "EvalError", "URIError"};
       v = JS_UNDEFINED;
       for (size_t i = 0; i < sizeof builtins / sizeof builtins[0]; i++) {
         if (strlen(builtins[i]) == err->name->len &&
