@@ -7,8 +7,10 @@
   "scripts": {
     "build": "pnpm -r --filter \"./packages/*\" run build",
     "build:fresh": "rm -rf packages/compiler/dist packages/cli/dist node_modules/.cache/scriptc-tsc && pnpm build",
+    "bench:builds": "node scripts/bench-builds.mjs",
     "test": "vitest run",
     "test:ts7": "node scripts/test-ts7.mjs",
+    "generate:ts7-ast": "node scripts/generate-ts7-ast-schema.mjs",
     "test:fetch-conformance": "vitest run tests/harness/fetch-conformance.test.ts",
     "test:test262": "tsx tests/test262/run.ts",
     "test:test262:fetch": "node tests/test262/fetch.mjs",

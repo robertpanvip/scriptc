@@ -167,7 +167,7 @@ export const UNSUPPORTED: Record<string, UnsupportedEntry> = {
       "util/types, string_decoder, querystring, readline, events, stream, " +
       "stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, " +
       "cluster, tty, async_hooks, timers, timers/promises, " +
-      "diagnostics_channel, perf_hooks, and module modules (bare or " +
+      "diagnostics_channel, perf_hooks, module, and console modules (bare or " +
       "node:-prefixed) and node:test (node:-prefixed only, like in Node) " +
       "are supported",
   },
@@ -617,6 +617,19 @@ export function noLoweringDiag(
       (viaNodeTypes
         ? "the type checker sees everything @types/node declares, but only the supported surface compiles (https://scriptc.dev/limitations)"
         : "the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)"),
+  };
+}
+
+/** A resolved native addon needs Node's embedding ABI, even when the
+ * caller opts into scriptc's dynamic engine. The migration uses the
+ * underlying native operation through an ordinary C ABI declaration. */
+export function nativeAddonDiag(specifier: string, loc: SrcLoc): ScrDiagnostic {
+  return {
+    code: "SC2020",
+    message: `native addon '${specifier}' requires Node's addon runtime, which is unavailable in static and --dynamic builds`,
+    loc,
+    milestone: "later",
+    hint: "expose the native operation as a plain C ABI function in an object or static archive, then bind a signature-only TypeScript declaration with --ffi; Node-API callbacks themselves require Node (https://scriptc.dev/ffi#replacing-a-node-api-addon)",
   };
 }
 

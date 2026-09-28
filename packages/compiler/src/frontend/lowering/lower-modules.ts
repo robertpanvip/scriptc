@@ -3,8 +3,9 @@
  * seeds), npm/JSON import collection, per-file %init functions, %main, and
  * the module artifacts (globals, embedded npm tables) the IR module carries. */
 import * as ts from "../ts7/adapter.js";
+import { bindingSource } from "../binding-source.js";
 import type { Lowerer } from "./lowerer.js";
-import { dirname as dirnamePath, resolve as resolvePath } from "node:path";
+import { dirname as dirnamePath, isAbsolute, resolve as resolvePath } from "node:path";
 import { NpmGraphBuilder, packageNameOfPath, probeNodeImportRefusal, probeNodeRequireRefusal } from "../npm.js";
 import { isNpmStaticPackage } from "../npm-static.js";
 import { isJsSourceFileName } from "../tsc-codes.js";
@@ -14,16 +15,17 @@ import type { CycleEdge } from "../program.js";
 import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag } from "../../diagnostics/diagnostic.js";
 import { BOOL, DYN, F64, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType } from "../../ir/ir.js";
 import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, newFnCtx, staticImportNamespaceType, uncheckedOverloadHandleCall } from "./lowerer.js";
-import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireProgramModuleDecl, createRequireSpecOf, isPromisifyCall, registerBuiltinCallableAlias, textCodecBindingDecl } from "./lower-builtins.js";
+import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireProgramModuleDecl, createRequireSpecOf, isPromisifyCall, registerBuiltinCallableAlias } from "./lower-builtins.js";
 import { bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, bindingNeverReassigned, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf, registerOverloadedCallableAlias } from "./lower-calls.js";
 import { isVarDeclared, numericIteratorSourceOf, provenanceElidedConstDecl } from "./lower-stmts.js";
 import { streamClassAliasDecl } from "./lower-stream.js";
 import { stdlibGlobalAliasDecl, stdlibGlobalAliasNameOf } from "./surfaces.js";
 import { collectNamespaceStmt, nsPathPrefix, trapDeclRootOf } from "./lower-namespaces.js";
 import { collectExpandoMembers } from "./lower-expando.js";
+import { recordTextCodecClass } from "../../ir/ir.js";
 import { isUnitOnlyTsType, unitOnlyUnion } from "../type-mapper.js";
 import type { ClassInfo } from "./lower-classes.js";
-import { decoratorNodesOf, genericIfaceBindingKeepsClass, guaranteedDecorationThrow } from "./lower-classes.js";
+import { collectVirtualJsMethods, decoratorNodesOf, genericIfaceBindingKeepsClass, guaranteedDecorationThrow } from "./lower-classes.js";
 import { isMixinFnBinding, mixinResultBindingClassOf } from "./lower-mixins.js";
 import { cjsModuleRef, cjsModuleRegistryPrelude } from "./lower-node-module.js";
 import { forkTargetPaths } from "../fork-target.js";
@@ -246,6 +248,7 @@ export function appendForkModules(
   export function collectProgram(lowerer: Lowerer, parts: FileParts[]): void {
     lowerer.collecting = true;
     try {
+      collectVirtualJsMethods(lowerer, parts.map((part) => part.sf));
       for (const fp of parts) for (const decl of fp.classDecls) lowerer.collectClassShape(decl);
       for (const fp of parts) for (const decl of fp.fnDecls) lowerer.collectSignature(decl);
     } finally {
@@ -549,7 +552,7 @@ export function appendForkModules(
           spec !== null &&
           canonicalBuiltinModule(spec) === null &&
           !isRelativeSpecifier(spec) &&
-          !spec.startsWith("/") &&
+          !isAbsolute(spec) &&
           !spec.startsWith("#") &&
           probeNodeRequireRefusal(cr.baseFile.fileName, spec) === null
         ) {
@@ -1347,7 +1350,7 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
         // `const require = createRequire(import.meta.url)` at file scope:
         // compile-time plumbing — no global storage; the statement
         // lowering skips it by the same test.
-        if (isConst && createRequireBindingDecl(lowerer, decl.name, decl.initializer)) continue;
+        if (createRequireBindingDecl(lowerer, decl.name, decl.initializer)) continue;
         // `const fs = require("node:fs")` through that binding at file
         // scope — a namespace import in const clothing, same story.
         if (isConst && createRequireNamespaceDecl(lowerer, decl.name, decl.initializer)) continue;
@@ -1386,10 +1389,6 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
             })()
           );
         if (stableStdlibAlias && stdlibGlobalAliasDecl(lowerer, decl.name, decl.initializer)) continue;
-        // Stored default TextEncoder/TextDecoder instances are the same
-        // compile-time alias plumbing as their statement lowering: calls
-        // trace this const initializer, so no module global exists.
-        if (isConst && textCodecBindingDecl(lowerer, decl.name, decl.initializer)) continue;
         // Destructuring declarations register EVERY bound identifier (the
         // desugar in the init function assigns the pre-registered globals,
         // exactly like plain declarations).
@@ -1412,7 +1411,7 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
             ) {
               const symbol = lowerer.checker.getSymbolAtLocation(nameNode);
               if (symbol) {
-                const g: IrGlobal = { id: `%g.${tag}${nameNode.text}`, name: nameNode.text, type: DYN, mutable: isLet };
+                const g: IrGlobal = { id: `%g.${tag}${nameNode.text}`, name: nameNode.text, type: DYN, mutable: isLet, source: bindingSource(nameNode) };
                 lowerer.globalsBySymbol.set(symbol, g);
                 lowerer.globalsList.push(g);
               }
@@ -1445,7 +1444,7 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
             ) {
               const symbol = lowerer.checker.getSymbolAtLocation(nameNode);
               if (symbol && !lowerer.globalsBySymbol.has(symbol)) {
-                const g: IrGlobal = { id: `%g.${tag}${nameNode.text}`, name: nameNode.text, type: DYN, mutable: isLet };
+                const g: IrGlobal = { id: `%g.${tag}${nameNode.text}`, name: nameNode.text, type: DYN, mutable: isLet, source: bindingSource(nameNode) };
                 lowerer.globalsBySymbol.set(symbol, g);
                 lowerer.globalsList.push(g);
               }
@@ -1472,7 +1471,7 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
             ) {
               const symbol = lowerer.checker.getSymbolAtLocation(nameNode);
               if (symbol && !lowerer.globalsBySymbol.has(symbol)) {
-                const g: IrGlobal = { id: `%g.${tag}${nsPrefix}${nameNode.text}`, name: nameNode.text, type: DYN, mutable: isLet };
+                const g: IrGlobal = { id: `%g.${tag}${nsPrefix}${nameNode.text}`, name: nameNode.text, type: DYN, mutable: isLet, source: bindingSource(nameNode) };
                 lowerer.globalsBySymbol.set(symbol, g);
                 lowerer.globalsList.push(g);
                 // Mutable dyn globals hold the dyn undefined from module
@@ -1498,7 +1497,7 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
             ) {
               const symbol = lowerer.checker.getSymbolAtLocation(nameNode);
               if (symbol && !lowerer.globalsBySymbol.has(symbol)) {
-                const g: IrGlobal = { id: `%g.${tag}${nsPrefix}${nameNode.text}`, name: nameNode.text, type: JSVAL, mutable: isLet };
+                const g: IrGlobal = { id: `%g.${tag}${nsPrefix}${nameNode.text}`, name: nameNode.text, type: JSVAL, mutable: isLet, source: bindingSource(nameNode) };
                 lowerer.globalsBySymbol.set(symbol, g);
                 lowerer.globalsList.push(g);
               }
@@ -1606,6 +1605,14 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
               const shape = lowerer.shapes.get(type.shapeId);
               if (shape && shape.fields.length === 0 && !shape.indexValue && !shape.tuple) type = DYN;
             }
+            // A module var starts as undefined, even when its declared type
+            // excludes it. Do not silently treat a NULL codec as a usable
+            // receiver during a closure's pre-initialization read.
+            const codec = type.kind === "record" && recordTextCodecClass(lowerer.shapes.get(type.shapeId)!) !== null;
+            if (codec && (isVarDeclared(decl) || !decl.initializer)) {
+              lowerer.noLowering("module-scope codec bindings that can hold undefined before initialization", decl,
+                "use let or const with an initializer for TextEncoder/TextDecoder instances");
+            }
             const symbol = lowerer.checker.getSymbolAtLocation(nameNode);
             // Merged `var` redeclarations (`var y = 1; ...; var y = 2;` —
             // one symbol) register exactly one global; later declarations
@@ -1616,6 +1623,8 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
               name: nameNode.text,
               type,
               mutable: isLet,
+              source: bindingSource(nameNode),
+              ...(codec ? { tdz: true as const } : {}),
             };
             lowerer.globalsBySymbol.set(symbol, g);
             lowerer.globalsList.push(g);
@@ -1738,7 +1747,7 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
             }
             const symbol = lowerer.checker.getSymbolAtLocation(nameNode);
             if (!symbol || lowerer.globalsBySymbol.has(symbol)) continue;
-            const g: IrGlobal = { id: `%g.${tag}${nameNode.text}`, name: nameNode.text, type, mutable: true };
+            const g: IrGlobal = { id: `%g.${tag}${nameNode.text}`, name: nameNode.text, type, mutable: true, source: bindingSource(nameNode) };
             lowerer.globalsBySymbol.set(symbol, g);
             lowerer.globalsList.push(g);
             noteVarGlobalEntryInit(lowerer, sf, g);

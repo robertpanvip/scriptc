@@ -268,8 +268,8 @@
       "static": {
         "supported": 0,
         "partial": 6,
-        "refused": 0,
-        "not-implemented": 18,
+        "refused": 1,
+        "not-implemented": 17,
         "by-design": 0,
         "unreviewed": 0,
         "not-applicable": 0
@@ -531,9 +531,9 @@
       "apiEntries": 92,
       "static": {
         "supported": 0,
-        "partial": 8,
+        "partial": 10,
         "refused": 0,
-        "not-implemented": 84,
+        "not-implemented": 82,
         "by-design": 0,
         "unreviewed": 0,
         "not-applicable": 0
@@ -1323,9 +1323,9 @@
       "apiEntries": 105,
       "static": {
         "supported": 0,
-        "partial": 5,
+        "partial": 9,
         "refused": 0,
-        "not-implemented": 100,
+        "not-implemented": 96,
         "by-design": 0,
         "unreviewed": 0,
         "not-applicable": 0
@@ -22571,7 +22571,9 @@
         "evidence": "derived:descendants",
         "tests": [
           "tests/corpus/1460-console-error-warn.ts",
-          "tests/corpus/2440-console-inspect-args.ts"
+          "tests/corpus/2440-console-inspect-args.ts",
+          "tests/corpus/2631-create-require/main.ts",
+          "tests/harness/npm-static.test.ts"
         ]
       },
       "dynamic": {
@@ -22709,8 +22711,8 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:console"
+        "status": "refused",
+        "evidence": "surface-manifest:unsupported:node-builtin.console.Console"
       },
       "dynamic": {
         "status": "partial",
@@ -22863,7 +22865,9 @@
         "evidence": "compiler-dedicated:console.debug",
         "tests": [
           "tests/corpus/1460-console-error-warn.ts",
-          "tests/corpus/2440-console-inspect-args.ts"
+          "tests/corpus/2440-console-inspect-args.ts",
+          "tests/corpus/2631-create-require/main.ts",
+          "tests/harness/npm-static.test.ts"
         ]
       },
       "dynamic": {
@@ -22954,7 +22958,9 @@
         "evidence": "compiler-dedicated:console.error",
         "tests": [
           "tests/corpus/1460-console-error-warn.ts",
-          "tests/corpus/2440-console-inspect-args.ts"
+          "tests/corpus/2440-console-inspect-args.ts",
+          "tests/corpus/2631-create-require/main.ts",
+          "tests/harness/npm-static.test.ts"
         ]
       },
       "dynamic": {
@@ -23075,7 +23081,9 @@
         "evidence": "compiler-dedicated:console.info",
         "tests": [
           "tests/corpus/1460-console-error-warn.ts",
-          "tests/corpus/2440-console-inspect-args.ts"
+          "tests/corpus/2440-console-inspect-args.ts",
+          "tests/corpus/2631-create-require/main.ts",
+          "tests/harness/npm-static.test.ts"
         ]
       },
       "dynamic": {
@@ -23109,7 +23117,9 @@
         "evidence": "compiler-dedicated:console.log",
         "tests": [
           "tests/corpus/1460-console-error-warn.ts",
-          "tests/corpus/2440-console-inspect-args.ts"
+          "tests/corpus/2440-console-inspect-args.ts",
+          "tests/corpus/2631-create-require/main.ts",
+          "tests/harness/npm-static.test.ts"
         ]
       },
       "dynamic": {
@@ -23290,7 +23300,9 @@
         "evidence": "compiler-dedicated:console.warn",
         "tests": [
           "tests/corpus/1460-console-error-warn.ts",
-          "tests/corpus/2440-console-inspect-args.ts"
+          "tests/corpus/2440-console-inspect-args.ts",
+          "tests/corpus/2631-create-require/main.ts",
+          "tests/harness/npm-static.test.ts"
         ]
       },
       "dynamic": {
@@ -59422,10 +59434,12 @@
         "status": "partial",
         "evidence": "derived:descendants",
         "tests": [
+          "tests/corpus/1423-text-codec.ts",
           "tests/corpus/1804-timers-module.ts",
           "tests/corpus/1805-timer-callback-args.ts",
           "tests/corpus/2093-timers-promises.ts",
           "tests/corpus/2852-timers-promises-interval.ts",
+          "tests/corpus/text-codec-values/main.ts",
           "tests/harness/fetch-conformance.test.ts"
         ]
       },
@@ -60818,8 +60832,12 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:globals"
+        "status": "partial",
+        "evidence": "compiler-feature:globals.TextDecoder",
+        "tests": [
+          "tests/corpus/1423-text-codec.ts",
+          "tests/corpus/text-codec-values/main.ts"
+        ]
       },
       "dynamic": {
         "status": "partial",
@@ -60878,8 +60896,12 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:globals"
+        "status": "partial",
+        "evidence": "compiler-feature:globals.TextEncoder",
+        "tests": [
+          "tests/corpus/1423-text-codec.ts",
+          "tests/corpus/text-codec-values/main.ts"
+        ]
       },
       "dynamic": {
         "status": "partial",
@@ -110313,7 +110335,10 @@
           "tests/corpus/1473-promisify-execfile.ts",
           "tests/corpus/1573-promisify-execfile-env-spread.ts",
           "tests/corpus/2440-console-inspect-args.ts",
-          "tests/corpus/2912-promisify-fs-readfile.ts"
+          "tests/corpus/2912-promisify-fs-readfile.ts",
+          "tests/corpus/text-codec-values/main.ts",
+          "tests/fixtures/node-types/text-codecs.mts",
+          "tests/harness/project-config.test.ts"
         ]
       },
       "dynamic": {
@@ -110862,8 +110887,13 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:util"
+        "status": "partial",
+        "evidence": "compiler-feature:util.util.TextDecoder",
+        "tests": [
+          "tests/corpus/text-codec-values/main.ts",
+          "tests/fixtures/node-types/text-codecs.mts",
+          "tests/harness/project-config.test.ts"
+        ]
       },
       "dynamic": {
         "status": "partial",
@@ -111000,8 +111030,13 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:util"
+        "status": "partial",
+        "evidence": "compiler-feature:util.textDecoder.decode",
+        "tests": [
+          "tests/corpus/text-codec-values/main.ts",
+          "tests/fixtures/node-types/text-codecs.mts",
+          "tests/harness/project-config.test.ts"
+        ]
       },
       "dynamic": {
         "status": "not-implemented",
@@ -111108,8 +111143,13 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:util"
+        "status": "partial",
+        "evidence": "compiler-feature:util.util.TextEncoder",
+        "tests": [
+          "tests/corpus/text-codec-values/main.ts",
+          "tests/fixtures/node-types/text-codecs.mts",
+          "tests/harness/project-config.test.ts"
+        ]
       },
       "dynamic": {
         "status": "partial",
@@ -111138,8 +111178,13 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:util"
+        "status": "partial",
+        "evidence": "compiler-feature:util.textEncoder.encode",
+        "tests": [
+          "tests/corpus/text-codec-values/main.ts",
+          "tests/fixtures/node-types/text-codecs.mts",
+          "tests/harness/project-config.test.ts"
+        ]
       },
       "dynamic": {
         "status": "not-implemented",
@@ -125817,7 +125862,8 @@
         "evidence": "derived:descendants",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -126427,7 +126473,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.crc32",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -126896,7 +126943,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.deflate",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -126930,7 +126978,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.deflateSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -126964,7 +127013,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.deflateRaw",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -126998,7 +127048,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.deflateRawSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -127032,7 +127083,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.gunzip",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -127066,7 +127118,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.gunzipSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -127100,7 +127153,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.gzip",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -127134,7 +127188,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.gzipSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -127168,7 +127223,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.inflate",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -127202,7 +127258,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.inflateSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -127236,7 +127293,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.inflateRaw",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -127270,7 +127328,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.inflateRawSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -127304,7 +127363,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.unzip",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -127338,7 +127398,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.unzipSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128164,7 +128225,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.deflate",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128198,7 +128260,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.deflateSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128232,7 +128295,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.deflateRaw",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128266,7 +128330,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.deflateRawSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128300,7 +128365,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.gunzip",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128334,7 +128400,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.gunzipSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128368,7 +128435,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.gzip",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128402,7 +128470,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.gzipSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128436,7 +128505,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.inflate",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128470,7 +128540,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.inflateSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128504,7 +128575,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.inflateRaw",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128538,7 +128610,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.inflateRawSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128572,7 +128645,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.unzip",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {
@@ -128606,7 +128680,8 @@
         "evidence": "surface-manifest:node-builtin.zlib.unzipSync",
         "tests": [
           "tests/corpus/1404-zlib-crypto-bytes.ts",
-          "tests/corpus/2921-zlib-callbacks.ts"
+          "tests/corpus/2921-zlib-callbacks.ts",
+          "tests/corpus/3115-zlib-static-compression-levels.ts"
         ]
       },
       "dynamic": {

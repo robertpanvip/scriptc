@@ -6,9 +6,10 @@ import { InternalCompilerError } from "../../errors.js";
 import type { CEmitter, ScopeEntry } from "./c-emitter.js";
 import type { IrFunction } from "../../ir/ir.js";
 import { mangleField, mangleGlobal, mangleLocal, mangleRawParam } from "../mangle.js";
-import { BOOL, CAUGHT, IrExpr, IrStmt, RUNTIME_ERROR_CLASSES, isRefCounted } from "../../ir/ir.js";
+import { BOOL, CAUGHT, type IrExpr, type IrStmt, RUNTIME_ERROR_CLASSES, isRefCounted } from "../../ir/ir.js";
 import { boxAccess, cDecl, cStringLiteral, elemAccess, vAdapters } from "./types.js";
 import { OVERFLOW_MEMBER } from "./shapes.js";
+import { checkGlobalTdz, writeBox } from "./bindings.js";
 import { emitStableReceiver } from "./exprs.js";
 import { matchIntegerBytesForLoop } from "../../ir/integer-loops.js";
 import { analyzeIntegerRanges } from "../../ir/integer-ranges.js";
@@ -20,6 +21,7 @@ import { endsWithJump, matchStringSelfConcat } from "../../ir/analysis.js";
 
 
 export function emitFunction(emitter: CEmitter, fn: IrFunction): void {
+    emitter.sourceLoc = fn.loc;
     emitter.tempCounter = 0;
     emitter.frames = [];
     emitter.scopes = [];
@@ -93,6 +95,8 @@ export function emitFunction(emitter: CEmitter, fn: IrFunction): void {
 
     emitter.indent--;
     emitter.line(`}`);
+    // Keep generated runtime scaffolding out of the user's source file.
+    emitter.endSourceFunction();
     emitter.line(``);
   }
 
@@ -166,6 +170,16 @@ export function emitStmts(emitter: CEmitter, stmts: IrStmt[]): void {
   }
 
 export function emitStmt(emitter: CEmitter, s: IrStmt): void {
+    const previous = emitter.sourceLoc;
+    emitter.sourceLoc = s.loc;
+    try {
+      emitStmtBody(emitter, s);
+    } finally {
+      emitter.sourceLoc = previous;
+    }
+  }
+
+function emitStmtBody(emitter: CEmitter, s: IrStmt): void {
     emitter.frames.push([]);
     switch (s.kind) {
       case "varDecl": {
@@ -259,6 +273,7 @@ export function emitStmt(emitter: CEmitter, s: IrStmt): void {
           if (!g) throw new InternalCompilerError(`emitter bug: assign to unknown binding ${s.localId}`);
           const target = mangleGlobal(g.id);
           const v = emitter.emitExpr(s.value);
+          if (!s.initializes) checkGlobalTdz(emitter, g);
           emitter.moveTemp(v);
           if (isRefCounted(v.type)) emitter.releaseValue(target, v.type);
           emitter.line(`${target} = ${v.name};${emitter.srcComment(s.loc)}`);
@@ -267,19 +282,9 @@ export function emitStmt(emitter: CEmitter, s: IrStmt): void {
         const target = mangleLocal(s.localId);
         const v = emitter.emitExpr(s.value);
         if (local!.boxed) {
-          // A scalar TDZ box (forward-captured const): the initializing
-          // write mints the one-element array cell — set_ref moves it in
-          // (and the empty-slot sentinel ends here).
-          if (local!.tdz && boxAccess(local!.type) !== "ref") {
-            const acc = boxAccess(local!.type);
-            const cell = `sc_t${emitter.tempCounter++}`;
-            emitter.line(`ScrArr *${cell} = ${emitter.arrNewC(local!.type, 1)};${emitter.srcComment(s.loc)}`);
-            emitter.line(`scr_arr_push_${acc}(${cell}, ${v.name});`);
-            emitter.line(`scr_box_set_ref(${target}, ${cell});`);
-            break;
-          }
-          if (isRefCounted(v.type)) emitter.moveTemp(v); // set_ref releases the old value
-          emitter.line(`scr_box_set_${boxAccess(local!.type)}(${target}, ${v.name});${emitter.srcComment(s.loc)}`);
+          writeBox(emitter, local, v.name, s.initializes);
+          // A TDZ failure must still unwind the evaluated RHS.
+          if (isRefCounted(v.type)) emitter.moveTemp(v);
           break;
         }
         emitter.moveTemp(v);
@@ -708,6 +713,13 @@ export function emitStmt(emitter: CEmitter, s: IrStmt): void {
           // uncaught printer's "name: message" for Error instances).
           const rc = vAdapters(t);
           emitter.line(`scr_throw_obj(${v.name}, &${rc.retain}, &${rc.release}, ${emitter.traceArgC(t)});${emitter.srcComment(s.loc)}`);
+        } else if (t.kind === "symbol" || t.kind === "bigint" || t.kind === "func" || t.kind === "classval") {
+          const rc = vAdapters(t);
+          emitter.line(`scr_throw_primitive_ref(${v.name}, &${rc.retain}, &${rc.release}, NULL);${emitter.srcComment(s.loc)}`);
+        } else if (t.kind === "dyn" || t.kind === "jsval") {
+          const rc = vAdapters(t);
+          const test = t.kind === "dyn" ? "scr_dyn_is_object" : "scr_jsval_is_object";
+          emitter.line(`scr_throw_ref_classified(${v.name}, &${rc.retain}, &${rc.release}, ${emitter.traceArgC(t)}, ${test}(${v.name}));${emitter.srcComment(s.loc)}`);
         } else {
           const rc = vAdapters(t);
           emitter.line(`scr_throw_ref(${v.name}, &${rc.retain}, &${rc.release}, ${emitter.traceArgC(t)});${emitter.srcComment(s.loc)}`);
@@ -1006,10 +1018,10 @@ export function emitStmt(emitter: CEmitter, s: IrStmt): void {
     // Bodies in source order: entering one falls through the rest (JS-exact)
     // until a break jumps to the end label.
     const target = {
+      labels: s.labels,
       kind: "switch" as const,
       endLabel,
       usedEnd: defaultIdx < 0,
-      ...(s.labels !== undefined && { labels: s.labels }),
       scopeDepth: emitter.scopes.length,
       frameDepth: emitter.frames.length,
       finallyDepth: emitter.finallyStack.length,
@@ -1034,8 +1046,9 @@ export function emitStmt(emitter: CEmitter, s: IrStmt): void {
 /** Emits `if (cond) ` followed by a block on the same line for readability. */
   export function mergeBrace(emitter: CEmitter, emitBlockFn: () => void): void {
     const head = emitter.lines.pop()!;
-    const before = emitter.lines.length;
+    let before = emitter.lines.length;
     emitBlockFn();
+    while (emitter.lines[before]?.startsWith("#line ")) before++;
     emitter.lines[before] = head + emitter.lines[before]!.trimStart();
   }
 

@@ -6,6 +6,7 @@ import { DYN_KIND } from "./dyn.js";
 import { elemAccess, vAdapters } from "./shapes.js";
 import { LlvmUnsupportedError } from "./unsupported.js";
 import type { LlvmEmitterContext, ExprOf, LlValue } from "./expr-context.js";
+import { emitUnionWiden } from "./expr-records.js";
 
 export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | "dynFromJsval" | "dynCall" | "dynInvoke" | "dynArrLit" | "dynObjLit" | "unionWrap" | "unionNarrow" | "unionDisc" | "unionKeyGet" | "unionIsTag" | "dynKeyGet" | "dynHasKey" | "dynScalarEq" | "dynTest" | "unionEq" | "unionFuncEq" | "caughtTest" | "caughtCheck" | "caughtNarrow" | "caughtToDyn">): LlValue {
     const B = host.B;
@@ -55,7 +56,7 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
             );
             host.liveDynRefAdapters.set(key, adapter);
           }
-          const rc = vAdapters(host, v.type);
+          const rc = vAdapters(host.shapeHost, v.type);
           host.declare(
             `declare ptr @scr_dyn_new_typed_ref(ptr, ptr, ptr, ptr, ${host.sizeType}, ptr, ptr)`,
           );
@@ -325,6 +326,12 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
               B.br(join);
               return;
             }
+            if (arm.elem.kind === "union" && e.type.kind === "union") {
+              const widened = emitUnionWiden(host, v, arm.elem.unionId, e.type.unionId, true);
+              B.line(`store ptr ${widened}, ptr ${slot}`);
+              B.br(join);
+              return;
+            }
             const tag = resultDef?.arms.findIndex((a) => typeEquals(a, arm.elem)) ?? -1;
             if (tag < 0 || e.type.kind !== "union" || isUnitType(arm.elem)) {
               throw new InternalCompilerError(`llvm emitter bug: unionKeyGet element ${arm.elem.kind} outside the join`);
@@ -344,6 +351,12 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
             const v = host.loadField(ptr, ft);
             if (typeEquals(ft, e.type)) {
               B.line(`store ${ty} ${isRefCounted(ft) ? host.retainValue(v, ft) : v}, ptr ${slot}`);
+              B.br(join);
+              return;
+            }
+            if (ft.kind === "union" && e.type.kind === "union") {
+              const widened = emitUnionWiden(host, v, ft.unionId, e.type.unionId, false);
+              B.line(`store ptr ${widened}, ptr ${slot}`);
               B.br(join);
               return;
             }
@@ -731,6 +744,15 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
           host.declare(`declare zeroext i1 @scr_caught_instanceof(ptr, ${host.sizeType}, ${host.sizeType})`);
           const t = B.tmp();
           B.line(`${t} = call zeroext i1 @scr_caught_instanceof(ptr ${c.name}, ${host.sizeType} ${target.pre}, ${host.sizeType} ${target.post})`);
+          if (e.negated !== true) return { name: t, type: e.type };
+          const n = B.tmp();
+          B.line(`${n} = xor i1 ${t}, true`);
+          return { name: n, type: e.type };
+        }
+        if (e.test === "object") {
+          host.declare(`declare zeroext i1 @scr_caught_is_object(ptr)`);
+          const t = B.tmp();
+          B.line(`${t} = call zeroext i1 @scr_caught_is_object(ptr ${c.name})`);
           if (e.negated !== true) return { name: t, type: e.type };
           const n = B.tmp();
           B.line(`${n} = xor i1 ${t}, true`);

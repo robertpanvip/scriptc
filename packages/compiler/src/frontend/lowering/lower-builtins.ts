@@ -4,17 +4,17 @@ import { InternalCompilerError } from "../../errors.js";
  * methods), JSON.parse/stringify, process properties/methods and
  * process.env access, and console.log detection. */
 import { builtinModules } from "node:module";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { PoisonError, dynUndefinedExpr, ladderFenceExpr, nodeThrowExpr, own } from "./lowerer.js";
-import { canonicalBuiltinModule, isJsSourceFile, isNodeEsmFile, locOf, npmStaticDepSf7, requireSpecOf, resolveImport } from "../program.js";
+import { canonicalBuiltinModule, isCreateRequireBinding7, isJsSourceFile, isNodeEsmFile, locOf, npmStaticDepSf7, requireSpecOf, resolveImport } from "../program.js";
 import { isRelativeSpecifier } from "../workspace-registry.js";
 import { probeNodeRequireRefusal } from "../npm.js";
 import { isNpmStaticPackage } from "../npm-static.js";
 import { trackedReadFile } from "../input-tracker.js";
 import { requireResolvePathsRuntime, resolveImportMetaRuntime, resolveRequireRuntime, type RuntimeResolveError, type RuntimeResolveResult } from "../runtime-resolve.js";
-import { invalidJsonModuleDiag, requiresDynamicImportDiag } from "../../diagnostics/diagnostic.js";
+import { invalidJsonModuleDiag, nativeAddonDiag, requiresDynamicImportDiag } from "../../diagnostics/diagnostic.js";
 import {
   BuiltinModuleFn,
   builtinModuleFnOf,
@@ -151,11 +151,13 @@ function lowerOptionalNumberPredicate(
   fn: IrLibFn,
   loc: SrcLoc,
 ): IrExpr | null {
-  const widened = lowerer.runtimeOptionalWidening(value.type, F64);
-  if (!widened || widened.kind !== "union") return null;
+  // Number predicates do not coerce. In a mixed union only the numeric
+  // arm runs the predicate; every other arm answers false after evaluating
+  // the argument once. This includes the undefined added by array reads.
+  const widened = value.type;
+  if (widened.kind !== "union") return null;
   const numberTag = lowerer.armTag(widened.unionId, F64);
-  const undefinedTag = lowerer.armTag(widened.unionId, UNDEFINED_T);
-  if (numberTag < 0 || undefinedTag < 0) return null;
+  if (numberTag < 0) return null;
   const key = `number.optionalPredicate:${fn}:${widened.unionId}`;
   let helper = lowerer.widthHelpers.get(key);
   if (!helper) {
@@ -170,7 +172,7 @@ function lowerOptionalNumberPredicate(
       body: [
         {
           kind: "if",
-          cond: { kind: "unionIsTag", unionId: widened.unionId, tag: undefinedTag, negated: false, value: input, type: BOOL, loc },
+          cond: { kind: "unionIsTag", unionId: widened.unionId, tag: numberTag, negated: true, value: input, type: BOOL, loc },
           then: [{ kind: "return", value: boolLit(false, loc), loc }],
           else_: null,
           loc,
@@ -401,7 +403,7 @@ function lowerBuiltinOptionalDefault(
     if (!bi || bi.module !== "module" || bi.member !== "createRequire") return null;
     if (e.arguments.length !== 1) return null;
     const base = stripTypeCasts(e.arguments[0]!);
-    if (ts.isIdentifier(base) && base.text === "__filename") return e;
+    if (ts.isIdentifier(base) && lowerer.isStdlibGlobal(base, "__filename")) return e;
     if (
       ts.isPropertyAccessExpression(base) &&
       !base.questionDotToken &&
@@ -417,15 +419,21 @@ function lowerBuiltinOptionalDefault(
 /** True for `const require = createRequire(import.meta.url)` — the
    * binding is compile-time plumbing (each call through it resolves per
    * site) with no storage and no code; both declaration walks skip by
-   * this test. A reassignable (let/var) binding never matches — callers
-   * gate on constness like the other alias decls. */
+   * this test. Top-level let/var bindings also qualify when preflight's
+   * shared proof rules out writes, escapes, and use before initialization. */
   export function createRequireBindingDecl(lowerer: Lowerer, nameNode: ts.Node, init: ts.Expression | undefined): boolean {
-    if (!ts.isIdentifier(nameNode) || init === undefined) return false;
-    return createRequireBaseCallOf(lowerer, init) !== null;
+    if (!ts.isIdentifier(nameNode) || init === undefined || createRequireBaseCallOf(lowerer, init) === null) return false;
+    // Preserve const loaders acquired through CommonJS member/destructure
+    // aliases, which builtinImportOf also recognizes. Mutable syntax uses
+    // preflight's narrower import provenance and whole-file stability proof.
+    const decl = nameNode.parent;
+    if (ts.isVariableDeclaration(decl) && ts.isVariableDeclarationList(decl.parent) &&
+        (decl.parent.flags & ts.NodeFlags.Const) !== 0) return true;
+    return isCreateRequireBinding7(lowerer.program, nameNode);
   }
 
 /** The declaring source file when `callee` denotes a createRequire-made
-   * require: a CONST binding over createRequire(import.meta.url) (the
+   * require: a stable binding over createRequire(import.meta.url) (the
    * binding's own file anchors resolution) or the inline
    * `createRequire(import.meta.url)(...)` spelling (the call's file).
    * Null off the pattern, so call chains keep trying. */
@@ -438,8 +446,7 @@ function lowerBuiltinOptionalDefault(
     const symbol = lowerer.checker.getSymbolAtLocation(e);
     const decl = symbol ? lowerer.checker.declarationsOf(symbol)[0] : undefined;
     if (!decl || !ts.isVariableDeclaration(decl) || decl.initializer === undefined) return null;
-    if (!ts.isVariableDeclarationList(decl.parent) || (decl.parent.flags & ts.NodeFlags.Const) === 0) return null;
-    return createRequireBaseCallOf(lowerer, decl.initializer) !== null ? decl.getSourceFile() : null;
+    return createRequireBindingDecl(lowerer, decl.name, decl.initializer) ? decl.getSourceFile() : null;
   }
 
 /** The static require of `R("spec")` through a createRequire binding:
@@ -651,15 +658,26 @@ function lowerBuiltinOptionalDefault(
         "imports-field specifiers have no require lowering yet — import the target statically",
       );
     }
-    if (isRelativeSpecifier(spec) || spec.startsWith("/")) {
+    if (isRelativeSpecifier(spec) || isAbsolute(spec)) {
       if (!spec.endsWith(".json")) {
+        // Only refine the existing refusal path: Node resolution detects
+        // extensionless addons and directory entries without executing
+        // them, and avoids mistaking a .node-named JS directory for one.
+        // This probe marks frontend inputs unstable, but every branch
+        // here refuses compilation, so successful-build caches keep their
+        // existing dependency proofs.
+        const resolved = resolveRequireRuntime(cr.baseFile.fileName, spec, lowerer.targetPlatform);
+        if (resolved.ok && resolved.value.endsWith(".node")) {
+          lowerer.pushDiag(nativeAddonDiag(spec, loc));
+          throw new PoisonError();
+        }
         lowerer.noLowering(
           `createRequire's require of '${spec}'`,
           call,
           "relative program modules lower when they resolve into the compiled graph; relative .json documents bake at build time",
         );
       }
-      const abs = spec.startsWith("/")
+      const abs = isAbsolute(spec)
         ? spec
         : resolve(dirname(cr.baseFile.fileName), spec);
       const text = trackedReadFile(abs);
@@ -1434,6 +1452,32 @@ function lowerFsSyncBufferWindow(
     }
     const syncFn = ZLIB_SYNC_FNS[bi.member];
     if (syncFn !== undefined) {
+      if (expr.arguments.length === 2 &&
+        (bi.member === "deflateSync" || bi.member === "deflateRawSync" || bi.member === "gzipSync")) {
+        const options = expr.arguments[1]!;
+        // A literal level is enough for build-time compression in the native
+        // emitters. Other options retain the explicit refusal: silently
+        // dropping strategy/windowBits/dictionaries changes the wire bytes.
+        if (ts.isObjectLiteralExpression(options) && options.properties.length === 1) {
+          const prop = options.properties[0]!;
+          if (ts.isPropertyAssignment(prop) &&
+            (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)) && prop.name.text === "level") {
+            const value = prop.initializer;
+            const level = ts.isNumericLiteral(value) ? Number(value.text)
+              : ts.isPrefixUnaryExpression(value) && value.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(value.operand)
+                ? -Number(value.operand.text) : NaN;
+            if (Number.isInteger(level) && level >= -1 && level <= 9) {
+              return {
+                kind: "libCall", fn: "zlib.deflateLevelSync",
+                args: [zlibInputBytes(lowerer, expr.arguments[0]!, loc), numLit(bi.member === "deflateSync" ? 0 : bi.member === "deflateRawSync" ? 1 : 2, loc), numLit(level, loc)],
+                type: BYTES_U8, loc,
+              };
+            }
+          }
+        }
+        lowerer.noLowering(`${bi.member} with these options`, options,
+          "the static compression options form is { level: <integer literal from -1 through 9> }");
+      }
       if (expr.arguments.length !== 1) {
         const site = expr.arguments[1] ?? expr;
         lowerer.noLowering(
@@ -4747,39 +4791,30 @@ export function lowerForkCall(lowerer: Lowerer, expr: ts.CallExpression, loc: Sr
     return name;
   }
 
-/** `JSON.parse(text)` / `JSON.stringify(value)`.
-   * - parse → a may-throw `libCall` producing a dyn value (the runtime JSON
-   *   dyn); malformed input throws a catchable SyntaxError-shaped string.
-   *   The divergence override types the one-argument form `unknown`; the
-   *   lib's reviver form typechecks (returning `any`) and is fenced here.
-   * - stringify → the type-DIRECTED `jsonStringify` node: the lib
-   *   signature honestly says `any`, but lowering requires the argument's
-   *   STATIC IR type to be JSON-safe — the backend emits a per-type
-   *   serializer, never a dynamic walk, so dyn (and closures/class
-   *   instances) are rejected here with a specific message. The
-   *   `stringify(v, null, space)` pretty-print form compiles when the
-   *   replacer is the literal null (or undefined) and the space is a
-   *   LITERAL — Node's rules apply at compile time (numbers clamp to 0–10
-   *   spaces, strings truncate to 10 code units) and the resolved indent
-   *   rides the node to the backend's re-indenter. Function replacers and
-   *   non-literal spaces stay fenced.
-   * Null when this isn't a JSON member call. */
+/** JSON parse produces checked-dynamic data; a native reviver walks it
+ * bottom-up before any checked cast. Stringify without a callback keeps
+ * its type-directed fast path. A function replacer boxes the input and
+ * walks it before primitive normalization. Both paths share literal gap
+ * rules, and callback failures use ordinary native exception unwinding. */
   export function lowerJsonMethodCall(lowerer: Lowerer, call: ts.CallExpression,
     access: ts.PropertyAccessExpression,): IrExpr | null {
     if (call.questionDotToken) return null;
     const member = lowerer.stdlibGlobalMember(access, "JSON");
     if (member === null) return null;
     const loc = locOf(call);
-    if (member === "parse" && call.arguments.length !== 1) {
-      lowerer.noLowering(
-        "JSON.parse with a reviver",
-        call,
-        "parse to `unknown` and validate with a checked cast ('as T') instead",
-      );
+    if ((member === "parse" && (call.arguments.length < 1 || call.arguments.length > 2)) ||
+        (member === "stringify" && call.arguments.length > 3) ||
+        call.arguments.some(ts.isSpreadElement)) {
+      lowerer.noLowering(`JSON.${member} with extra or spread arguments`, call, "pass the JSON arguments explicitly");
     }
     if (member === "parse") {
       const text = lowerer.lowerExprExpecting(call.arguments[0]!, STRING);
-      return { kind: "libCall", fn: "json.parse", args: [text], type: DYN, loc };
+      const reviver = call.arguments[1];
+      if (!reviver || jsonNullishArgument(lowerer, reviver)) {
+        return { kind: "libCall", fn: "json.parse", args: [text], type: DYN, loc };
+      }
+      const callback = lowerJsonCallback(lowerer, reviver, "reviver");
+      return { kind: "libCall", fn: "json.parseReviver", args: [text, callback], type: DYN, loc };
     }
     if (member === "stringify") {
       const indent = stringifySpaceIndent(lowerer, call);
@@ -4787,7 +4822,36 @@ export function lowerForkCall(lowerer: Lowerer, expr: ts.CallExpression, loc: Sr
         return lowerer.wrappedUndefined(lowerer.withUndefinedArm(STRING), loc)!;
       }
       const argNode = call.arguments[0]!;
-      const value = lowerer.lowerExpr(argNode);
+      let value = lowerer.lowerExpr(argNode);
+      const replacer = call.arguments[1];
+      if (replacer && !jsonNullishArgument(lowerer, replacer)) {
+        const callback = lowerJsonCallback(lowerer, replacer, "replacer");
+        if (value.type.kind === "undefinedT" || value.type.kind === "nullT") value = lowerer.coerceToExpected(value, DYN);
+        // Evaluate the original arguments before taking a typed snapshot.
+        // Creating the callback can itself mutate the input object.
+        const inputSlot = lowerer.declareHiddenLocal("%jsonInput", value.type);
+        const callbackSlot = lowerer.declareHiddenLocal("%jsonCallback", DYN);
+        const boxed = lowerer.coerceToExpected(varRef(inputSlot.id, value.type, loc), DYN);
+        if (boxed.type.kind !== "dyn") {
+          lowerer.unsupported("SC1090", argNode,
+            `JSON.stringify callback input of type '${lowerer.fmt(value.type)}' (the value must cross the checked-dynamic boundary)`);
+        }
+        const raw: IrExpr = {
+          kind: "libCall", fn: "json.stringifyReplacer",
+          args: [boxed, varRef(callbackSlot.id, DYN, loc), { kind: "strLit", value: indent, type: STRING, loc }],
+          type: DYN, loc,
+        };
+        // A replacer can omit even the root. Preserve actual undefined;
+        // an inferred binding adopts this union, while a required string
+        // consumer uses the ordinary checked optional-value boundary.
+        const result: IrExpr = { kind: "dynCheck", value: raw, type: lowerer.withUndefinedArm(STRING), loc };
+        return {
+          kind: "seqExpr", stmts: [
+            { kind: "varDecl", localId: inputSlot.id, init: value, loc },
+            { kind: "varDecl", localId: callbackSlot.id, init: callback, loc },
+          ], result, type: result.type, loc,
+        };
+      }
       const optionalString = lowerOptionalStringifyRoot(lowerer, value, indent, loc);
       if (optionalString) return optionalString;
       // An ISLAND value (`JSON.stringify(err)` on a package handle — the
@@ -4898,13 +4962,33 @@ function lowerOptionalStringifyRoot(lowerer: Lowerer, value: IrExpr, indent: str
   return { kind: "call", callee: helper, args: [value], type: resultT, loc };
 }
 
-/** The compile-time indent of a `JSON.stringify(v[, replacer[, space]])`
-   * call, with Node's space rules applied: a number clamps to 0–10 spaces
-   * (ToInteger truncation), a string truncates to its first 10 code units,
-   * and null/undefined/0/"" mean compact ("" here). Only literal
-   * replacer/space spellings compile — the replacer must be `null` (or
-   * `undefined`), the space a numeric/string literal or `null`/`undefined`;
-   * everything else keeps the existing fence. */
+/** Only explicit null/undefined select the no-callback path. */
+function jsonNullishArgument(lowerer: Lowerer, node: ts.Expression): boolean {
+  if (ts.isParenthesizedExpression(node)) return jsonNullishArgument(lowerer, node.expression);
+  if (node.kind === ts.SyntaxKind.NullKeyword) return true;
+  if (!ts.isIdentifier(node) || node.text !== "undefined") return false;
+  const symbol = lowerer.checker.getSymbolAtLocation(node);
+  return symbol !== undefined && lowerer.checker.declarationsOf(symbol).every((decl) => lowerer.isStdlibFile(decl.getSourceFile()));
+}
+
+/** JSON callbacks cross the same checked native function boundary as other
+ * runtime callbacks. Reviver source contexts need parser source tracking;
+ * refuse signatures that request one until that protocol is implemented. */
+function lowerJsonCallback(lowerer: Lowerer, node: ts.Expression, role: "replacer" | "reviver"): IrExpr {
+  const callback = lowerer.lowerExpr(node);
+  if (callback.type.kind === "func" && callback.type.params.length <= 2 &&
+      (role !== "reviver" || (!callback.type.rest && !callback.type.argumentsAll)) &&
+      canBoxFuncIntoDyn(callback.type, (id) => lowerer.shapes.get(id), (id) => lowerer.unions.get(id))) {
+    return { kind: "dynFrom", value: callback, type: DYN, loc: locOf(node) };
+  }
+  lowerer.noLowering(
+    `JSON ${role} of type '${lowerer.fmt(callback.type)}'`, node,
+    "use a native function taking key and value; replacer arrays and reviver source contexts are not supported yet",
+  );
+}
+
+/** Compile-time Node gap rules: numbers clamp to 0–10 spaces and strings
+ * truncate to ten UTF-16 code units. Callback validation is independent. */
   function stringifySpaceIndent(lowerer: Lowerer, call: ts.CallExpression): string {
     const fence = (): never =>
       lowerer.noLowering(
@@ -4916,9 +5000,7 @@ function lowerOptionalStringifyRoot(lowerer: Lowerer, value: IrExpr, indent: str
     const unwrap = (e: ts.Expression): ts.Expression =>
       ts.isParenthesizedExpression(e) ? unwrap(e.expression) : e;
     const isUndefined = (e: ts.Expression): boolean =>
-      ts.isIdentifier(e) && e.text === "undefined";
-    const replacer = unwrap(call.arguments[1]!);
-    if (replacer.kind !== ts.SyntaxKind.NullKeyword && !isUndefined(replacer)) fence();
+      jsonNullishArgument(lowerer, e);
     if (call.arguments.length === 2) return "";
     const space = unwrap(call.arguments[2]!);
     if (space.kind === ts.SyntaxKind.NullKeyword || isUndefined(space)) return "";
@@ -6814,7 +6896,8 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
     );
   }
 
-/** `.code` on an error-hierarchy receiver — NodeJS.ErrnoException's
+/** `.code` and `.cause` on an error-hierarchy receiver. The latter reads
+   * the hidden dyn slot installed by constructor options. The former is NodeJS.ErrnoException's
    * member (the fallback declares the same shape): the runtime Error's
    * code slot as `string | undefined` — the errno name where a throw site
    * stamped one (fs, exec spawn/timeout, process.kill, the spawn 'error'
@@ -6846,9 +6929,9 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
         return { kind: "libCall", fn: "error.domCause", args: [receiver], type: DYN, loc: locOf(expr) };
       }
     }
-    if (expr.name.text !== "code") return null;
+    if (expr.name.text !== "code" && expr.name.text !== "cause") return null;
     // Error-rooted classes only — builtin or user subclass (both embed the
-    // code slot in their layout prefix).
+    // code and cause slots in their layout prefix).
     let info = lowerer.classes.get(recvT.className) ?? null;
     while (info && info.base) info = info.base;
     if (!info || info.def.name !== "%Error") return null;
@@ -6856,9 +6939,9 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
     const receiver = lowerer.lowerExpr(expr.expression);
     return {
       kind: "libCall",
-      fn: "error.code",
+      fn: expr.name.text === "cause" ? "error.cause" : "error.code",
       args: [receiver],
-      type: lowerer.envValueType(),
+      type: expr.name.text === "cause" ? DYN : lowerer.envValueType(),
       loc: locOf(expr),
     };
   }
@@ -8611,6 +8694,88 @@ function staticTextDecoderEncoding(label: string): StaticTextDecoderEncoding | n
   return id === undefined ? null : { kind: "legacy", id };
 }
 
+/** Box a codec's immutable encoding in an owned record. Unlike erased
+ * aliases, this value can live in fields, arguments, and closure captures. */
+export function lowerTextCodecNew(lowerer: Lowerer, ctor: ts.NewExpression, cls: TextCodecCtor["cls"]): IrExpr {
+  const args = ctor.arguments ?? [];
+  const loc = locOf(ctor);
+  let encoding = -1;
+  let label: IrExpr | null = null;
+  if (cls === "TextEncoder") {
+    if (args.length !== 0) lowerer.noLowering("new TextEncoder with arguments", ctor);
+  } else if (args.length !== 0) {
+    const labelT = lowerer.typeOf(args[0]!);
+    const parsed = labelT.isStringLiteralType() ? staticTextDecoderEncoding(labelT.value) : null;
+    if (args.length !== 1 || parsed === null) {
+      lowerer.noLowering("new TextDecoder with runtime-valued options or an unknown label", ctor,
+        "a recognized literal WHATWG label with default options compiles");
+    }
+    encoding = parsed.kind === "utf8" ? -1 : parsed.id;
+    label = lowerer.lowerExprExpecting(args[0]!, STRING);
+  }
+  const type = lowerer.mapTypeOf(lowerer.typeOf(ctor));
+  if (type?.kind !== "record") lowerer.badType(ctor, lowerer.typeOf(ctor));
+  const result: IrExpr = {
+    kind: "recordLit", fields: [{ name: `%${cls}`, value: { kind: "numLit", value: encoding, type: F64, loc } }], type, loc,
+  };
+  return label === null || label.kind === "strLit" ? result : {
+    kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: label, loc }], result, type, loc,
+  };
+}
+
+function storedTextCodecClassOf(lowerer: Lowerer, expr: ts.Expression): TextCodecCtor["cls"] | null {
+  const sym = lowerer.typeOf(expr).getSymbol();
+  if (!sym || (sym.name !== "TextEncoder" && sym.name !== "TextDecoder")) return null;
+  return lowerer.checker.declarationsOf(sym).some((d) =>
+    (ts.isInterfaceDeclaration(d) || ts.isClassDeclaration(d)) && lowerer.isStdlibFile(d.getSourceFile()),
+  ) ? sym.name : null;
+}
+
+function lowerStoredTextCodecCall(lowerer: Lowerer, call: ts.CallExpression, access: ts.PropertyAccessExpression): IrExpr | null {
+  const cls = storedTextCodecClassOf(lowerer, access.expression);
+  if (cls === null || !lowerer.isStdlibMember(access)) return null;
+  if (access.name.text !== (cls === "TextEncoder" ? "encode" : "decode")) return null;
+  if (call.arguments.length > 1) {
+    lowerer.noLowering(cls === "TextDecoder" ? "decode with a stream option" : "TextEncoder.encode with extra arguments", call);
+  }
+  const loc = locOf(call);
+  const receiver = lowerer.lowerExpr(access.expression);
+  if (receiver.type.kind !== "record") lowerer.badType(access.expression, lowerer.typeOf(access.expression));
+  const arg: IrExpr = call.arguments.length === 0
+    ? cls === "TextEncoder" ? strLit("", loc)
+      : { kind: "bytesNew", source: null, type: BYTES_U8, loc }
+    : cls === "TextEncoder" ? lowerer.lowerExprExpecting(call.arguments[0]!, STRING) : lowerer.lowerExpr(call.arguments[0]!);
+  if (cls === "TextDecoder" && !(arg.type.kind === "bytes" && arg.type.elem === "u8")) {
+    lowerer.noLowering(`TextDecoder.decode of '${lowerer.fmt(arg.type)}' values`, call,
+      "Uint8Array/Buffer input decodes (ArrayBuffer values have no representation)");
+  }
+  const key = `textCodec.${cls}.${receiver.type.shapeId}`;
+  let name = lowerer.widthHelpers.get(key);
+  if (!name) {
+    name = `%${key}`;
+    lowerer.widthHelpers.set(key, name);
+    const recT = receiver.type;
+    const input = varRef("input.0", arg.type, loc);
+    const result: IrExpr = cls === "TextEncoder"
+      ? { kind: "libCall", fn: "buffer.fromStr", args: [input, { kind: "strLit", value: "utf8", type: STRING, loc }], type: BYTES_U8, loc }
+      : {
+        kind: "ternary",
+        cond: { kind: "bin", op: "<", left: { kind: "recordGet", obj: varRef("codec.0", recT, loc), shapeId: recT.shapeId, field: "%TextDecoder", type: F64, loc }, right: { kind: "numLit", value: 0, type: F64, loc }, type: BOOL, loc },
+        then: { kind: "libCall", fn: "text.decode", args: [input], type: STRING, loc },
+        else_: { kind: "libCall", fn: "text.decodeLegacy", args: [input, { kind: "recordGet", obj: varRef("codec.0", recT, loc), shapeId: recT.shapeId, field: "%TextDecoder", type: F64, loc }], type: STRING, loc },
+        type: STRING, loc,
+      };
+    lowerer.liftedFns.push({
+      name,
+      params: [{ localId: "codec.0", name: "codec", type: recT }, { localId: "input.0", name: "input", type: arg.type }],
+      returnType: result.type,
+      locals: [{ id: "codec.0", name: "codec", type: recT, mutable: false }, { id: "input.0", name: "input", type: arg.type, mutable: false }],
+      body: [{ kind: "return", value: result, loc }], loc,
+    });
+  }
+  return { kind: "call", callee: name, args: [receiver, arg], type: cls === "TextEncoder" ? BYTES_U8 : STRING, loc };
+}
+
 /** A direct construction of THE stdlib TextEncoder/TextDecoder, through
    * type-only wrappers. Name alone is never enough: a user class with the
    * same spelling keeps the ordinary class lowering. */
@@ -8626,125 +8791,8 @@ function staticTextDecoderEncoding(label: string): StaticTextDecoderEncoding | n
     return { cls: sym.name, ctor };
   }
 
-/** True when construction itself is effect-free and inside the already
-   * lowered codec slice, so a const binding can be erased and calls can
-   * resolve back to the initializer. TextDecoder's explicit label must be
-   * an actual recognized literal here: accepting an arbitrary expression
-   * merely typed as a label would move or repeat its effects when the
-   * binding is erased. */
-  function erasableTextCodecCtor(info: TextCodecCtor): boolean {
-    const args = info.ctor.arguments ?? [];
-    if (info.cls === "TextEncoder") return args.length === 0;
-    if (args.length === 0) return true;
-    if (args.length !== 1) return false;
-    const label = stripTypeCasts(args[0]!);
-    return ts.isStringLiteralLike(label) && staticTextDecoderEncoding(label.text) !== null;
-  }
-
-/** `const encoder = new TextEncoder()` / a statically-labelled TextDecoder twin:
-   * compile-time alias plumbing with no runtime object. Calls through the
-   * stable binding are recognized by textCodecReceiverOf below; any other
-   * reached value use keeps the ordinary SC2020 representation fence. Both
-   * declaration walks call this and independently gate on constness. */
-  export function textCodecBindingClassOf(
-    lowerer: Lowerer,
-    nameNode: ts.Node,
-    init: ts.Expression | undefined,
-  ): TextCodecCtor["cls"] | null {
-    if (!ts.isIdentifier(nameNode) || init === undefined) return null;
-    const decl = nameNode.parent;
-    if (
-      !ts.isVariableDeclaration(decl) || !ts.isVariableDeclarationList(decl.parent) ||
-      !ts.isVariableStatement(decl.parent.parent)
-    ) {
-      return null;
-    }
-    const info = directTextCodecCtorOf(lowerer, init);
-    return info !== null && erasableTextCodecCtor(info) ? info.cls : null;
-  }
-
-  export function textCodecBindingDecl(
-    lowerer: Lowerer,
-    nameNode: ts.Node,
-    init: ts.Expression | undefined,
-  ): boolean {
-    return textCodecBindingClassOf(lowerer, nameNode, init) !== null;
-  }
-
-/** The inline composed receiver, or a const identifier whose initializer
-   * is an erasable codec construction in the same execution scope and
-   * after that declaration. Following the declaration instead of
-   * materializing the value is honest for the supported slice: receiver
-   * reads are pure, construction has no effects, and every non-call use
-   * fences because there is deliberately no general value lowering. */
-  function textCodecReceiverOf(lowerer: Lowerer, expr: ts.Expression): TextCodecCtor | null {
-    const direct = directTextCodecCtorOf(lowerer, expr);
-    if (direct !== null) return direct;
-    const receiver = stripTypeCasts(expr);
-    if (!ts.isIdentifier(receiver)) return null;
-    const sym = lowerer.resolveValueSymbol(receiver);
-    const decl = sym ? lowerer.checker.valueDeclarationOf(sym) : undefined;
-    if (
-      !decl || !ts.isVariableDeclaration(decl) || decl.initializer === undefined ||
-      !ts.isVariableDeclarationList(decl.parent) || (decl.parent.flags & ts.NodeFlags.Const) === 0 ||
-      !textCodecBindingDecl(lowerer, decl.name, decl.initializer)
-    ) {
-      return null;
-    }
-    // A closure can run before the const initializes (TDZ), and an
-    // imported binding can be observed during a module cycle; both need
-    // real runtime storage rather than this deliberately trivial rewrite.
-    const executionScope = (node: ts.Node): ts.Node => {
-      let child = node;
-      for (let cur = node.parent; ; child = cur, cur = cur.parent) {
-        if (ts.isFunctionLike(cur) || ts.isSourceFile(cur)) return cur;
-        // An instance field initializer runs when an object is constructed,
-        // not when its enclosing class expression evaluates. Treat it like
-        // a closure boundary: a later source position does not prove the
-        // codec declaration ran (a switch can enter a following case and
-        // instantiate the class while the binding is still in its TDZ).
-        if (
-          ts.isPropertyDeclaration(cur) && cur.initializer === child &&
-          (ts.getCombinedModifierFlags(cur) & ts.ModifierFlags.Static) === 0
-        ) {
-          return cur;
-        }
-      }
-    };
-    if (executionScope(receiver) !== executionScope(decl) || receiver.getStart() < decl.end) return null;
-    // All switch clauses share one lexical environment, but dispatch can
-    // enter a later clause without executing a const in an earlier one.
-    // TypeScript normally diagnoses the direct read; an @ts-expect-error
-    // can deliberately retain the runtime TDZ shape, so source order alone
-    // is not a sufficient proof. A codec declared in a clause is erasable
-    // only for uses inside that exact clause's subtree (nested switches are
-    // fine; closures and instance initializers already fail executionScope).
-    const switchClauseOf = (node: ts.Node): ts.CaseOrDefaultClause | null => {
-      for (let cur: ts.Node | undefined = node.parent; cur !== undefined; cur = cur.parent) {
-        if (ts.isCaseClause(cur) || ts.isDefaultClause(cur)) return cur;
-        if (ts.isFunctionLike(cur) || ts.isSourceFile(cur)) return null;
-      }
-      return null;
-    };
-    const declClause = switchClauseOf(decl);
-    if (declClause !== null) {
-      let insideDeclClause = false;
-      for (let cur: ts.Node | undefined = receiver; cur !== undefined; cur = cur.parent) {
-        if (cur === declClause) {
-          insideDeclClause = true;
-          break;
-        }
-      }
-      if (!insideDeclClause) return null;
-    }
-    return directTextCodecCtorOf(lowerer, decl.initializer);
-  }
-
-/** The WHATWG encoder pair, COMPOSED or through an erasable const binding:
-   * `new TextDecoder().decode(bytes)`, `new TextEncoder().encode(s)`, and
-   * the idiomatic store-then-call equivalents. The codec object never
-   * exists (the crypto/Date precedent); bare construction and value uses
-   * are fenced with the composed hint. decode is the runtime's WHATWG
+/** Inline codec calls avoid allocating a receiver; stored receivers use
+   * the owned record path above. decode is the runtime's WHATWG
    * decode for every recognized static label (with BOM handling for the
    * Unicode encodings); a zero-argument decode() is "" like the spec's.
    * encode IS Buffer.from(s, "utf8") — ScrStr
@@ -8756,8 +8804,9 @@ function staticTextDecoderEncoding(label: string): StaticTextDecoderEncoding | n
     if (call.questionDotToken || access.questionDotToken) return null;
     const member = access.name.text;
     if (member !== "decode" && member !== "encode") return null;
-    const info = textCodecReceiverOf(lowerer, access.expression);
-    if (info === null || !lowerer.isStdlibMember(access)) return null;
+    const info = directTextCodecCtorOf(lowerer, access.expression);
+    if (info === null) return lowerStoredTextCodecCall(lowerer, call, access);
+    if (!lowerer.isStdlibMember(access)) return null;
     const { cls, ctor: recv } = info;
     if (!(cls === "TextDecoder" && member === "decode") && !(cls === "TextEncoder" && member === "encode")) {
       return null;
@@ -8767,7 +8816,7 @@ function staticTextDecoderEncoding(label: string): StaticTextDecoderEncoding | n
     if (cls === "TextDecoder") {
       // The label must be statically known. A literal-typed effectful inline
       // expression is accepted, but its evaluation is sequenced before the
-      // decode below; stored decoder aliases admit only actual literals.
+      // decode below, just as stored decoders evaluate it at construction.
       const labelT = ctorArgs.length >= 1 ? lowerer.typeOf(ctorArgs[0]!) : null;
       const encoding = ctorArgs.length === 0
         ? { kind: "utf8" } as const
@@ -8828,14 +8877,13 @@ function staticTextDecoderEncoding(label: string): StaticTextDecoderEncoding | n
     if (ctorArgs.length > 0) {
       lowerer.noLowering("new TextEncoder with arguments", recv);
     }
-    if (call.arguments.length !== 1) {
+    if (call.arguments.length > 1) {
       lowerer.noLowering(
         `TextEncoder.encode with ${call.arguments.length} arguments`,
         call,
-        call.arguments.length === 0 ? "pass the string (a zero-argument encode is an empty Uint8Array)" : undefined,
       );
     }
-    const s = lowerer.lowerExprExpecting(call.arguments[0]!, STRING);
+    const s = call.arguments.length === 0 ? strLit("", loc) : lowerer.lowerExprExpecting(call.arguments[0]!, STRING);
     const enc: IrExpr = { kind: "strLit", value: "utf8", type: STRING, loc };
     return { kind: "libCall", fn: "buffer.fromStr", args: [s, enc], type: BYTES_U8, loc };
   }
@@ -9486,10 +9534,20 @@ export function isConsoleLog(lowerer: Lowerer, call: ts.CallExpression): boolean
     lowerer: Lowerer,
     call: ts.CallExpression,
   ): "log" | "info" | "debug" | "error" | "warn" | null {
+    if (call.questionDotToken) return null;
+    if (ts.isIdentifier(call.expression)) {
+      const imported = builtinImportOf(lowerer, call.expression);
+      return imported?.module === "console" && isConsoleOutputMember(imported.member) ? imported.member : null;
+    }
     if (!ts.isPropertyAccessExpression(call.expression)) return null;
     const access = call.expression;
     if (access.questionDotToken || call.questionDotToken) return null;
     const name = access.name.text;
-    if (name !== "log" && name !== "info" && name !== "debug" && name !== "error" && name !== "warn") return null;
-    return lowerer.isStdlibGlobal(access.expression, "console") ? name : null;
+    if (!isConsoleOutputMember(name)) return null;
+    return lowerer.isStdlibGlobal(access.expression, "console") ||
+      lowerer.builtinNamespaceModuleOf(access.expression) === "console" ? name : null;
+  }
+
+  function isConsoleOutputMember(name: string): name is "log" | "info" | "debug" | "error" | "warn" {
+    return name === "log" || name === "info" || name === "debug" || name === "error" || name === "warn";
   }

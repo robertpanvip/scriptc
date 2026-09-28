@@ -17,7 +17,8 @@
  * lanes (npm.test.ts, vercel-e2e.test.ts pin those). */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { globSync, mkdirSync, readFileSync } from "node:fs";
+import { cpSync, globSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
@@ -98,6 +99,101 @@ async function buildStatic(entry: string, npmStatic: string[] | "auto"): Promise
 }
 
 describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
+  test.each(["c", "llvm"] as const)("untyped package methods preserve virtual overrides (%s)", async (backend) => {
+    const entry = join(pilotRoot, "virtual-classes-cli.ts");
+    const { coverage } = analyze(entry, { npmStatic: "auto" });
+    expect(coverage.npmStatic).toEqual([{ package: "virtual-classes", status: "static" }]);
+    expect(coverage.diagnostics).toHaveLength(0);
+    expect(coverage.runtimeFences ?? []).toHaveLength(0);
+    const outDir = join(cacheDir, "virtual-classes", sanitize ? "san" : "plain", backend);
+    const result = await compile(entry, { backend, dynamic: false, npmStatic: "auto", sanitize, outDir, outPath: join(outDir, "program") });
+    if (!result.ok) throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+    const [nodeRes, nativeRes] = await Promise.all([runBinary(process.execPath, [entry]), runBinary(result.binaryPath, [])]);
+    expect(nativeRes.stdout).toEqual(nodeRes.stdout);
+    expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  });
+
+  test.each(["c", "llvm"] as const)("a package's literal createRequire calls compile without an engine (%s)", async (backend) => {
+    const entry = join(pilotRoot, "module-loader-cli.ts");
+    const { coverage } = analyze(entry, { npmStatic: "auto" });
+    expect(coverage.npmStatic).toEqual([{ package: "module-loader", status: "static" }]);
+    expect(coverage.diagnostics).toHaveLength(0);
+    expect(coverage.runtimeFences ?? []).toHaveLength(0);
+    const outDir = join(cacheDir, "module-loader", sanitize ? "san" : "plain", backend);
+    const result = await compile(entry, { backend, dynamic: false, npmStatic: "auto", sanitize, outDir, outPath: join(outDir, "program") });
+    if (!result.ok) throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+    const [nodeRes, nativeRes] = await Promise.all([runBinary(process.execPath, [entry]), runBinary(result.binaryPath, [])]);
+    expect(nativeRes.stdout).toEqual(nodeRes.stdout);
+    expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  });
+
+  test.each([
+    ["computed specifier", 'const spec = "node:path"; const path = load(spec);', "computed specifier"],
+    ["escaped require", 'const alias = load; const path = alias("node:path");', "escapes"],
+    ["reassigned require", 'let load = createLoader(import.meta.url); load = () => ({}); const path = load("node:path");', "reassigned"],
+    ["redeclared require", 'var load = createLoader(import.meta.url); var load = () => ({}); const path = load("node:path");', "redeclared"],
+    ["exported mutable require", 'export let load = createLoader(import.meta.url); const path = load("node:path");', "exported binding"],
+    ["exported mutable alias", 'let load = createLoader(import.meta.url); export { load as exported }; const path = load("node:path");', "escapes"],
+    ["escaped mutable shorthand", 'var load = createLoader(import.meta.url); const alias = { load }; const path = load("node:path");', "escapes"],
+    ["destructured reassignment", 'var load = createLoader(import.meta.url); ({ load } = { load: () => ({}) }); const path = load("node:path");', "reassigned"],
+    ["early var call", 'const path = load("node:path"); var load = createLoader(import.meta.url);', "before initialization"],
+    ["early let call", 'const path = load("node:path"); let load = createLoader(import.meta.url);', "before initialization"],
+    ["early hoisted call", 'const path = read(); var load = createLoader(import.meta.url); function read() { return load("node:path"); }', "before initialization"],
+    ["early shorthand call", 'const callbacks = { read }; const path = callbacks.read(); var load = createLoader(import.meta.url); function read() { return load("node:path"); }', "before initialization"],
+    ["early declarator call", 'var path = read(), load = createLoader(import.meta.url); function read() { return load("node:path"); }', "before initialization"],
+    ["optional resolution", 'var load = createLoader(import.meta.url); load?.resolve("node:path"); const path = load("node:path");', "escapes"],
+    ["shadowed filename", 'const __filename = "/tmp/other.js"; var load = createLoader(__filename); const path = load("node:path");', "current file"],
+    ["foreign base", 'const load = createLoader("/tmp/other.js"); const path = load("node:path");', "current file"],
+  ])("a package's %s preserves createRequire fallback", (_name, source, reason) => {
+    const dir = mkdtempSync(join(tmpdir(), "scriptc-module-loader-"));
+    try {
+      const pkg = join(dir, "node_modules/module-loader");
+      cpSync(join(pilotRoot, "node_modules/module-loader"), pkg, { recursive: true });
+      const declaration = source.includes("load = createLoader") ? "" : "const load = createLoader(import.meta.url);\n";
+      writeFileSync(join(pkg, "index.js"), `import { createRequire as createLoader } from "node:module";\n${declaration}${source}\nexport function describe() { return path.join("a", "b"); }\n`);
+      writeFileSync(join(dir, "package.json"), '{"type":"module"}\n');
+      cpSync(join(pilotRoot, "module-loader-cli.ts"), join(dir, "main.ts"));
+      const { coverage } = analyze(join(dir, "main.ts"), { npmStatic: "auto" });
+      expect(coverage.npmStatic).toEqual([{ package: "module-loader", status: "fallback", detail: expect.stringContaining(reason!) }]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    'import { Console as Logger } from "node:console"; new Logger({ stdout: process.stdout });',
+    'import * as output from "console"; new output.Console(process.stdout);',
+    'import { table } from "node:console"; table([1, 2]);',
+  ])("unsupported console members retain a use-site diagnostic: %s", (source) => {
+    const dir = mkdtempSync(join(tmpdir(), "scriptc-console-import-"));
+    try {
+      writeFileSync(join(dir, "main.ts"), source);
+      const { coverage } = analyze(join(dir, "main.ts"));
+      expect(coverage.preflightFailed).toBe(false);
+      expect(coverage.diagnostics.some((d) => d.code === "SC2020" && d.message.includes("console."))).toBe(true);
+      expect(coverage.diagnostics.some((d) => d.code === "SC1010")).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["c", "llvm"] as const)("bundled CommonJS function imports compile without an engine (%s)", async (backend) => {
+    const entry = join(pilotRoot, "bundled-function-cli.ts");
+    const { coverage } = analyze(entry, { npmStatic: "auto" });
+    expect(coverage.npmStatic).toEqual([{ package: "bundled-function", status: "static" }]);
+    expect(coverage.diagnostics).toHaveLength(0);
+    expect(coverage.runtimeFences ?? []).toHaveLength(0);
+    const outDir = join(cacheDir, "bundled-function", sanitize ? "san" : "plain", backend);
+    const result = await compile(entry, { backend, dynamic: false, npmStatic: "auto", sanitize, outDir, outPath: join(outDir, "program") });
+    if (!result.ok) throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+    const [nodeRes, nativeRes] = await Promise.all([runBinary(process.execPath, [entry]), runBinary(result.binaryPath, [])]);
+    expect(nativeRes.stdout).toEqual(nodeRes.stdout);
+    expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  });
+
   // Tier 1: fully static, byte-exact against Node. ms's driven surface —
   // BOTH the parse and format directions — joined when implicit-any
   // monomorphization and aliased-typeof narrowing landed; its one
@@ -119,6 +215,26 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
       runBinary(binary, []),
     ]);
     expect(nativeRes.stdout.toString("utf8")).toBe(nodeRes.stdout.toString("utf8"));
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  }, 120_000);
+
+  test.for(["explicit", "auto"] as const)("hoisted CommonJS function exports stay static (%s)", async (mode) => {
+    const entry = join(pilotRoot, "early-export-cli.ts");
+    const npmStatic = mode === "auto" ? "auto" : ["early-export"];
+    const { coverage } = analyze(entry, { npmStatic });
+    expect(coverage.npmStatic).toEqual([{ package: "early-export", status: "static" }]);
+    expect(coverage.preflightFailed).toBe(false);
+    expect(coverage.diagnostics).toHaveLength(0);
+    expect(coverage.runtimeFences ?? []).toHaveLength(0);
+    expect(coverage.stats.statementsFailed).toBe(0);
+
+    const binary = await buildStatic(entry, npmStatic);
+    const [nodeRes, nativeRes] = await Promise.all([
+      runBinary("node", [entry]),
+      runBinary(binary, []),
+    ]);
+    expect(nativeRes.stdout).toEqual(nodeRes.stdout);
+    expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
     expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
   }, 120_000);
 

@@ -3,37 +3,99 @@ import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import { describe, expect, test } from "vitest";
 import { runSource } from "../test262/execute.js";
-import { exclusion, matchesExpectation, metadata, pin, vendorRoot, verifyVendor } from "../test262/support.mjs";
+import { exclusion, matchesExpectation, matchesParseNegative, metadata, pin, vendorRoot, verifyVendor } from "../test262/support.mjs";
 import { shardSelect, shardSuffix } from "./shard.js";
 
 const sanitize = process.env.SCRIPTC_SAN === "1";
 const upstreamHarness = ["assert.js", "sta.js"]
   .map((name) => readFileSync(join(vendorRoot, "harness", name), "utf8")).join("\n");
 
-function runUpstream(source: string): void {
+function runUpstream(source: string, variant: "strict" | "sloppy" = "strict"): void {
   const context = createContext({});
   runInContext(upstreamHarness, context, { timeout: 5000 });
-  runInContext(`"use strict";\n${source}`, context, { timeout: 5000 });
+  runInContext(variant === "strict" ? `"use strict";\n${source}` : source, context, { timeout: 5000 });
 }
+
+async function runUpstreamAsync(source: string, variant: "strict" | "sloppy"): Promise<void> {
+  const context = createContext({});
+  let calls = 0;
+  const done = new Promise<void>((resolve, reject) => {
+    context.$DONE = (error?: unknown) => {
+      calls++;
+      if (calls > 1) reject(new Error("Test262 called $DONE more than once"));
+      else if (error) reject(error);
+      else resolve();
+    };
+  });
+  runInContext(upstreamHarness, context, { timeout: 5000 });
+  runInContext(variant === "strict" ? `"use strict";\n${source}` : source, context, { timeout: 5000 });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      done,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Test262 async completion timed out")), 5000); }),
+    ]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (calls !== 1) throw new Error(`Test262 called $DONE ${calls} times`);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+test("upstream async completion rejects errors and duplicate calls", async () => {
+  await expect(runUpstreamAsync("$DONE(new Test262Error('failed'));", "strict"))
+    .rejects.toMatchObject({ message: "failed" });
+  await expect(runUpstreamAsync("$DONE(); $DONE();", "strict"))
+    .rejects.toThrow("Test262 called $DONE 2 times");
+});
+
+test("sloppy script source executes through a CommonJS entry", async () => {
+  const source = readFileSync(join(vendorRoot, "test/language/expressions/addition/S11.6.1_A4_T1.js"), "utf8");
+  const meta = metadata(source);
+  expect(exclusion(source, meta, "sloppy")).toBeUndefined();
+  const context = createContext({});
+  runInContext(upstreamHarness, context, { timeout: 5000 });
+  runInContext(source, context, { timeout: 5000 });
+  const result = await runSource(source, { sanitize, variant: "sloppy" });
+  expect(result, JSON.stringify(result, null, 2)).toMatchObject({ status: "pass" });
+});
 
 test("Test262 regression inputs retain their pinned upstream bytes", () => {
   verifyVendor();
 });
 
-const profileCases = shardSelect<string>(pin.tests, (path) => `${path}#strict`);
-// The initial profile is small enough that a valid shard can own no cases.
-// Vitest rejects an empty describe block, so register this suite only when
-// this shard actually owns a program. The host checks below still run.
-if (profileCases.length > 0) describe(`Test262 static strict profile${shardSuffix()}`, () => {
+test("negative parse cases require a matching compiler syntax diagnostic", async () => {
+  const source = "/*---\nnegative: {phase: parse, type: SyntaxError}\n---*/\n$DONOTEVALUATE();\nconst = ;";
+  expect(exclusion(source, metadata(source), "strict")).toBeUndefined();
+  const result = await runSource(source, { sanitize });
+  expect(matchesParseNegative(result, source), JSON.stringify(result, null, 2)).toBe(true);
+});
+
+const profileCases = shardSelect<string>(pin.tests, (path) => {
+  const source = readFileSync(join(vendorRoot, path), "utf8");
+  const variant = metadata(source, path).flags.includes("noStrict") ? "sloppy" : "strict";
+  return `${path}#${variant}`;
+});
+// Vitest rejects an empty describe block when a valid shard owns no cases.
+if (profileCases.length > 0) describe(`Test262 static script profile${shardSuffix()}`, () => {
   for (const path of profileCases) {
     test(path, async () => {
       const source = readFileSync(join(vendorRoot, path), "utf8");
-      expect(exclusion(source, metadata(source, path), "strict")).toBeUndefined();
+      const meta = metadata(source, path);
+      const variant = meta.flags.includes("noStrict") ? "sloppy" : "strict";
+      expect(exclusion(source, meta, variant)).toBeUndefined();
       // Independently check the unchanged test with the original global-script
       // harness. Node is a host sanity check, not the conformance oracle.
-      runUpstream(source);
-      const result = await runSource(source, { sanitize });
-      expect(matchesExpectation(`${path}#strict`, result), JSON.stringify(result, null, 2)).toBe(true);
+      if (meta.negative?.phase === "parse") {
+        let error: unknown;
+        try { runUpstream(source, variant); } catch (caught) { error = caught; }
+        expect(error).toMatchObject({ name: "SyntaxError" });
+      } else if (meta.flags.includes("async")) await runUpstreamAsync(source, variant);
+      else runUpstream(source, variant);
+      const result = await runSource(source, { sanitize, variant, asyncTest: meta.flags.includes("async") });
+      if (meta.negative?.phase === "parse") {
+        expect(matchesParseNegative(result, source, variant), JSON.stringify(result, null, 2)).toBe(true);
+      } else expect(matchesExpectation(`${path}#${variant}`, result), JSON.stringify(result, null, 2)).toBe(true);
     });
   }
 });
@@ -56,6 +118,16 @@ assert.notSameValue(1, "1");
   { name: "array element mismatch", status: "fail", source: "assert.compareArray([1, 2], [1, 3]);" },
   { name: "array signed zero mismatch", status: "fail", source: "assert.compareArray([0], [-0]);" },
   { name: "assert requires true, not truthiness", status: "fail", source: "assert(1);" },
+  { name: "exact built-in exception", status: "pass", source: "assert.throws(TypeError, () => { throw new TypeError('x'); });" },
+  { name: "exact reference exception", status: "pass", source: "assert.throws(ReferenceError, () => { throw new ReferenceError('x'); });" },
+  { name: "exact evaluation exception", status: "pass", source: "assert.throws(EvalError, () => { throw new EvalError('x'); });" },
+  { name: "exact URI exception", status: "pass", source: "assert.throws(URIError, () => { throw new URIError('x'); });" },
+  { name: "reference exception is not a type exception", status: "fail", source: "assert.throws(TypeError, () => { throw new ReferenceError('x'); });" },
+  { name: "subclassed reference exception is not exact", status: "fail", source: "class E extends ReferenceError {} assert.throws(ReferenceError, () => { throw new E('x'); });" },
+  { name: "wrong built-in exception", status: "fail", source: "assert.throws(TypeError, () => { throw new RangeError('x'); });" },
+  { name: "subclass is not exact", status: "fail", source: "class E extends TypeError {} assert.throws(TypeError, () => { throw new E('x'); });" },
+  { name: "missing exception", status: "fail", source: "assert.throws(TypeError, () => {});" },
+  { name: "primitive exception", status: "fail", source: "assert.throws(TypeError, () => { throw 1; });" },
 ];
 
 describe(`Test262 host assertion contract${shardSuffix()}`, () => {
@@ -96,4 +168,30 @@ describe(`Test262 host assertion contract${shardSuffix()}`, () => {
     const result = await runSource(source, { sanitize });
     expect(result, JSON.stringify(result)).toMatchObject({ status: "harness-refusal", reason: "reference-assertion" });
   });
+
+  test("non-Error objects do not masquerade as Error assertions", async () => {
+    const source = "const value = JSON.parse('{\"constructor\":\"[builtin TypeError]\"}'); assert.throws(TypeError, () => { throw value; });";
+    expect(() => runUpstream(source)).toThrow();
+    const result = await runSource(source, { sanitize });
+    expect(result, JSON.stringify(result)).toMatchObject({ status: "harness-refusal", reason: "non-error-assertion" });
+  });
+});
+
+const asyncControls = shardSelect([
+  { name: "promise completion", status: "pass", body: "Promise.resolve(1).then(value => { assert.sameValue(value, 1); $DONE(); });" },
+  { name: "completion error", status: "fail", body: "Promise.resolve().then(() => { $DONE('failure'); });" },
+  { name: "missing completion", status: "fail", body: "Promise.resolve().then(() => {});" },
+  { name: "duplicate completion", status: "fail", body: "$DONE(); $DONE();" },
+  { name: "completion marker spoof", status: "fail", body: "console.log('__scriptc_test262_complete__');" },
+], (item) => `async:${item.name}`);
+
+if (asyncControls.length > 0) describe(`Test262 async host contract${shardSuffix()}`, () => {
+  for (const control of asyncControls) {
+    test(control.name, async () => {
+      const source = `/*---\nflags: [async]\n---*/\n${control.body}`;
+      expect(exclusion(source, metadata(source), "strict")).toBeUndefined();
+      const result = await runSource(source, { sanitize, asyncTest: true });
+      expect(result, JSON.stringify(result, null, 2)).toMatchObject({ status: control.status });
+    });
+  }
 });

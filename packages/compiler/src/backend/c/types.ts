@@ -1,3 +1,4 @@
+import { commentText, octalByte } from "../literals.js";
 import { InternalCompilerError } from "../../errors.js";
 /* Type-directed dispatch tables of the C emitter: the C spelling of every IR
  * type and the per-type runtime entry points (retain/release, box kinds,
@@ -5,7 +6,7 @@ import { InternalCompilerError } from "../../errors.js";
  * functions of IrType/values — every emission module leans on these, so they
  * live in ONE place with no emitter state. */
 import type { IrBytesElem, IrType } from "../../ir/ir.js";
-import { POINTER_KINDS, type PointerKind, runtimeRcStem, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES } from "../../ir/ir.js";
+import { isIdentityCollectionKey, POINTER_KINDS, type PointerKind, runtimeRcStem, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES } from "../../ir/ir.js";
 import {
   mangleClassRelease,
   mangleClassRetain,
@@ -101,9 +102,8 @@ export function cType(t: IrType): string {
       // ONE struct type for every class (the fields are class-independent).
       return "ScrClassObj *";
     case "object":
-      // Runtime-provided error classes share the runtime's ScrError struct
-      // (all four builtins have the same layout; user subclasses embed it
-      // as their emitted struct's prefix).
+      // Runtime-provided error classes use the ScrError prefix. DOMException
+      // has additional runtime slots; user subclasses embed the prefix.
       if (RUNTIME_ERROR_CLASSES.has(t.className)) return "ScrError *";
       // The runtime emitter class shares the runtime's ScrEmitter struct
       // (user subclasses embed its prefix in their emitted structs).
@@ -268,7 +268,7 @@ export function elemKindC(elem: IrType): string {
       elem.kind !== "string" && elem.kind !== "array" && elem.kind !== "bytes" &&
       elem.kind !== "record" && elem.kind !== "object" && elem.kind !== "union" &&
       elem.kind !== "jsval" && elem.kind !== "child" && elem.kind !== "netServer" &&
-      elem.kind !== "symbol" && elem.kind !== "bigint" && elem.kind !== "classval" && elem.kind !== "func") {
+      elem.kind !== "symbol" && elem.kind !== "bigint" && elem.kind !== "classval" && elem.kind !== "func" && elem.kind !== "dyn") {
     throw new InternalCompilerError(`emitter bug: array of ${elem.kind} (frontend rejects these)`);
   }
   switch (elem.kind) {
@@ -289,6 +289,7 @@ export function elemKindC(elem: IrType): string {
     // release adapters) — `any[]` under --dynamic is a native array of
     // handles, one element per island value.
     case "jsval":
+    case "dyn":
     // Spawned child handles (ChildProcess[] — the running-apps list):
     // ordinary refcounted pointers, no trace (they drop their closures at
     // reap, so never part of a cycle).
@@ -407,16 +408,17 @@ export function elemAccess(elem: IrType): "f64" | "bool" | "ref" {
 export function mapKeyAccess(key: IrType): "f64" | "str" | "ref" {
   if (key.kind === "f64") return "f64";
   if (key.kind === "string") return "str";
-  // Handle-kind SET elements (identity hashing — isSupportedSetElem);
-  // Map keys proper stay f64/string.
-  if (key.kind === "netServer" || key.kind === "symbol") return "ref";
+  // Identity references share a pointer ABI; union keys select a separate
+  // hash/equality kind below so their wrapper is not treated as the key.
+  if (isIdentityCollectionKey(key) || key.kind === "union" || key.kind === "dyn") return "ref";
   throw new InternalCompilerError(`emitter bug: map key of ${key.kind} (frontend rejects these)`);
 }
 
 /** The runtime's key-kind/value-kind tags for scr_map_new. */
 export function mapKeyKindC(key: IrType): string {
+  if (key.kind === "dyn") return "SCR_MAP_KEY_DYN";
   const acc = mapKeyAccess(key);
-  return acc === "str" ? "SCR_MAP_KEY_STR" : acc === "ref" ? "SCR_MAP_KEY_REF" : "SCR_MAP_KEY_F64";
+  return key.kind === "union" ? "SCR_MAP_KEY_UNION_REF" : acc === "str" ? "SCR_MAP_KEY_STR" : acc === "ref" ? "SCR_MAP_KEY_REF" : "SCR_MAP_KEY_F64";
 }
 
 export function mapValKindC(value: IrType): string {
@@ -431,12 +433,7 @@ export function mapValKindC(value: IrType): string {
  * ordinary output byte-for-byte, but split comment delimiters and encode
  * source-control characters so the text cannot alter the translation unit. */
 export function cCommentText(text: string): string {
-  return text
-    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, (char) =>
-      `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
-    )
-    .replace(/\*\//g, "* /")
-    .replace(/\/\*/g, "/ *");
+  return commentText(text).replace(/\*\//g, "* /").replace(/\/\*/g, "/ *");
 }
 
 /** UTF-8 bytes as an unambiguous C string literal (octal escapes are always
@@ -453,7 +450,7 @@ export function cStringLiteral(bytes: Buffer): string {
     // standard C, exactly for this.
     else if (b === 0x3f) out += "\\?";
     else if (b >= 0x20 && b < 0x7f) out += String.fromCharCode(b);
-    else out += "\\" + b.toString(8).padStart(3, "0");
+    else out += "\\" + octalByte(b);
   }
   return out + '"';
 }

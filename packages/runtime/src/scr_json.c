@@ -436,6 +436,42 @@ ScrDyn *scr_dyn_obj_get(const ScrDyn *d, const char *key, size_t key_len) {
   return NULL;
 }
 
+/* Read through a typed capsule without exposing its native layout to a
+ * matcher for another type. The returned member owns its reference after
+ * the materialized view is released. */
+static ScrDyn *scr_dyn_discriminant(const ScrDyn *d, const ScrStr *key) {
+  if (d && d->kind == SCR_DYN_TYPED_REF) {
+    ScrDyn *view = scr_dyn_typed_ref_materialize(d);
+    ScrDyn *out = scr_dyn_discriminant(view, key);
+    scr_dyn_release(view);
+    return out;
+  }
+  if (!d || d->kind != SCR_DYN_OBJ) return NULL;
+  ScrDyn *value = scr_dyn_obj_get(d, key->data, key->len);
+  return value ? scr_dyn_retain(value) : NULL;
+}
+
+bool scr_dyn_field_eq_str(const ScrDyn *d, const ScrStr *key, const ScrStr *value) {
+  ScrDyn *member = scr_dyn_discriminant(d, key);
+  bool matches = member && member->kind == SCR_DYN_STR && scr_str_eq(member->v.str, (ScrStr *)value);
+  scr_dyn_release(member);
+  return matches;
+}
+
+bool scr_dyn_field_eq_num(const ScrDyn *d, const ScrStr *key, double value) {
+  ScrDyn *member = scr_dyn_discriminant(d, key);
+  bool matches = member && member->kind == SCR_DYN_NUM && member->v.num == value;
+  scr_dyn_release(member);
+  return matches;
+}
+
+bool scr_dyn_field_eq_bool(const ScrDyn *d, const ScrStr *key, bool value) {
+  ScrDyn *member = scr_dyn_discriminant(d, key);
+  bool matches = member && member->kind == SCR_DYN_BOOL && member->v.b == value;
+  scr_dyn_release(member);
+  return matches;
+}
+
 /* Public: the compiler-emitted static→dyn converters push through this
  * too. Ownership of the item moves in. */
 void scr_dyn_arr_push(ScrDyn *arr, ScrDyn *item) {
@@ -1387,6 +1423,13 @@ ScrStr *scr_dyn_typeof(const ScrDyn *d) {
   return scr_str_new(s, strlen(s));
 }
 
+bool scr_dyn_is_object(const ScrDyn *d) {
+  ScrStr *type = scr_dyn_typeof(d);
+  bool object = type->len == 6 && memcmp(type->data, "object", 6) == 0;
+  scr_str_release(type);
+  return object;
+}
+
 ScrStr *scr_dyn_object_tag(const ScrDyn *d) {
   if (d->kind == SCR_DYN_TYPED_REF) {
     if (scr_dyn_isl_is_error(d)) return scr_str_new("[object Error]", 14);
@@ -1594,6 +1637,7 @@ ScrDyn *scr_dyn_from_error(const ScrError *e) {
   scr_dyn_obj_set(d, "name", 4, scr_dyn_new_str(e->name));
   scr_dyn_obj_set(d, "message", 7, scr_dyn_new_str(e->message));
   if (e->code) scr_dyn_obj_set(d, "code", 4, scr_dyn_new_str(e->code));
+  if (e->error_cause) scr_dyn_obj_set(d, "cause", 5, scr_dyn_retain(e->error_cause));
   /* DOMException: `code` is the WebIDL legacy NUMBER (never the errno
    * string slot), and the options form's cause crosses as itself. */
   if (e->vt == &scr_error_vts[SCR_ERR_DOMEX]) {
@@ -1628,6 +1672,8 @@ ScrDyn *scr_dyn_from_error(const ScrError *e) {
  * its name/message/code (the vtable kind resolves from the name so a
  * later `instanceof TypeError` still answers) and ENTERS the cache, so
  * its next boxing answers the same dyn node. The dyn node is borrowed. */
+static void scr_error_cause_drop_impl(void *obj);
+
 ScrError *scr_error_from_dyn(const ScrDyn *d) {
   ScrError *hit = scr_errdyn_err_of(d);
   if (hit) return hit;
@@ -1640,6 +1686,9 @@ ScrError *scr_error_from_dyn(const ScrDyn *d) {
     if (n->len == 9 && memcmp(n->data, "TypeError", 9) == 0) k = SCR_ERR_TYPE;
     else if (n->len == 10 && memcmp(n->data, "RangeError", 10) == 0) k = SCR_ERR_RANGE;
     else if (n->len == 11 && memcmp(n->data, "SyntaxError", 11) == 0) k = SCR_ERR_SYNTAX;
+    else if (n->len == 14 && memcmp(n->data, "ReferenceError", 14) == 0) k = SCR_ERR_REFERENCE;
+    else if (n->len == 9 && memcmp(n->data, "EvalError", 9) == 0) k = SCR_ERR_EVAL;
+    else if (n->len == 8 && memcmp(n->data, "URIError", 8) == 0) k = SCR_ERR_URI;
   }
   ScrError *e = scr_error_new(k, (em && em->kind == SCR_DYN_STR) ? em->v.str : NULL);
   if (en && en->kind == SCR_DYN_STR) {
@@ -1647,6 +1696,11 @@ ScrError *scr_error_from_dyn(const ScrDyn *d) {
     e->name = scr_str_retain(en->v.str);
   }
   if (ec && ec->kind == SCR_DYN_STR) e->code = scr_str_retain(ec->v.str);
+  ScrDyn *cause = scr_dyn_obj_get(d, "cause", 5);
+  if (cause) {
+    scr_error_install_cause_drop(&scr_error_cause_drop_impl);
+    e->error_cause = scr_dyn_retain(cause);
+  }
   scr_errdyn_put(e, (ScrDyn *)d);
   return e;
 }
@@ -2728,6 +2782,264 @@ ScrDyn *scr_json_parse(ScrStr *text) {
   return d;
 }
 
+/* ── Native JSON callback walks ──────────────────────────────────────
+ * Keep these walks separate from the type-directed fast serializer. The
+ * replacer observes the original value BEFORE number normalization, and
+ * a reviver observes children AFTER their replacements. Neither protocol
+ * can be implemented as a callback over already-serialized JSON text.
+ *
+ * Each frame owns its value and its key snapshot. A callback may mutate
+ * siblings, recurse into JSON, or throw; no pointer into an object's
+ * reallocatable entry storage survives a callback. Receiver binding is
+ * scoped to the call and unwound even when an exception is pending. */
+static ScrDyn *scr_json_callback(const ScrDyn *callback, const ScrDyn *holder,
+                                 const ScrStr *key, ScrDyn *value) {
+  ScrDyn *name = scr_dyn_new_str((ScrStr *)key);
+  ScrDyn *args[] = { name, value };
+  scr_dyn_this_push_dyn(holder);
+  ScrDyn *result = scr_dyn_call(callback, args, 2, "JSON callback");
+  scr_dyn_this_pop();
+  scr_dyn_release(name);
+  return result;
+}
+
+static bool scr_json_callback_depth(size_t depth) {
+  if (depth <= SCR_JSON_MAX_DEPTH) return true;
+  const char *message = "Maximum call stack size exceeded";
+  scr_throw_error_msg(SCR_ERR_RANGE, message, strlen(message));
+  return false;
+}
+
+static ScrStr *scr_json_index_key(size_t index) {
+  char bytes[32];
+  int length = snprintf(bytes, sizeof bytes, "%zu", index);
+  return scr_str_new(bytes, (size_t)length);
+}
+
+/* Keys passed here come from our own index formatter or own-key walk. */
+static ScrDyn *scr_json_member(const ScrDyn *holder, const ScrStr *key) {
+  if (holder->kind == SCR_DYN_ARR || holder->kind == SCR_DYN_BYTES) {
+    size_t index = 0;
+    for (size_t i = 0; i < key->len; i++) index = index * 10 + (size_t)(key->data[i] - '0');
+    if (holder->kind == SCR_DYN_BYTES) {
+      return index < holder->v.bytes->len ? scr_dyn_new_num(scr_bytes_get(holder->v.bytes, (double)index))
+                                         : scr_dyn_retain(scr_dyn_undefined());
+    }
+    return scr_dyn_retain(index < holder->v.arr.len ? holder->v.arr.items[index] : scr_dyn_undefined());
+  }
+  ScrDyn *value = scr_dyn_obj_get(holder, key->data, key->len);
+  return scr_dyn_retain(value ? value : scr_dyn_undefined());
+}
+
+static void scr_json_delete_member(ScrDyn *object, const ScrStr *key) {
+  for (size_t i = 0; i < object->v.obj.len; i++) {
+    ScrDynEntry *entry = &object->v.obj.entries[i];
+    if (entry->key_len != key->len || memcmp(entry->key, key->data, key->len) != 0) continue;
+    free(entry->key);
+    scr_dyn_release(entry->value);
+    memmove(entry, entry + 1, (object->v.obj.len - i - 1) * sizeof *entry);
+    object->v.obj.len--;
+    return;
+  }
+}
+
+static ScrDyn *scr_json_revive(ScrDyn *holder, const ScrStr *key,
+                              const ScrDyn *reviver, size_t depth) {
+  if (!scr_json_callback_depth(depth)) return NULL;
+  ScrDyn *value = scr_json_member(holder, key);
+  if (value->kind == SCR_DYN_ARR) {
+    /* Capture length once, but read each member at the time it is visited. */
+    size_t length = value->v.arr.len;
+    for (size_t i = 0; i < length; i++) {
+      ScrStr *index = scr_json_index_key(i);
+      ScrDyn *replacement = scr_json_revive(value, index, reviver, depth + 1);
+      scr_str_release(index);
+      if (!replacement) { scr_dyn_release(value); return NULL; }
+      if (replacement->kind == SCR_DYN_UNDEF) {
+        /* The checked-dynamic array ABI is dense. Do not pretend that an
+         * undefined element is a hole: hasOwn/keys would be observably wrong. */
+        const char *message = "JSON.parse reviver deleting array elements is not supported yet";
+        scr_throw_error_msg(SCR_ERR_ERROR, message, strlen(message));
+        scr_dyn_release(replacement);
+        scr_dyn_release(value);
+        return NULL;
+      }
+      while (value->v.arr.len <= i) scr_dyn_arr_push(value, scr_dyn_retain(scr_dyn_undefined()));
+      scr_dyn_release(value->v.arr.items[i]);
+      value->v.arr.items[i] = replacement;
+    }
+  } else if (value->kind == SCR_DYN_OBJ) {
+    ScrDyn *keys = scr_dyn_obj_keys(value);
+    for (size_t i = 0; i < keys->v.arr.len; i++) {
+      const ScrStr *name = keys->v.arr.items[i]->v.str;
+      ScrDyn *replacement = scr_json_revive(value, name, reviver, depth + 1);
+      if (!replacement) { scr_dyn_release(keys); scr_dyn_release(value); return NULL; }
+      if (replacement->kind == SCR_DYN_UNDEF) {
+        scr_json_delete_member(value, name);
+        scr_dyn_release(replacement);
+      } else {
+        scr_dyn_obj_set(value, name->data, name->len, replacement);
+      }
+    }
+    scr_dyn_release(keys);
+  }
+  ScrDyn *result = scr_json_callback(reviver, holder, key, value);
+  scr_dyn_release(value);
+  return result;
+}
+
+ScrDyn *scr_json_parse_reviver(ScrStr *text, const ScrDyn *reviver) {
+  ScrDyn *parsed = scr_json_parse(text);
+  if (!parsed) return NULL; /* No callback runs on invalid input. */
+  ScrDyn *holder = scr_dyn_new_obj();
+  scr_dyn_obj_set(holder, "", 0, parsed);
+  ScrStr *key = scr_str_new("", 0);
+  ScrDyn *result = scr_json_revive(holder, key, reviver, 0);
+  scr_str_release(key);
+  scr_dyn_release(holder);
+  return result;
+}
+
+/* Buffer's toJSON happens before the replacer. The returned data object
+ * is owned by this walk; a replacer-returned Buffer is never sent here. */
+static ScrDyn *scr_json_buffer_view(const ScrDyn *value) {
+  ScrDyn *view = scr_dyn_new_obj();
+  const ScrBytes *bytes = value->v.bytes;
+  ScrStr *name = scr_str_new("Buffer", 6);
+  scr_dyn_obj_set(view, "type", 4, scr_dyn_new_str(name));
+  scr_str_release(name);
+  ScrDyn *data = scr_dyn_new_arr();
+  for (size_t i = 0; i < bytes->len; i++) scr_dyn_arr_push(data, scr_dyn_new_num(scr_bytes_get(bytes, (double)i)));
+  scr_dyn_obj_set(view, "data", 4, data);
+  return view;
+}
+
+static ScrDyn *scr_json_replace(const ScrDyn *holder, const ScrStr *key, const ScrDyn *replacer) {
+  ScrDyn *value = scr_json_member(holder, key);
+  if (value->kind == SCR_DYN_TYPED_REF) {
+    ScrDyn *view = scr_dyn_typed_ref_materialize(value);
+    scr_dyn_release(value);
+    value = view;
+  }
+  if (value->kind == SCR_DYN_BYTES && value->buffer) {
+    ScrDyn *view = scr_json_buffer_view(value);
+    scr_dyn_release(value);
+    value = view;
+  } else if (value->kind == SCR_DYN_OBJ) {
+    ScrDyn *method = scr_dyn_obj_get(value, "toJSON", 6);
+    if (method && method->kind == SCR_DYN_FUNC) {
+      /* Retain the callable too: it can replace its own property. */
+      scr_dyn_retain(method);
+      ScrDyn *name = scr_dyn_new_str((ScrStr *)key);
+      ScrDyn *args[] = { name };
+      scr_dyn_this_push_dyn(value);
+      ScrDyn *converted = scr_dyn_call(method, args, 1, "toJSON");
+      scr_dyn_this_pop();
+      scr_dyn_release(method);
+      scr_dyn_release(name);
+      scr_dyn_release(value);
+      if (!converted) return NULL;
+      value = converted;
+    }
+  }
+  ScrDyn *result = scr_json_callback(replacer, holder, key, value);
+  scr_dyn_release(value);
+  return result;
+}
+
+static bool scr_json_omitted(const ScrDyn *value) {
+  return value->kind == SCR_DYN_UNDEF || value->kind == SCR_DYN_FUNC;
+}
+
+static void scr_json_gap(ScrJsonBuf *buffer, const ScrStr *gap, size_t depth) {
+  if (!gap->len) return;
+  scr_jb_putc(buffer, '\n');
+  for (size_t i = 0; i < depth; i++) scr_jb_write(buffer, gap->data, gap->len);
+}
+
+static bool scr_json_replaced_write(ScrJsonBuf *buffer, const ScrDyn *value,
+                                   const ScrDyn *replacer, const ScrStr *gap, size_t depth) {
+  if (!scr_json_callback_depth(depth)) return false;
+  if (value->kind == SCR_DYN_TYPED_REF) {
+    ScrDyn *view = scr_dyn_typed_ref_materialize(value);
+    bool ok = scr_json_replaced_write(buffer, view, replacer, gap, depth);
+    scr_dyn_release(view);
+    return ok;
+  }
+  if (value->kind != SCR_DYN_OBJ && value->kind != SCR_DYN_ARR && value->kind != SCR_DYN_BYTES) {
+    /* Engine objects need an engine callback bridge, not an opaque JSON
+     * splice: that would silently skip all their children. */
+    if (value->kind == SCR_DYN_JSVAL) {
+      const char *message = "JSON replacers over engine-held values are not supported yet";
+      scr_throw_error_msg(SCR_ERR_ERROR, message, strlen(message));
+      return false;
+    }
+    scr_dyn_json_write(buffer, value);
+    return !scr_exc_pending();
+  }
+  bool array = value->kind == SCR_DYN_ARR;
+  if (!scr_jb_enter(buffer, value, array)) return false;
+  scr_jb_putc(buffer, array ? '[' : '{');
+  ScrDyn *keys = array ? NULL : scr_dyn_obj_keys(value);
+  size_t length = array ? value->v.arr.len : keys->v.arr.len;
+  bool first = true;
+  bool ok = true;
+  for (size_t i = 0; i < length; i++) {
+    ScrStr *key = array ? scr_json_index_key(i) : scr_str_retain(keys->v.arr.items[i]->v.str);
+    if (array) scr_jb_edge_idx(buffer, i);
+    else scr_jb_edge_key(buffer, key);
+    ScrDyn *child = scr_json_replace(value, key, replacer);
+    if (!child) { scr_str_release(key); ok = false; break; }
+    if (!array && scr_json_omitted(child)) {
+      scr_dyn_release(child);
+      scr_str_release(key);
+      continue;
+    }
+    if (!first) scr_jb_putc(buffer, ',');
+    first = false;
+    scr_json_gap(buffer, gap, depth + 1);
+    if (!array) {
+      scr_jb_put_json_str(buffer, key);
+      scr_jb_putc(buffer, ':');
+      if (gap->len) scr_jb_putc(buffer, ' ');
+    }
+    if (scr_json_omitted(child)) scr_jb_puts(buffer, "null");
+    else ok = scr_json_replaced_write(buffer, child, replacer, gap, depth + 1);
+    scr_dyn_release(child);
+    scr_str_release(key);
+    if (!ok) break;
+  }
+  scr_dyn_release(keys);
+  scr_jb_leave(buffer);
+  if (!ok) return false;
+  if (!first) scr_json_gap(buffer, gap, depth);
+  scr_jb_putc(buffer, array ? ']' : '}');
+  return true;
+}
+
+ScrDyn *scr_json_stringify_replacer(const ScrDyn *value, const ScrDyn *replacer, const ScrStr *gap) {
+  ScrDyn *holder = scr_dyn_new_obj();
+  scr_dyn_obj_set(holder, "", 0, scr_dyn_retain((ScrDyn *)value));
+  ScrStr *key = scr_str_new("", 0);
+  ScrDyn *replaced = scr_json_replace(holder, key, replacer);
+  scr_str_release(key);
+  scr_dyn_release(holder);
+  if (!replaced) return NULL;
+  if (scr_json_omitted(replaced)) {
+    scr_dyn_release(replaced);
+    return scr_dyn_retain(scr_dyn_undefined());
+  }
+  ScrJsonBuf buffer;
+  scr_jb_init(&buffer);
+  bool ok = scr_json_replaced_write(&buffer, replaced, replacer, gap, 0);
+  scr_dyn_release(replaced);
+  if (!ok) { scr_jb_dispose(&buffer); return NULL; }
+  ScrStr *text = scr_jb_finish(&buffer);
+  ScrDyn *result = scr_dyn_new_str(text);
+  scr_str_release(text);
+  return result;
+}
+
 /* Untyped RC adapters (box/promise/exception-cell currency). */
 void *scr_dyn_retain_v(void *d) { return scr_dyn_retain((ScrDyn *)d); }
 void scr_dyn_release_v(void *d) { scr_dyn_release((ScrDyn *)d); }
@@ -2764,10 +3076,9 @@ bool scr_dyn_strict_eq(const ScrDyn *a, const ScrDyn *b) {
      * — a dyn copy is a different object, which is Node's answer too. */
     return a == b || scr_dyn_jsval_ops()->strict_eq(a->v.jsval.cell, b->v.jsval.cell);
   case SCR_DYN_TYPED_REF:
-    return a->v.typed_ref.ptr == b->v.typed_ref.ptr &&
-           a->v.typed_ref.type_key_len == b->v.typed_ref.type_key_len &&
-           memcmp(a->v.typed_ref.type_key, b->v.typed_ref.type_key,
-                  a->v.typed_ref.type_key_len) == 0;
+    /* A base-class view and a derived view still name the same object.
+     * The compiler's type key governs checked extraction, not identity. */
+    return a->v.typed_ref.ptr == b->v.typed_ref.ptr;
   default: return a == b;
   }
 }
@@ -2957,6 +3268,32 @@ bool scr_dyn_err_instanceof(const ScrDyn *d, double kind) {
     }
   }
   return false;
+}
+
+ScrDyn *scr_dyn_obj_read(const ScrDyn *d, const char *key, size_t key_len) {
+  ScrDyn *own = scr_dyn_obj_get(d, key, key_len);
+  if (own) return scr_dyn_retain(own);
+  if (key_len == 11 && memcmp(key, "constructor", 11) == 0) {
+    static const char *const tokens[] = {
+        "[builtin Error]", "[builtin TypeError]",
+        "[builtin RangeError]", "[builtin SyntaxError]",
+        NULL, "[builtin ReferenceError]", "[builtin EvalError]", "[builtin URIError]",
+    };
+    for (size_t i = 0; i < scr_errdyn_n; i++) {
+      if (scr_errdyn_cache[i].dyn != d) continue;
+      const ScrVt *vt = scr_errdyn_cache[i].err->vt;
+      for (size_t kind = 0; kind < sizeof tokens / sizeof tokens[0]; kind++) {
+        if (!tokens[kind]) continue;
+        if (vt != &scr_error_vts[kind]) continue;
+        ScrStr *token = scr_str_new(tokens[kind], strlen(tokens[kind]));
+        ScrDyn *result = scr_dyn_new_str(token);
+        scr_str_release(token);
+        return result;
+      }
+      break;
+    }
+  }
+  return scr_dyn_retain(scr_dyn_undefined());
 }
 
 /* ── Object.keys/values/entries over the checked-dynamic tree ──────────────────────────
@@ -3354,11 +3691,62 @@ bool scr_dyn_has_own(const ScrDyn *v, const ScrStr *key) {
 ScrDyn *scr_dyn_obj_values(const ScrDyn *v) { return scr_dyn_objwalk(v, SCR_OBJWALK_VALUES); }
 ScrDyn *scr_dyn_obj_entries(const ScrDyn *v) { return scr_dyn_objwalk(v, SCR_OBJWALK_ENTRIES); }
 
-/* ── DOMException's dyn-touching half ─────────────────────────────────
+/* ── Error and DOMException checked-dynamic constructors ──────────────
  * Construction/cause/clone live HERE (not scr_error.c) so the error unit
  * stays linkable without the checked-dynamic tree (the runtime C-unit tests link
  * subsets). The cause teardown installs through scr_error.c's hook
  * before any cause can exist. */
+
+/* Error's cause uses the same split as DOMException: plain runtime
+ * throws stay independent of the checked-dynamic implementation. A NULL
+ * slot means no own property; a stored dyn undefined is a present cause.
+ * Compiled subclasses release the matching hidden dyn field themselves. */
+static void scr_error_cause_drop_impl(void *obj) {
+  ScrError *e = (ScrError *)obj;
+  scr_dyn_release(e->error_cause);
+  e->error_cause = NULL;
+}
+
+void scr_error_init_options(void *obj, int kind, const ScrDyn *message, const ScrDyn *options) {
+  ScrStr *text = message == NULL || message->kind == SCR_DYN_UNDEF
+      ? scr_str_new("", 0) : scr_dyn_string_coerce_js(message);
+  if (scr_exc_pending()) {
+    scr_str_release(text);
+    return;
+  }
+  scr_error_init(obj, kind, text);
+  scr_str_release(text);
+  ScrDyn *view = options && options->kind == SCR_DYN_TYPED_REF
+      ? scr_dyn_typed_ref_materialize(options) : NULL;
+  if (view) options = view;
+  if (options && options->kind == SCR_DYN_OBJ) {
+    ScrDyn *cause = scr_dyn_obj_get(options, "cause", 5);
+    if (cause) {
+      scr_error_install_cause_drop(&scr_error_cause_drop_impl);
+      ((ScrError *)obj)->error_cause = scr_dyn_retain(cause);
+    }
+  }
+  scr_dyn_release(view);
+}
+
+ScrError *scr_error_new_options(int kind, const ScrDyn *message, const ScrDyn *options) {
+  ScrError *e = scr_error_new(kind, NULL);
+  /* scr_error_init_options initializes the prefix of an empty subclass;
+   * discard the allocating constructor's defaults before using it here. */
+  scr_str_release(e->name);
+  scr_str_release(e->message);
+  e->name = e->message = NULL;
+  scr_error_init_options(e, kind, message, options);
+  if (scr_exc_pending()) {
+    scr_error_release(e);
+    return NULL;
+  }
+  return e;
+}
+
+ScrDyn *scr_error_cause(ScrError *e) {
+  return e->error_cause ? scr_dyn_retain(e->error_cause) : scr_dyn_undefined();
+}
 
 static void scr_domex_cause_drop_impl(void *obj) {
   ScrDomException *d = (ScrDomException *)obj;

@@ -48,18 +48,16 @@ export type IrType =
   | { kind: "array"; elem: IrType } // heap, refcounted, monomorphic elements
   /** ES `Map<K, V>` — heap, refcounted, insertion-ordered hash map with ONE
    * runtime representation (ScrMap) and type-directed key/value handling,
-   * exactly the array pattern (never per-instantiation structs). Keys are
-   * f64 or string (SameValueZero); values are f64, string, bool, record,
-   * object, union, or array — anything isRefCounted or scalar EXCEPT
-   * func/promise/dyn/jsval/map (frontend-fenced, validator-checked). */
+   * exactly the array pattern (never per-instantiation structs). Keys use
+   * numeric SameValueZero, string content, or reference identity, including
+   * payload identity for unions of reference keys. isSupportedMapKey and
+   * isSupportedMapValue define the frontend/validator storage fences. */
   | { kind: "map"; key: IrType; value: IrType }
   /** ES `Set<T>` — heap, refcounted, insertion-ordered. Map's sibling with
    * the value slot removed: ONE runtime representation (the backend lowers
    * sets onto the map runtime with a constant unit value), elements are
-   * exactly Map's KEY types — f64 or string, SameValueZero. Same container
-   * fences as map (no union arms, no array elements, no map values, no sets
-   * of sets, not JSON-safe) and never cycle-capable: elements are scalars
-   * or strings, which cannot point back. */
+   * exactly Map's KEY types and use the same equality. Reference elements
+   * carry retain/release and, when cycle-capable, tracing adapters. */
   | { kind: "set"; elem: IrType }
   /** A regular expression — heap, refcounted, IMMUTABLE. No lastIndex
    * statefulness exists: /g and /y are supported only inside
@@ -537,9 +535,12 @@ export function isUnitType(t: IrType): boolean {
  * backends. Array-producing lowerings can learn their result element from
  * a callback rather than through mapType's ordinary T[] gate, so they must
  * share this predicate instead of reconstructing an array around an
- * otherwise-valid standalone type (Map, Set, dyn, opaque handles, ...). */
+ * otherwise-valid standalone type (Map, Set, opaque handles, ...). */
 export function isSupportedArrayElem(t: IrType): boolean {
   switch (t.kind) {
+    // Native collection seeds and drains retain checked values in a
+    // temporary vector. User-facing unknown[] still maps to a dyn array.
+    case "dyn":
     case "f64":
     case "bigint":
     case "bool":
@@ -580,37 +581,36 @@ export function setOf(elem: IrType): IrType {
   return { kind: "set", elem };
 }
 
-/** The Map KEY fence: string (content) or number (SameValueZero) — the two
- * kinds a hash of the VALUE is honest for. Booleans, objects, and the rest
- * of JS's anything-goes keys stay out. Shared by the frontend's
- * type mapping/diagnostics and the validator. Set ELEMENTS use the same
- * fence: a set is hashed storage of its elements exactly as a map is of
- * its keys (isSupportedSetElem is this predicate under its own name). */
-export function isSupportedMapKey(t: IrType): boolean {
-  return t.kind === "f64" || t.kind === "string";
+/** Values whose native reference represents JavaScript identity. Records,
+ * classes and arrays can point back at their collection, so constructors
+ * must carry key tracing as well as retain/release adapters. */
+export function isIdentityCollectionKey(t: IrType): boolean {
+  return t.kind === "record" || t.kind === "object" || t.kind === "array" ||
+    t.kind === "netServer" || t.kind === "symbol";
 }
 
-/** The Set ELEMENT fence — Map's key fence plus the refcounted HANDLE
- * kinds stored under identity hashing (SameValueZero for JS objects IS
- * reference identity, so a Set of server handles — portless's auxiliary-
- * server registry — is honest hashed storage; SCR_MAP_KEY_REF in the
- * runtime). netServer is the one handle admitted so far: it drops its
- * listener closures at close, so a set-in-listener cycle is temporary —
- * the child precedent's story. Symbols are identity values by DESIGN —
- * SameValueZero on a symbol IS pointer identity, so a Set of symbols (the
- * sentinel-registry idiom) is the same honest hashed storage with no
- * cycle risk at all (symbols hold only strings). */
-export function isSupportedSetElem(t: IrType): boolean {
-  return isSupportedMapKey(t) || t.kind === "netServer" || t.kind === "symbol";
+/** Numbers use SameValueZero, strings use content, and reference keys use
+ * identity. A union of identity arms hashes its payload, never its temporary
+ * wrapper. Mixed scalar/reference unions remain outside this contract. */
+export function isSupportedMapKey(t: IrType, unionArms?: IrType[]): boolean {
+  return t.kind === "f64" || t.kind === "string" || t.kind === "dyn" || isIdentityCollectionKey(t) ||
+    (t.kind === "union" && unionArms !== undefined && unionArms.length > 0 && unionArms.every(isIdentityCollectionKey));
 }
 
-/** The Map VALUE fence: scalars plus every refcounted kind EXCEPT
- * func/promise/dyn/jsval (and map itself — no maps of maps).
+/** Set elements and Map keys share storage, equality and ownership rules. */
+export function isSupportedSetElem(t: IrType, unionArms?: IrType[]): boolean {
+  return isSupportedMapKey(t, unionArms);
+}
+
+/** The Map VALUE fence: scalars, supported native references and checked
+ * values. Functions require checked-value boxing; nested maps and jsval
+ * have no native Map slot.
  * Record/object/union values can point back at the map holding them, which
  * is exactly why ref-valued maps are cycle-capable (see the backend's
  * cycle analysis and docs/memory.md). Shared frontend/validator. */
 export function isSupportedMapValue(t: IrType): boolean {
   switch (t.kind) {
+    case "dyn":
     case "f64":
     case "bigint":
     case "string":
@@ -685,18 +685,13 @@ export function funcOf(params: IrType[], ret: IrType): IrType {
   return { kind: "func", params, ret };
 }
 
-/** The union FUNC/SET-arm sibling rule, shared by the frontend's union
- * builders and the validator: FUNC arms are valid beside ANY sibling —
- * `typeof x === "function"` narrows against data arms, unit tag tests
- * cover the nullable-callback shape, and between func arms closures
- * compare by pointer identity per tag (unionEq), so `x === String` is the
- * narrowing (the primitive-constructor tables' `StringConstructor |
- * NumberConstructor` field, and LinkOptions' `false | ((s: string) =>
- * string)`). A SET arm keeps the unit-only rule (no narrowing test
- * against data arms). */
-export function unionFuncSetArmsOk(arms: IrType[]): boolean {
+/** Maps, sets and promises may share a union with null/undefined only.
+ * Unit tag tests can narrow nullable containers without losing identity;
+ * arbitrary data siblings require a separate runtime narrowing operation.
+ * Share this rule across checker mapping, synthesized unions and validation. */
+export function unionContainerArmsOk(arms: IrType[]): boolean {
   return arms.every(
-    (a, i) => a.kind !== "set" || arms.every((b, j) => j === i || isUnitType(b)),
+    (a, i) => (a.kind !== "map" && a.kind !== "set" && a.kind !== "promise") || arms.every((b, j) => j === i || isUnitType(b)),
   );
 }
 
@@ -811,7 +806,7 @@ export function isRefCounted(t: IrType): boolean {
 
 export interface IrModule {
   /** Bumped on any breaking IR change; serialize.ts refuses mismatches. */
-  irVersion: 11;
+  irVersion: 13;
   sourceFile: string;
   functions: IrFunction[];
   /** Class shapes. Constructors and methods are ordinary module functions
@@ -880,17 +875,21 @@ export interface IrModule {
   lib?: IrLibSection;
 }
 
-export type IrFfiValueParamClass = "f64" | "bool" | "u8" | "u32" | "i32" | "string" | "bytes";
+export type IrFfiValueParamClass = "f64" | "f32" | "bool" | "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "string" | "bytes" | "mutable-bytes";
 export type IrFfiCallbackParamClass =
   | "f64"
+  | "f32"
   | "bool"
   | "u8"
+  | "i8"
+  | "u16"
+  | "i16"
   | "u32"
   | "i32"
   | "cstring"
   | "string"
   | "bytes";
-export type IrFfiReturnClass = "f64" | "bool" | "u8" | "u32" | "i32" | "void";
+export type IrFfiReturnClass = "f64" | "f32" | "bool" | "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "void";
 
 export interface IrFfiContextParam {
   /** Manifest-local id of the callback whose ScrClosure* occupies this ABI slot. */
@@ -950,6 +949,7 @@ export function ffiClassType(
     case "string":
       return STRING;
     case "bytes":
+    case "mutable-bytes":
       return BYTES_U8;
     case "void":
       return VOID;
@@ -962,11 +962,13 @@ export function ffiClassType(
 export function ffiCallbackType(
   callback: IrFfiCallbackParam["callback"] | IrFfiReleaseParam["callback"],
 ): IrType & { kind: "func" } {
+  const params: IrType[] = [];
+  for (const param of callback.params) {
+    if (!isFfiContextParam(param)) params.push(ffiClassType(param));
+  }
   return {
     kind: "func",
-    params: callback.params
-      .filter((param): param is IrFfiCallbackParamClass => !isFfiContextParam(param))
-      .map(ffiClassType),
+    params,
     ret: ffiClassType(callback.returns),
   };
 }
@@ -1176,7 +1178,7 @@ export interface IrClassDef {
  * `class Error` can never collide). `lib` is the standard-library name the
  * frontend recognizes; `kind` is the runtime's SCR_ERR_* index (backends
  * stamp scr_error_vts[kind] and pick constructor kinds by it). Every
- * emitted module carries all four class defs (flagged `runtime`) so the
+ * emitted module carries the builtin class defs (flagged `runtime`) so the
  * program's preorder numbering always covers them — the runtime's own
  * throws (JSON/dynCheck/regex) mint instances of these classes whether or
  * not user code mentions Error. */
@@ -1191,8 +1193,11 @@ export const RUNTIME_ERROR_CLASSES: ReadonlyMap<string, { lib: string; kind: num
     // cause) lives in runtime-side slots BEYOND the ScrError prefix the IR
     // fields describe, reached only through the error.dom* libCalls — so
     // user `extends DOMException` is fenced (the subclass layout would
-    // overlap the hidden slots), where the other four extend freely.
+    // overlap the hidden slots), while the standard Error classes extend freely.
     ["%DOMException", { lib: "DOMException", kind: 4, base: "%Error" }],
+    ["%ReferenceError", { lib: "ReferenceError", kind: 5, base: "%Error" }],
+    ["%EvalError", { lib: "EvalError", kind: 6, base: "%Error" }],
+    ["%URIError", { lib: "URIError", kind: 7, base: "%Error" }],
   ]);
 
 /** The runtime-provided node:events EventEmitter class (ScrEmitter /
@@ -1273,6 +1278,14 @@ export interface IrRecordShape {
   declaredOrder?: string[];
 }
 
+/** Codec records have private native state, not a structurally checkable
+ * data surface. Reserve the same '%' namespace as other internal slots. */
+export function recordTextCodecClass(shape: IrRecordShape): "TextEncoder" | "TextDecoder" | null {
+  if (shape.fields.some((f) => f.name === "%TextEncoder")) return "TextEncoder";
+  if (shape.fields.some((f) => f.name === "%TextDecoder")) return "TextDecoder";
+  return null;
+}
+
 /** Object-literal ACCESSOR properties (`{ get x() {...}, set x(v) {...} }`)
  * live on the shape as reserved '%'-fields holding closures: `%get:x` a
  * `() => T` invoked once per property READ (side effects and all — JS's
@@ -1296,6 +1309,14 @@ export function shapeHasAccessorSlots(shape: IrRecordShape): boolean {
   return shape.fields.some((f) => accessorSlotProp(f.name) !== null);
 }
 
+/** Literal fields that select a record layout at a checked-dynamic boundary.
+ * These are part of union identity: equal storage arms can have different
+ * discriminator contracts. Several source variants can share one layout. */
+export interface IrUnionDiscriminant {
+  field: string;
+  cases: { tag: number; values: (string | number | boolean)[] }[];
+}
+
 export interface IrUnionDef {
   /** Frontend-assigned union id (`u0`, `u1`, ...). */
   id: string;
@@ -1303,6 +1324,7 @@ export interface IrUnionDef {
    * an arm's index here is its runtime tag. Never void/func/union; the
    * unit kinds (undefinedT/nullT) are payload-less arms. */
   arms: IrType[];
+  discriminant?: IrUnionDiscriminant;
 }
 
 export interface IrFunction {
@@ -1361,6 +1383,16 @@ export interface IrGlobal {
   name: string;
   type: IrType;
   mutable: boolean;
+  /** A lexical codec binding uses its initially-null record slot as the
+   * TDZ sentinel. Reads and later writes throw until initializing assign. */
+  tdz?: true;
+  /** Original declaration and lexical scope, when this is a source binding. */
+  source?: IrBindingSource;
+}
+
+export interface IrBindingSource {
+  loc: SrcLoc;
+  scope: SrcLoc;
 }
 
 export interface IrLocal {
@@ -1368,18 +1400,21 @@ export interface IrLocal {
   name: string;
   type: IrType;
   mutable: boolean;
+  /** Absent for compiler temporaries and hidden ABI parameters. */
+  source?: IrBindingSource;
   /** Captured by a nested function: the variable lives in a refcounted box
    * (a shared binding — mutations are visible through every capture). All
    * access, including in the declaring function, goes through the box. */
   boxed?: true;
-  /** A forward-captured const (a function declared BEFORE the const it
+  /** A forward-captured lexical binding (a function declared BEFORE the binding it
    * captures): the box is allocated TDZ-empty at scope entry (a `varDecl`
    * with `init: null`) so earlier closures can capture it, and the source
-   * declaration initializes it via `assign`. Every read tests the box —
+   * declaration initializes it via `assign` with `initializes: true`.
+   * Every read and non-initializing write tests the box —
    * empty throws JS's catchable ReferenceError ("Cannot access 'name'
    * before initialization"), exactly Node's temporal dead zone. Always
-   * paired with `boxed`; restricted to pointer-backed types (the NULL slot
-   * IS the TDZ sentinel). Capture entries inherit the flag. */
+   * paired with `boxed`; scalar payloads use a one-element array cell so
+   * the NULL slot remains the TDZ sentinel. Capture entries inherit the flag. */
   tdz?: true;
 }
 
@@ -1394,7 +1429,9 @@ export type IrStmt =
    * initialized-check; refcounted locals simply stay NULL until the first
    * `assign`. */
   | { kind: "varDecl"; localId: string; init: IrExpr | null; loc: SrcLoc }
-  | { kind: "assign"; localId: string; value: IrExpr; loc: SrcLoc }
+  /** `initializes` marks a TDZ binding's declaration, whose store may
+   * initialize an empty box. Ordinary assignments must check it first. */
+  | { kind: "assign"; localId: string; value: IrExpr; initializes?: true; loc: SrcLoc }
   | { kind: "exprStmt"; expr: IrExpr; loc: SrcLoc }
   | { kind: "if"; cond: IrExpr; then: IrStmt[]; else_: IrStmt[] | null; loc: SrcLoc }
   /** `labels` (here and on doWhile/for/forOf/switch/block): the JS label
@@ -1927,8 +1964,9 @@ export type IrRegexIntrinsicMethod =
  * union — every member has a signature in the validator's LIB_FN_SIGS and a
  * scr_* implementation in the runtime (scr_lib.c / scr_json.c). fs.*
  * failures and json.parse syntax errors THROW (catchable, via the runtime
- * exception cell); process.* members never throw. JSON.stringify is NOT a
- * libCall — it lowers to the type-directed `jsonStringify` node below.
+ * exception cell); process.* members never throw. JSON.stringify without a
+ * callback lowers to the type-directed `jsonStringify` node below; callback
+ * forms use the shared native JSON walker through libCall.
  * island.eval (the internal __island_eval testing hook) exists only in
  * --dynamic builds — the frontend rejects it otherwise, so backends may
  * assume the island runtime is linked when they see it; island exceptions
@@ -1978,6 +2016,8 @@ export type IrLibFn =
    * --dynamic only. */
   | "island.castFail"
   | "json.parse"
+  | "json.parseReviver"
+  | "json.stringifyReplacer"
   /** Keyed WRITE on a dyn value — `h.onDone = cb` / `h["k"] = v` on a
    * checked-dynamic object (args: receiver, key string, value — all
    * borrowed; the runtime copies the key and retains the value in). An
@@ -3397,11 +3437,14 @@ export type IrLibFn =
   /** node:zlib (scr_zlib.c — native-toolchain.ts compiles/links it ONLY when these
    * appear on the IR, the regex/libcurl gating precedent): one-shot zlib,
    * raw-DEFLATE, gzip, and auto-detect codecs over u8 bytes with Node's
-   * default options. Compression never throws (OOM aborts); decompression
+   * default options, or a validated literal compression level from -1 to 9.
+   * Compression never throws (OOM aborts); decompression
    * of corrupt input THROWS Node's error catchably. */
   | "zlib.deflateSync"
   | "zlib.inflateSync"
   | "zlib.deflateRawSync"
+  /** bytes, mode (0 zlib / 1 raw / 2 gzip), validated compression level. */
+  | "zlib.deflateLevelSync"
   | "zlib.inflateRawSync"
   | "zlib.gzipSync"
   | "zlib.gunzipSync"
@@ -3712,6 +3755,15 @@ export type IrLibFn =
    * field to stamp. error.toString: borrowed `%Error`-typed receiver, +1
    * string in Node's "name: message" shape. None of the three throws. */
   | "error.new"
+  /** ECMAScript constructors with raw checked-dynamic message/options.
+   * Options retain cause presence; constructor calls borrow their args.
+   * Message coercion may throw before the cause is installed. */
+  | "error.newOptions"
+  | "error.ctorOptions"
+  /** Borrowed Error receiver. cause returns an owned dyn value (undefined
+   * when absent); hasCause distinguishes absence from present undefined. */
+  | "error.cause"
+  | "error.hasCause"
   /** The compiler-resolved Node-parity throw for always-throwing lowered
    * arms (ERR_INVALID_THIS receivers, ERR_MISSING_ARGS arity ladders,
    * the symbol-to-string TypeError): args are [error-kind f64 (the
@@ -4461,10 +4513,9 @@ export type IrLibFn =
   /** WHATWG TextDecoder.decode over u8 bytes (scr_bytes.c): utf-8 with
    * default options — the same maximal-subpart replacement decode as
    * Buffer.toString("utf8"), with the leading BOM stripped (the one
-   * behavioral difference; ignoreBOM defaults to false). The composed
-   * `new TextDecoder().decode(bytes)` form and its same-scope const
-   * store-then-call twin lower — decoder values still have no general
-   * representation. TextEncoder.encode needs no libFn: its matching forms
+   * behavioral difference; ignoreBOM defaults to false). Inline calls
+   * lower directly; stored decoder records dispatch by encoding id.
+   * TextEncoder.encode needs no libFn: its matching forms
    * lower to buffer.fromStr(s, "utf8") (identical bytes — ScrStr storage
    * is well-formed UTF-8). Borrowed arg; owned (+1) string; never throws. */
   | "text.decode"
@@ -4726,11 +4777,11 @@ export type IrExpr =
    * release the left. */
   | { kind: "orDefault"; left: IrExpr; right: IrExpr; retag?: string; type: IrType; loc: SrcLoc }
   /** Optional chaining `a?.b` / `a?.m(...)` / `f?.()` / `a?.[i]` — the
-   * `nullish` test inverted: `receiver` is a unit-armed union with exactly
-   * ONE non-unit arm, evaluated exactly once; when its runtime tag is a
+   * `nullish` test inverted: `receiver` is a unit-armed union with at least
+   * one non-unit arm, evaluated exactly once; when its runtime tag is a
    * unit arm the result is the interned undefined arm of `type` (JS-exact:
    * a null receiver still yields undefined) and `body` never evaluates —
-   * argument side effects included. Otherwise the narrowed receiver binds
+   * argument side effects included. Otherwise the receiver binds
    * to `id` (read via chainRecv inside `body`, +1 per read for ref kinds)
    * and `body` produces the result: `type` when non-void (an
    * undefined-armed union; the frontend pre-wraps the member value into
@@ -4738,7 +4789,9 @@ export type IrExpr =
    * checker's `void | undefined` maps to void). */
   | { kind: "optChain"; id: string; receiver: IrExpr; body: IrExpr; type: IrType; loc: SrcLoc }
   /** The narrowed receiver inside an enclosing optChain's `body`, by the
-   * chain's `id` — typed as the union's single non-unit arm; each read is
+   * chain's `id` — typed as the single non-unit arm when there is one,
+   * or as the original union when there are several (the body can retag
+   * it to the present sub-union). Each read is
    * +1 for ref kinds (a borrowed bind temp backs it). Valid nowhere else
    * (validated against the active-chain stack). */
   | { kind: "chainRecv"; id: string; type: IrType; loc: SrcLoc }
@@ -5302,9 +5355,11 @@ export type IrExpr =
    * forms whose statement lowering needs temps and writes (destructuring
    * assignments in value position, keyed dyn writes yielding the RHS).
    * `type` IS result's type. Restricted on purpose: stmts must be
-   * straight-line (varDecl/assign/exprStmt/field-and-record writes — no
-   * control flow, no jumps; the validator enforces the subset), and any
-   * varDecl-introduced local is a function local like every hidden temp. */
+   * local statements (including state-selection blocks/ifs, but no jumps;
+   * the validator enforces the subset). Hidden locals retain function-wide
+   * ids, but their owned values live through the enclosing expression's
+   * frame: later call arguments may reuse a saved operand. Release them
+   * on the same path that initialized them, not an outer lexical scope. */
   | { kind: "seqExpr"; stmts: IrStmt[]; result: IrExpr; type: IrType; loc: SrcLoc }
   /** RequireObjectCoercible with V8's destructuring TypeError: throws
    * "Cannot destructure 'SPELLING' as it is undefined." (or "…null.") on
@@ -5336,6 +5391,11 @@ export type IrExpr =
    * listed (they never live in the overflow map — the lowering prepends
    * them from the shape). Never throws. */
   | { kind: "recordOvfKeys"; obj: IrExpr; shapeId: string; type: IrType; loc: SrcLoc }
+  /** Own-key presence in an index-signature record's overflow map. Unlike
+   * a keyed read, this distinguishes a missing key from a stored undefined
+   * value. Declared fields are handled separately by the lowering. Both
+   * operands are borrowed, the key is string, the result is bool. */
+  | { kind: "recordOvfHas"; obj: IrExpr; shapeId: string; key: IrExpr; type: IrType; loc: SrcLoc }
   /** Union construction: wrap an arm value into a fresh tagged box (the
    * frontend inserts these wherever a `B` flows into an `A | B` slot).
    * `tag` is the arm's index in the union's canonical arm list; `value` has
@@ -5350,14 +5410,15 @@ export type IrExpr =
   | { kind: "unionFuncEq"; unionId: string; tag: number; union: IrExpr; func: IrExpr; negated: boolean; type: IrType; loc: SrcLoc }
   /** Runtime test on a catch binding (`value` is a caught-typed varRef,
    * borrowed). The primitive tests ("string"/"number"/"boolean") compare
-   * the snapshot's kind tag — exactly what `typeof e === "..."` observes;
+   * the snapshot's kind tag. "object" also checks reference payloads,
+   * excluding callable and primitive references;
    * "instanceof" requires `className` (a hierarchy class) and tests an OBJ
    * payload's vtable preorder against its interval (false for every other
    * payload kind). `negated` flips the result (the `!==` spelling). */
   | {
       kind: "caughtTest";
       value: IrExpr;
-      test: "string" | "number" | "boolean" | "instanceof";
+      test: "string" | "number" | "boolean" | "object" | "instanceof";
       className?: string;
       negated?: boolean;
       type: IrType;
@@ -5743,24 +5804,28 @@ function isJsonSafeAt(
   stringify: boolean,
   undefinedAllowed: boolean,
   visiting: Set<string>,
+  dynFields = false,
 ): boolean {
   if (HANDLE_KINDS.has(t.kind)) return false;
   switch (t.kind) {
+    case "dyn":
+      return dynFields;
     case "f64":
     case "string":
     case "bool":
       return true;
     case "array":
-      return isJsonSafeAt(t.elem, getRecord, getUnion, stringify, stringify, visiting);
+      return isJsonSafeAt(t.elem, getRecord, getUnion, stringify, stringify, visiting, dynFields);
     case "record": {
       const shape = getRecord(t.shapeId);
       if (!shape) return false;
+      if (recordTextCodecClass(shape) !== null) return false;
       // The recursive knot: answer true and let the rest of the graph
       // decide (any unsafe constituent is found on its own path; a false
       // short-circuits every `every` up the walk).
       if (visiting.has(t.shapeId)) return true;
       visiting.add(t.shapeId);
-      if (!shape.fields.every((f) => isJsonSafeAt(f.type, getRecord, getUnion, stringify, !shape.tuple || stringify, visiting))) {
+      if (!shape.fields.every((f) => isJsonSafeAt(f.type, getRecord, getUnion, stringify, !shape.tuple || stringify, visiting, dynFields))) {
         return false;
       }
       // Overflow values sit in record-key position too: dyn is JSON-safe
@@ -5768,7 +5833,7 @@ function isJsonSafeAt(
       // like any undefined-valued key), everything else follows the
       // record-field rule.
       if (shape.indexValue && shape.indexValue.kind !== "dyn") {
-        return isJsonSafeAt(shape.indexValue, getRecord, getUnion, stringify, true, visiting);
+        return isJsonSafeAt(shape.indexValue, getRecord, getUnion, stringify, true, visiting, dynFields);
       }
       return true;
     }
@@ -5778,7 +5843,7 @@ function isJsonSafeAt(
       const key = `${t.unionId}:${stringify}:${undefinedAllowed}`;
       if (visiting.has(key)) return true; // the recursive knot, union-flavored
       visiting.add(key);
-      return def.arms.every((a) => a.kind === "undefinedT" ? undefinedAllowed : isJsonSafeAt(a, getRecord, getUnion, stringify, undefinedAllowed, visiting));
+      return def.arms.every((a) => a.kind === "undefinedT" ? undefinedAllowed : isJsonSafeAt(a, getRecord, getUnion, stringify, undefinedAllowed, visiting, dynFields));
     }
     case "func":
     case "object":
@@ -5808,7 +5873,6 @@ function isJsonSafeAt(
     // Buffers as {type:"Buffer",data:[...]} in Node — neither shape is
     // representable type-directedly; rejected like Maps.
     case "bytes":
-    case "dyn":
     case "jsval":
     case "caught":
     case "promise":
@@ -6109,6 +6173,7 @@ function canBoxDynComposite(
     case "record": {
       const shape = getRecord(t.shapeId);
       if (!shape) return false;
+      if (recordTextCodecClass(shape) !== null) return false;
       // Recursive shapes answer coinductively, like isJsonSafeType.
       if (visiting.has(t.shapeId)) return true;
       visiting.add(t.shapeId);
@@ -6137,14 +6202,19 @@ export function canDynCheckTo(
   getRecord: (shapeId: string) => IrRecordShape | undefined,
   getUnion: (unionId: string) => IrUnionDef | undefined,
 ): boolean {
-  if (isJsonSafeType(t, getRecord, getUnion)) return true;
+  // Unknown fields keep an owned dyn subtree; checking the surrounding
+  // record/array still validates its layout. This is broader than the
+  // stringify/island JSON domain, which cannot assume opaque slots are
+  // serializable. Backends already retain dyn fields and fill missing
+  // unknown record fields with the undefined value.
+  if (isJsonSafeAt(t, getRecord, getUnion, false, false, new Set(), true)) return true;
   if (t.kind === "bytes" && t.elem === "u8") return true;
   if (t.kind === "object" && t.className === "%Error") return true;
   if (t.kind === "func") return canAdaptDynFuncTo(t, getRecord, getUnion);
   if (DYN_HANDLE_KINDS.has(t.kind)) return true;
   if (t.kind === "union") {
     const def = getUnion(t.unionId);
-    return !!def && def.arms.every((a) => a.kind === "undefinedT" || isJsonSafeType(a, getRecord, getUnion));
+    return !!def && def.arms.every((a) => a.kind === "undefinedT" || isJsonSafeAt(a, getRecord, getUnion, false, false, new Set(), true));
   }
   return false;
 }
@@ -6685,7 +6755,9 @@ export function moduleUsesDynAsync(mod: IrModule): boolean {
     // A DYN-typed await reads through scr_await_dyn (the checked-dynamic tree-crossing
     // await lives in the gated TU) — promise<dyn> receivers' awaits and
     // the lifted then/catch helpers alike.
-    if (node.kind === "awaitExpr" && node.type !== undefined && node.type.kind === "dyn") {
+    const boxed = (node as { value?: { type?: { kind?: unknown; ret?: { kind?: unknown } } } }).value?.type;
+    if ((node.kind === "awaitExpr" && node.type?.kind === "dyn") ||
+        (node.kind === "dynFrom" && (boxed?.kind === "promise" || (boxed?.kind === "func" && boxed.ret?.kind === "promise")))) {
       found = true;
       return;
     }
@@ -7608,6 +7680,9 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "error.nodeThrow",
   // USVString coercion runs user toString/valueOf — throws propagate.
   "dyn.toStringCoerce",
+  // Error messages use the same coercion protocol before installing cause.
+  "error.newOptions",
+  "error.ctorOptions",
   "dyn.objectTag",
   // Numeric coercion runs user valueOf/toString — throws propagate.
   "dyn.toNumberCoerce",
@@ -7645,6 +7720,8 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "island.import",
   "island.castFail",
   "json.parse",
+  "json.parseReviver",
+  "json.stringifyReplacer",
   "util.parseArgs",
   // decodeURIComponent throws the spec's URIError on bad hex/invalid
   // UTF-8 octets (encodeURIComponent never throws — see the IrLibFn doc).

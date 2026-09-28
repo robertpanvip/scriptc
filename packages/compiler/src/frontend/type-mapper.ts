@@ -1,16 +1,32 @@
 import { InternalCompilerError } from "../errors.js";
 import * as ts from "./ts7/adapter.js";
 import { bodyReadsArguments } from "./arguments-usage.js";
-import type { IrRecordShape, IrType, IrUnionDef } from "../ir/ir.js";
-import { arrayOf, BOOL, bytesOf, canConvertToDyn, CHILD_T, CRYPTOHASH_T, CRYPTOHMAC_T, DATE_T, DYN, F64, funcOf, isSupportedArrayElem, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, UNDEFINED_T, VOID } from "../ir/ir.js";
+import type { IrRecordShape, IrType, IrUnionDef, IrUnionDiscriminant } from "../ir/ir.js";
+import { arrayOf, BOOL, bytesOf, canConvertToDyn, CHILD_T, CRYPTOHASH_T, CRYPTOHMAC_T, DATE_T, DYN, F64, funcOf, isSupportedArrayElem, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, JSVAL, mapOf, NULL_T, PROCSTREAM_T, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, setOf, STRING, SYMBOL_T, typeEquals, typeKey, unionContainerArmsOk, UNDEFINED_T, VOID } from "../ir/ir.js";
 import { BIGINT_T } from "../ir/ir.js";
 
 import { isJsSourceFile, isNodeTypesPath } from "./program.js";
-import { accessorSlotProp } from "../ir/ir.js";
+import { accessorSlotProp, recordTextCodecClass } from "../ir/ir.js";
 // typeKey moved to ir/ir.ts (the backend needs it too, for per-type
 // helper interning); re-exported here so frontend call sites keep their
 // import path.
 export { typeKey };
+
+/** Empty JS object inference describes no fixed layout. Keep these values
+ * in checked storage across fields, parameters and function signatures. */
+export function jsOpenObjectType(
+  decl: ts.Node | undefined,
+  type: IrType,
+  shapes: ShapeRegistry,
+  unions: UnionRegistry,
+): IrType {
+  if (!decl || !isJsSourceFile(decl.getSourceFile())) return type;
+  const arms = type.kind === "union" ? unions.get(type.unionId)?.arms : [type];
+  const present = arms?.filter((arm) => arm.kind !== "undefinedT");
+  if (present?.length !== 1 || present[0]!.kind !== "record") return type;
+  const shape = shapes.get(present[0]!.shapeId);
+  return shape && shape.fields.length === 0 && !shape.indexValue && !shape.tuple ? DYN : type;
+}
 
 /** The ambient TYPE names of the fetch slice. Under --dynamic their
  * values live in the embedded engine and map to island handles (jsval).
@@ -323,10 +339,9 @@ export class ShapeRegistry {
 }
 
 /** The frontend's union interner — mirrors ShapeRegistry. A union's
- * canonical identity is its typeKey-sorted arm list; two ts unions whose
- * arms map to the same IR types share one unionId (and later one runtime
- * tag numbering: an arm's index in the canonical list IS its tag). Owned by
- * the Lowerer; threaded through mapType exactly like ShapeRegistry. */
+ * canonical identity includes its typeKey-sorted arms and literal
+ * discriminator contract. An arm's index in that list IS its runtime tag.
+ * Owned by the Lowerer; threaded through mapType like ShapeRegistry. */
 export class UnionRegistry {
   private readonly byKey = new Map<string, string>();
   private readonly byId = new Map<string, IrUnionDef>();
@@ -376,27 +391,27 @@ export class UnionRegistry {
 
   /** Completes a recursive placeholder with its canonical arm list and
    * registers the structural key (first writer wins, like shapes). */
-  finalizeRecursive(t: ts.Type, arms: IrType[]): string {
+  finalizeRecursive(t: ts.Type, arms: IrType[], discriminant?: IrUnionDiscriminant): string {
     const id = this.recIds.get(t);
     if (id === undefined) throw new InternalCompilerError("union registry bug: finalizeRecursive without a placeholder");
     if (this.pendingRec.has(id)) {
       const def = this.byId.get(id)!;
       def.arms.push(...arms);
+      if (discriminant) def.discriminant = discriminant;
       this.pendingRec.delete(id);
-      const key = JSON.stringify(arms.map(typeKey));
+      const key = JSON.stringify([arms.map(typeKey), discriminant]);
       if (!this.byKey.has(key)) this.byKey.set(key, id);
     }
     return id;
   }
 
-  /** Interns a canonical (typeKey-sorted, deduplicated) arm list, returning
-   * its unionId. */
-  intern(arms: IrType[]): string {
-    const key = JSON.stringify(arms.map(typeKey));
+  /** Interns canonical arms and discriminator cases, returning their unionId. */
+  intern(arms: IrType[], discriminant?: IrUnionDiscriminant): string {
+    const key = JSON.stringify([arms.map(typeKey), discriminant]);
     let id = this.byKey.get(key);
     if (id === undefined) {
       id = `u${this.unions.length}`;
-      const def: IrUnionDef = { id, arms };
+      const def: IrUnionDef = { id, arms, ...(discriminant ? { discriminant } : {}) };
       this.byKey.set(key, id);
       this.byId.set(id, def);
       this.unions.push(def);
@@ -411,158 +426,228 @@ export class UnionRegistry {
 
 /** Human-readable rendering of an IrType for diagnostics (records expand to
  * their canonical field list, unions to their arms; `checker.typeToString`
- * can't — it never sees IR types). `seen` breaks recursive shapes/unions:
- * a back-reference renders as "..." instead of expanding forever. */
+ * can't — it never sees IR types). Bound the traversal as well as its output:
+ * cycle detection alone still expands a shared acyclic graph exponentially.
+ * The same budget covers every sibling, and deep wrapper chains truncate
+ * before exhausting the JS stack. Small types retain their full spelling. */
 export function formatIrType(t: IrType, shapes: ShapeRegistry, unions: UnionRegistry, seen: Set<string> = new Set()): string {
-  switch (t.kind) {
-    case "f64":
-      return "number";
-    case "string":
-      return "string";
-    case "bool":
-      return "boolean";
-    case "dyn":
-      return "unknown";
-    case "caught":
-      // What tsc calls the binding; the fence messages carry the real story.
-      return "unknown";
-    case "void":
-      return "void";
-    case "undefinedT":
-      return "undefined";
-    case "nullT":
-      return "null";
-    case "array": {
-      // Union/func elements need the parens TS syntax would ("(number |
-      // string)[]" — without them the [] reads as binding to the last arm).
-      const elem = formatIrType(t.elem, shapes, unions, seen);
-      return t.elem.kind === "union" || t.elem.kind === "func" ? `(${elem})[]` : `${elem}[]`;
+  const maxLength = 4096;
+  const maxDepth = 32;
+  let output = "";
+  let truncated = false;
+  const append = (text: string): void => {
+    if (truncated) return;
+    // Reserve the marker so a full buffer can always report truncation.
+    const remaining = maxLength - 3 - output.length;
+    if (text.length > remaining) {
+      output += text.slice(0, remaining) + "...";
+      truncated = true;
+    } else {
+      output += text;
     }
-    case "bytes":
-      // The u8 kind reads as Uint8Array (Buffer maps here too — one
-      // runtime representation; the message stays honest either way).
-      return t.elem === "u8" ? "Uint8Array" : t.elem === "u32" ? "Uint32Array" : t.elem === "i32" ? "Int32Array" : t.elem === "f32" ? "Float32Array" : "Float64Array";
-    case "map":
-      return `Map<${formatIrType(t.key, shapes, unions, seen)}, ${formatIrType(t.value, shapes, unions, seen)}>`;
-    case "set":
-      return `Set<${formatIrType(t.elem, shapes, unions, seen)}>`;
-    case "func":
-      return `(${t.params.map((p) => formatIrType(p, shapes, unions, seen)).join(", ")}) => ${formatIrType(t.ret, shapes, unions, seen)}`;
-    case "object":
-      // Runtime-provided error classes carry '%'-prefixed IR names
-      // ("%Error") so user classes can never collide; diagnostics show the
-      // source-level name.
-      return t.className.startsWith("%") ? t.className.slice(1) : t.className;
-    case "classval":
-      // The static side, in TS's own spelling.
-      return `typeof ${t.className.startsWith("%") ? t.className.slice(1) : t.className}`;
-    case "record": {
-      const shape = shapes.get(t.shapeId);
-      if (!shape) return `{ /* unknown shape ${t.shapeId} */ }`;
-      if (seen.has(t.shapeId)) return "..."; // the recursive knot
-      seen.add(t.shapeId);
-      try {
-        if (shape.tuple) {
-          const byIndex = [...shape.fields].sort((a, b) => Number(a.name) - Number(b.name));
-          return `[${byIndex.map((f) => formatIrType(f.type, shapes, unions, seen)).join(", ")}]`;
-        }
-        const members = shape.fields.map((f) => {
-          // Accessor slots print in TS's accessor spelling, not the
-          // reserved '%'-field encoding.
-          const slot = accessorSlotProp(f.name);
-          if (slot && f.type.kind === "func") {
-            return slot.kind === "get"
-              ? `get ${slot.prop}(): ${formatIrType(f.type.ret, shapes, unions, seen)}`
-              : `set ${slot.prop}(${formatIrType(f.type.params[0] ?? VOID, shapes, unions, seen)})`;
+  };
+  const list = (types: readonly IrType[], separator: string, depth: number): void => {
+    for (let i = 0; i < types.length && !truncated; i++) {
+      if (i > 0) append(separator);
+      visit(types[i]!, depth);
+    }
+  };
+  const visit = (t: IrType, depth: number): void => {
+    if (truncated) return;
+    if (depth >= maxDepth) return append("...");
+    const child = (type: IrType): void => visit(type, depth + 1);
+    switch (t.kind) {
+      case "f64":
+        return append("number");
+      case "string":
+        return append("string");
+      case "bool":
+        return append("boolean");
+      case "dyn":
+        return append("unknown");
+      case "caught":
+        // What tsc calls the binding; the fence messages carry the real story.
+        return append("unknown");
+      case "void":
+        return append("void");
+      case "undefinedT":
+        return append("undefined");
+      case "nullT":
+        return append("null");
+      case "array": {
+        // Union/func elements need the parens TS syntax would ("(number |
+        // string)[]" — without them the [] reads as binding to the last arm).
+        const parens = t.elem.kind === "union" || t.elem.kind === "func";
+        if (parens) append("(");
+        child(t.elem);
+        return append(parens ? ")[]" : "[]");
+      }
+      case "bytes":
+        // The u8 kind reads as Uint8Array (Buffer maps here too — one
+        // runtime representation; the message stays honest either way).
+        return append(t.elem === "u8" ? "Uint8Array" : t.elem === "u32" ? "Uint32Array" : t.elem === "i32" ? "Int32Array" : t.elem === "f32" ? "Float32Array" : "Float64Array");
+      case "map":
+        append("Map<");
+        child(t.key);
+        append(", ");
+        child(t.value);
+        return append(">");
+      case "set":
+        append("Set<");
+        child(t.elem);
+        return append(">");
+      case "func":
+        append("(");
+        list(t.params, ", ", depth + 1);
+        append(") => ");
+        return child(t.ret);
+      case "object":
+        // Runtime-provided error classes carry '%'-prefixed IR names
+        // ("%Error") so user classes can never collide; diagnostics show the
+        // source-level name.
+        return append(t.className.startsWith("%") ? t.className.slice(1) : t.className);
+      case "classval":
+        // The static side, in TS's own spelling.
+        append("typeof ");
+        return append(t.className.startsWith("%") ? t.className.slice(1) : t.className);
+      case "record": {
+        const shape = shapes.get(t.shapeId);
+        if (!shape) return append(`{ /* unknown shape ${t.shapeId} */ }`);
+        const codec = recordTextCodecClass(shape);
+        if (codec !== null) return append(codec);
+        if (seen.has(t.shapeId)) return append("..."); // the recursive knot
+        seen.add(t.shapeId);
+        try {
+          if (shape.tuple) {
+            const byIndex = [...shape.fields].sort((a, b) => Number(a.name) - Number(b.name));
+            append("[");
+            for (let i = 0; i < byIndex.length && !truncated; i++) {
+              if (i > 0) append(", ");
+              child(byIndex[i]!.type);
+            }
+            return append("]");
           }
-          return `${f.name}: ${formatIrType(f.type, shapes, unions, seen)}`;
-        });
-        if (shape.indexValue) {
-          members.push(`[key: string]: ${formatIrType(shape.indexValue, shapes, unions, seen)}`);
+          if (shape.fields.length === 0 && !shape.indexValue) return append("{}");
+          append("{ ");
+          for (let i = 0; i < shape.fields.length && !truncated; i++) {
+            if (i > 0) append("; ");
+            const f = shape.fields[i]!;
+            // Accessor slots print in TS's accessor spelling, not the
+            // reserved '%'-field encoding.
+            const slot = accessorSlotProp(f.name);
+            if (slot && f.type.kind === "func") {
+              append(slot.kind === "get" ? "get " : "set ");
+              append(slot.prop);
+              if (slot.kind === "get") {
+                append("(): ");
+                child(f.type.ret);
+              } else {
+                append("(");
+                child(f.type.params[0] ?? VOID);
+                append(")");
+              }
+            } else {
+              append(f.name);
+              append(": ");
+              child(f.type);
+            }
+          }
+          if (shape.indexValue) {
+            if (shape.fields.length > 0) append("; ");
+            append("[key: string]: ");
+            child(shape.indexValue);
+          }
+          return append(" }");
+        } finally {
+          seen.delete(t.shapeId); // sibling occurrences still expand
         }
-        if (members.length === 0) return "{}";
-        return `{ ${members.join("; ")} }`;
-      } finally {
-        seen.delete(t.shapeId); // sibling occurrences still expand
+      }
+      case "union": {
+        const def = unions.get(t.unionId);
+        if (!def) return append(`/* union ${t.unionId} */`);
+        if (seen.has(t.unionId)) return append("..."); // the recursive knot
+        seen.add(t.unionId);
+        try {
+          return list(def.arms, " | ", depth + 1);
+        } finally {
+          seen.delete(t.unionId);
+        }
+      }
+      case "jsval":
+        return append("any");
+      case "regex":
+        return append("RegExp");
+      case "date":
+        return append("Date");
+      case "url":
+        return append("URL");
+      case "searchParams":
+        return append("URLSearchParams");
+      case "symbol":
+        return append("symbol");
+      case "bigint":
+        return append("bigint");
+      case "stats":
+        return append("Stats");
+      case "fileHandle":
+        return append("FileHandle");
+      case "spawnRes":
+        return append("SpawnSyncReturns");
+      case "child":
+        return append("ChildProcess");
+      case "netServer":
+        return append("Server");
+      case "netSocket":
+        return append("Socket");
+      case "http2Session":
+        return append("Http2Session");
+      case "http2Stream":
+        return append("Http2Stream");
+      case "dgramSocket":
+        return append("dgram.Socket");
+      case "testCtx":
+        return append("TestContext");
+      case "httpReq":
+        return append("IncomingMessage");
+      case "httpRes":
+        return append("ServerResponse");
+      case "httpClientReq":
+        return append("ClientRequest");
+      case "secureCtx":
+        return append("SecureContext");
+      case "cryptoHash":
+        return append("Hash");
+      case "cryptoHmac":
+        return append("Hmac");
+      case "fsWatcher":
+        return append("FSWatcher");
+      case "childStream":
+        return append("Readable");
+      case "childWriter":
+        return append("Writable");
+      case "procStream":
+        return append("WriteStream");
+      case "moduleNs":
+        append("module namespace '");
+        append(t.moduleId);
+        return append("'");
+      case "promise":
+        append("Promise<");
+        child(t.inner);
+        return append(">");
+      case "generator":
+        append(t.async ? "AsyncGenerator<" : "Generator<");
+        list([t.yieldT, t.retT, t.nextT], ", ", depth + 1);
+        return append(">");
+      default: {
+        const _exhaustive: never = t;
+        void _exhaustive;
+        throw new InternalCompilerError("unreachable");
       }
     }
-    case "union": {
-      const def = unions.get(t.unionId);
-      if (!def) return `/* union ${t.unionId} */`;
-      if (seen.has(t.unionId)) return "..."; // the recursive knot
-      seen.add(t.unionId);
-      try {
-        return def.arms.map((a) => formatIrType(a, shapes, unions, seen)).join(" | ");
-      } finally {
-        seen.delete(t.unionId);
-      }
-    }
-    case "jsval":
-      return "any";
-    case "regex":
-      return "RegExp";
-    case "date":
-      return "Date";
-    case "url":
-      return "URL";
-    case "searchParams":
-      return "URLSearchParams";
-    case "symbol":
-      return "symbol";
-    case "bigint":
-      return "bigint";
-    case "stats":
-      return "Stats";
-    case "fileHandle":
-      return "FileHandle";
-    case "spawnRes":
-      return "SpawnSyncReturns";
-    case "child":
-      return "ChildProcess";
-    case "netServer":
-      return "Server";
-    case "netSocket":
-      return "Socket";
-    case "http2Session":
-      return "Http2Session";
-    case "http2Stream":
-      return "Http2Stream";
-    case "dgramSocket":
-      return "dgram.Socket";
-    case "testCtx":
-      return "TestContext";
-    case "httpReq":
-      return "IncomingMessage";
-    case "httpRes":
-      return "ServerResponse";
-    case "httpClientReq":
-      return "ClientRequest";
-    case "secureCtx":
-      return "SecureContext";
-    case "cryptoHash":
-      return "Hash";
-    case "cryptoHmac":
-      return "Hmac";
-    case "fsWatcher":
-      return "FSWatcher";
-    case "childStream":
-      return "Readable";
-    case "childWriter":
-      return "Writable";
-    case "procStream":
-      return "WriteStream";
-    case "moduleNs":
-      return `module namespace '${t.moduleId}'`;
-    case "promise":
-      return `Promise<${formatIrType(t.inner, shapes, unions, seen)}>`;
-    case "generator":
-      return `${t.async ? "AsyncGenerator" : "Generator"}<${formatIrType(t.yieldT, shapes, unions, seen)}, ${formatIrType(t.retT, shapes, unions, seen)}, ${formatIrType(t.nextT, shapes, unions, seen)}>`;
-    default: {
-      const _exhaustive: never = t;
-      void _exhaustive;
-      throw new InternalCompilerError("unreachable");
-    }
-  }
+  };
+  visit(t, 0);
+  return output;
 }
 
 /** True when the declaration sits inside `declare module "<name>"` (or
@@ -927,6 +1012,15 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   if (flags & ts.TypeFlags.Number) return F64;
   if (flags & ts.TypeFlags.String) return STRING;
   if (flags & ts.TypeFlags.Boolean || flags & ts.TypeFlags.BooleanLiteral) return BOOL;
+  // ErrorOptions carries a presence-sensitive unknown value. A fixed
+  // optional field cannot distinguish {} from { cause: undefined }; the
+  // checked-dynamic object retains that distinction through forwarding
+  // constructors. Only the standard library's interface gets this ABI.
+  const errorOptionsSymbol = widened.getSymbol();
+  if (errorOptionsSymbol?.name === "ErrorOptions" &&
+    checker.declarationsOf(errorOptionsSymbol).some((d) => ctx.isStdlibFile(d.getSourceFile()))) {
+    return DYN;
+  }
   // node:util.parseArgs config/results are declaration-heavy conditional
   // and discriminated-union types over a value that is naturally a checked-
   // dynamic tree. Keep the named public surface (plus @types/node's private
@@ -1003,6 +1097,12 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // unit-only union themselves (isUnitOnlyTsType + unitOnlyUnion) — the
   // position knows it wants a value; this mapping cannot.
   if (flags & (ts.TypeFlags.Void | ts.TypeFlags.Undefined)) return VOID;
+  // Generic visitors can instantiate `T | undefined` as `void | undefined`.
+  // It has the same return convention as standalone void; value positions
+  // still substitute the unit-only slot through isUnitOnlyTsType below.
+  if (widened.isUnionType() && ts.constituentTypes(widened).every(
+    (part) => (part.flags & (ts.TypeFlags.Void | ts.TypeFlags.Undefined)) !== 0,
+  )) return VOID;
   // Standalone `null` (a `const x = null` binding, a `{ value: null }`
   // field, a `(): null` return): the unit-only union — the value is always
   // THE interned null instance, comparisons are tag tests, JSON serializes
@@ -1138,9 +1238,9 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     // A dyn ELEMENT makes the WHOLE array the checked-dynamic value:
     // `unknown[]`, `object[]`, and the collapsed `(string | object)[]`
     // (the plugins-slot shape) — the checked-dynamic tree has real arrays, so length/
-    // index/push/iteration ride the keyed-dyn paths, while a dyn-element
-    // STATIC array has no backend representation (ScrArr has no dyn
-    // element kind). This is dynFallbackType's JS stance promoted into
+    // index/push/iteration ride the keyed-dyn paths. Native dyn-element
+    // vectors are reserved for collection seeds and drains, rather than
+    // changing this public representation. This is dynFallbackType's JS stance promoted into
     // the mapping itself; construction sites build dynArrLit (the checked-dynamic tree
     // array literal) and typed sources convert per element at the slot.
     if (elem.kind === "dyn") return DYN;
@@ -1392,8 +1492,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     checker.declarationsOf(psym).some(
       (d) => ts.isInterfaceDeclaration(d) && ctx.isStdlibFile(d.getSourceFile()),
     );
-  // The builtin Error classes: references to the LIB's Error/TypeError/
-  // RangeError/SyntaxError interfaces map to the runtime-provided class
+  // The builtin Error classes: references to the lib's Error interfaces map to the runtime-provided class
   // hierarchy (provenance, not the name — a user's own `class Error`
   // resolved through the class-instance branch above, and a user
   // `interface Error` maps as a record). The '%'-prefixed IR names are the
@@ -1505,6 +1604,19 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     )
   ) {
     return F64;
+  }
+  // WHATWG codec instances have ordinary reference identity and ownership.
+  // Their private encoding slot is omitted from enumeration and JSON.
+  if (
+    (psym?.name === "TextEncoder" || psym?.name === "TextDecoder") &&
+    checker.declarationsOf(psym).some((d) =>
+      (ts.isInterfaceDeclaration(d) || ts.isClassDeclaration(d)) && ctx.isStdlibFile(d.getSourceFile()),
+    )
+  ) {
+    return {
+      kind: "record",
+      shapeId: ctx.shapes.intern([{ name: `%${psym.name}`, type: F64 }], false, undefined, []),
+    };
   }
   // string_decoder.StringDecoder: the decoder value is a two-field record
   // — the CANONICAL encoding name (construction normalizes aliases; the
@@ -1660,22 +1772,24 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   if (isStdlibInterface("Map") || isStdlibInterface("ReadonlyMap")) {
     const args = checker.getTypeArguments(widened as ts.TypeReference);
     if (args.length !== 2) return null;
-    const key = mapType(args[0]!, ctx);
-    if (!key || !isSupportedMapKey(key)) return null;
-    const value = mapType(args[1]!, ctx);
+    const key = !ctx.dynamic && (args[0]!.flags & ts.TypeFlags.Any) !== 0 ? DYN : mapType(args[0]!, ctx);
+    if (!key || !isSupportedMapKey(key, key.kind === "union" ? ctx.unions.get(key.unionId)?.arms : undefined)) return null;
+    const value = !ctx.dynamic && (args[1]!.flags & ts.TypeFlags.Any) !== 0 ? DYN : mapType(args[1]!, ctx);
     if (!value || !isSupportedMapValue(value)) return null;
     return mapOf(key, value);
   }
-  // Set<T>: Map's sibling — same provenance rule, elements fenced to Map's
-  // KEY kinds (f64/string, SameValueZero). Anything else stays unmapped;
+  // Set<T>: Map's sibling — same provenance rule and key domain.
+  // Anything else stays unmapped;
   // the `new Set` lowering names the offending element type specifically.
   if (isStdlibInterface("Set") || isStdlibInterface("ReadonlySet")) {
     const args = checker.getTypeArguments(widened as ts.TypeReference);
     if (args.length !== 1) return null;
-    const elem = mapType(args[0]!, ctx);
-    if (!elem || !isSupportedSetElem(elem)) return null;
+    const elem = !ctx.dynamic && (args[0]!.flags & ts.TypeFlags.Any) !== 0 ? DYN : mapType(args[0]!, ctx);
+    if (!elem || !isSupportedSetElem(elem, elem.kind === "union" ? ctx.unions.get(elem.unionId)?.arms : undefined)) return null;
     return setOf(elem);
   }
+  const collectionView = mapCollectionView(widened, ctx);
+  if (collectionView) return collectionView;
   // Date: a TimeClip'd epoch-millisecond scalar in the static runtime.
   // This supports stored/passed values and the read-only getter slice;
   // identity and mutation stay fenced because the scalar deliberately
@@ -2588,10 +2702,11 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
         ts.isParameter(decl) &&
         (decl.questionToken !== undefined || decl.initializer !== undefined);
       let pt = mapType(checker.getTypeOfSymbol(p), ctx);
+      if (pt) pt = jsOpenObjectType(decl, pt, ctx.shapes, ctx.unions);
       // Belt and braces for non-strict type worlds: an optional param's
       // ABI slot is always the undefined-armed union (strictNullChecks
       // already spells it that way; arm it here if the world didn't).
-      if (optional && pt && pt.kind !== "void" && pt.kind !== "jsval") {
+      if (optional && pt && pt.kind !== "void" && pt.kind !== "jsval" && pt.kind !== "dyn") {
         const armed = withUndefinedArm(pt, ctx.unions);
         if (!armed) return null;
         pt = armed;
@@ -2699,7 +2814,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // literal unions like `"a" | "b"` — parts that map to the SAME IR type
   // collapse (deduplicated by typeKey), so a single surviving arm is just
   // that type. Two or more distinct arms become a TAGGED union: the
-  // typeKey-sorted arm list is interned (its identity), and an arm's index
+  // typeKey-sorted arm list and discriminator are interned, and an arm's index
   // in that list is its runtime tag. `undefined` and `null` PARTS become
   // the unit arms undefinedT/nullT — strictNullChecks spells optionality
   // as exactly these unions (`string | undefined`, `number | null`), and
@@ -2722,7 +2837,11 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     const sensitivityAtEntry = contextResolutions;
     try {
       const byKey = new Map<string, IrType>();
+      const recordParts: { source: ts.Type; mapped: IrType & { kind: "record" } }[] = [];
       for (const part of ts.constituentTypes(widened)) {
+        // TypeScript's client can retain impossible intersections in a
+        // distributed union. They have no inhabitants and no runtime tag.
+        if (checker.isNeverType(part)) continue;
         // A `void` PART is inhabited only by undefined (`Promise<void> |
         // void` return types, `string | void`): it becomes the undefinedT
         // unit arm, exactly like an undefined part — the value either
@@ -2756,8 +2875,10 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
           return null;
         }
         byKey.set(typeKey(mapped), mapped);
+        if (mapped.kind === "record") recordParts.push({ source: part, mapped });
       }
       const arms = [...byKey.values()];
+      if (arms.length === 0) return F64; // same unreachable placeholder as standalone never
       // A single surviving UNIT arm cannot stand alone (degenerate — the
       // checker collapsed everything else away); anything else single is
       // just that type. A single arm UNDER A MINTED PLACEHOLDER cannot
@@ -2800,31 +2921,14 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
         arms.some(
           (a) =>
             a.kind === "void" || a.kind === "union" ||
-            // Map/Set arms stay out (like func against data arms: no
-            // narrowing test — no discriminant fields on them). REGEX
-            // arms map: `x instanceof RegExp` is their narrowing test
-            // (the skip-utility `string | RegExp` shape), and the arm
-            // rides the ref machinery like array regex elements.
-            a.kind === "map" || a.kind === "set" || a.kind === "date" || a.kind === "dyn" ||
-            // Generator arms follow the map/set rule: no narrowing test.
-            a.kind === "generator" ||
-            // Func arms map beside ANY sibling: `typeof x === "function"`
-            // is the narrowing against data arms (typeofAnswer knows every
-            // arm kind), unit TAG tests cover the nullable-callback shape
-            // (cb !== null, cb ?? f, cb?.()), and against FUNC siblings
-            // (`StringConstructor | NumberConstructor` — the option-table
-            // field) closures compare by pointer identity per tag
-            // (unionEq), so `x === String` narrows. No restriction left.
-            // Promise arms follow the func rule (typeof gives no test
-            // against sibling data arms): only the promise-or-absent shape
-            // maps — `Promise<T> | undefined`, and `Promise<T> | void`
-            // return types whose void part became the undefined arm above.
-            (a.kind === "promise" && !arms.every((b) => b === a || isUnitType(b))),
-        )
+            a.kind === "date" || a.kind === "dyn" ||
+            a.kind === "generator",
+        ) || !unionContainerArmsOk(arms)
       ) {
         return null;
       }
       arms.sort((a, b) => (typeKey(a) < typeKey(b) ? -1 : 1));
+      const discriminant = unionDiscriminant(recordParts, arms, ctx);
       if (unions.recursivePending(widened)) {
         // The knot closed through this union. A frame that resolved
         // through context-sensitive hooks (generic type parameters, mixin
@@ -2832,14 +2936,146 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
         // same ts.Type answers differently per instantiation — so
         // recursive generic-open unions stay fenced.
         if (contextResolutions !== sensitivityAtEntry) return null;
-        return { kind: "union", unionId: unions.finalizeRecursive(widened, arms) };
+        return { kind: "union", unionId: unions.finalizeRecursive(widened, arms, discriminant) };
       }
-      return { kind: "union", unionId: unions.intern(arms) };
+      return { kind: "union", unionId: unions.intern(arms, discriminant) };
     } finally {
       unions.inProgress.delete(widened);
     }
   }
   return null;
+}
+
+/** Retain a literal discriminator before widening erases its values. A
+ * structural match alone is insufficient: `{ kind: "loop", body: ... }`
+ * also fits a smaller `{ kind: "empty" }` record. Choosing that layout
+ * makes a later switch on kind read fields outside the allocated object.
+ *
+ * Require one common, required data property with finite literal values.
+ * Values may repeat within a single storage arm (several variants share a
+ * shape), but never select different arms. Non-record arms keep their
+ * ordinary kind checks. Types without an unambiguous discriminator retain
+ * their structural boundary behavior. */
+function unionDiscriminant(
+  parts: { source: ts.Type; mapped: IrType & { kind: "record" } }[],
+  arms: IrType[],
+  ctx: TypeMapperCtx,
+): IrUnionDiscriminant | undefined {
+  if (arms.filter((arm) => arm.kind === "record").length < 2 || parts.length < 2) return undefined;
+  const { checker } = ctx;
+  const literals = (type: ts.Type): (string | number | boolean)[] | null => {
+    const values: (string | number | boolean)[] = [];
+    for (const part of type.isUnionType() ? ts.constituentTypes(type) : [type]) {
+      if (part.flags & ts.TypeFlags.StringLiteral) values.push((part as ts.StringLiteralType).value);
+      else if (part.flags & ts.TypeFlags.NumberLiteral) {
+        const value = (part as ts.NumberLiteralType).value;
+        if (!Number.isFinite(value)) return null;
+        values.push(value);
+      }
+      else if (part.flags & ts.TypeFlags.BooleanLiteral) values.push((part as ts.BooleanLiteralType).value);
+      else return null;
+    }
+    return values.length ? values : null;
+  };
+  for (const candidate of checker.getPropertiesOfType(parts[0]!.source)) {
+    if (candidate.name.startsWith("__@")) continue;
+    const byTag = new Map<number, (string | number | boolean)[]>();
+    const owner = new Map<string, number>();
+    let complete = true;
+    for (const part of parts) {
+      const prop = checker.getPropertyOfType(part.source, candidate.name);
+      if (!prop || prop.flags & (ts.SymbolFlags.Optional | ts.SymbolFlags.GetAccessor | ts.SymbolFlags.SetAccessor)) {
+        complete = false;
+        break;
+      }
+      const values = literals(checker.getTypeOfSymbol(prop));
+      if (!values) { complete = false; break; }
+      const tag = arms.findIndex((arm) => typeEquals(arm, part.mapped));
+      const grouped = byTag.get(tag) ?? [];
+      for (const value of values) {
+        const key = JSON.stringify(value);
+        const previous = owner.get(key);
+        if (previous !== undefined && previous !== tag) { complete = false; break; }
+        owner.set(key, tag);
+        if (!grouped.includes(value)) grouped.push(value);
+      }
+      if (!complete) break;
+      byTag.set(tag, grouped);
+    }
+    if (complete) {
+      return {
+        field: candidate.name,
+        cases: [...byTag].sort(([a], [b]) => a - b).map(([tag, values]) => ({
+          tag, values: values.sort((a, b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : JSON.stringify(a) > JSON.stringify(b) ? 1 : 0),
+        })),
+      };
+    }
+  }
+  return undefined;
+}
+
+/** Interface views of native collections may inherit their runtime surface
+ * and refine `has` into a type predicate. Keep declaration provenance and
+ * require the same call ABI; extra fields or replacement methods need a
+ * different representation. Value construction/coercion still has to prove
+ * a native Map/Set, so structural mocks cannot acquire a native handle. */
+function mapCollectionView(type: ts.Type, ctx: TypeMapperCtx, seen = new Set<ts.Type>()): IrType | null {
+  if (!type.isTypeReference()) return null;
+  const { checker } = ctx;
+  const symbol = type.getSymbol();
+  const declarations = symbol ? checker.declarationsOf(symbol) : [];
+  if (declarations.length === 0 || !declarations.every(
+    (decl) => ts.isInterfaceDeclaration(decl) && !ctx.isStdlibFile(decl.getSourceFile()),
+  )) return null;
+  const target = type.getTarget();
+  if (!target.isClassOrInterface() || seen.has(target) || seen.size >= MAP_TYPE_MAX_DEPTH) return null;
+  const bases = checker.getBaseTypes(target);
+  if (bases.length !== 1) return null;
+  if (checker.getCallSignatures(type).length || checker.getConstructSignatures(type).length ||
+      checker.getIndexInfosOfType(type).length) return null;
+
+  // Base declarations contain the interface's parameters, even when this
+  // reference is instantiated. Resolve those through this reference before
+  // mapping the base; never cache a template under one instantiation's ABI.
+  const params = checker.getTypeArguments(target);
+  const args = checker.getTypeArguments(type);
+  const baseCtx: TypeMapperCtx = {
+    ...ctx,
+    canMemoizeType: () => false,
+    resolveTypeParam: (param) => {
+      const index = params.indexOf(param);
+      const arg = index >= 0 ? args[index] : undefined;
+      return arg && arg !== param ? mapType(arg, ctx) : ctx.resolveTypeParam?.(param) ?? null;
+    },
+    resolveTypeParamTs: (param) => {
+      const index = params.indexOf(param);
+      const arg = index >= 0 ? args[index] : undefined;
+      return arg && arg !== param ? ctx.resolveTypeParamTs?.(arg) ?? arg : ctx.resolveTypeParamTs?.(param) ?? null;
+    },
+  };
+  seen.add(target);
+  try {
+    const base = bases[0]!;
+    const baseSymbol = base.getSymbol();
+    const native = baseSymbol && ["Map", "ReadonlyMap", "Set", "ReadonlySet"].includes(baseSymbol.name) &&
+      checker.declarationsOf(baseSymbol).some(
+        (decl) => ts.isInterfaceDeclaration(decl) && ctx.isStdlibFile(decl.getSourceFile()),
+      );
+    const mapped = native ? mapType(base, baseCtx) : mapCollectionView(base, baseCtx, seen);
+    if (mapped?.kind !== "map" && mapped?.kind !== "set") return null;
+    const hasType = funcOf([mapped.kind === "map" ? mapped.key : mapped.elem], BOOL);
+    for (const property of checker.getPropertiesOfType(type)) {
+      const own = checker.declarationsOf(property).filter((decl) => !ctx.isStdlibFile(decl.getSourceFile()));
+      if (own.length === 0) continue;
+      if (property.name !== "has" || (property.flags & ts.SymbolFlags.Optional) ||
+          !own.every((decl) => decl.kind === ts.SyntaxKind.MethodSignature)) return null;
+      const method = mapType(checker.getTypeOfSymbol(property), ctx);
+      if (!method || !typeEquals(method, hasType)) return null;
+    }
+    return mapped;
+  } finally {
+    seen.delete(target);
+  }
 }
 
 /** The narrowed-type-parameter recognizer behind mapType's early return:
@@ -3111,8 +3347,8 @@ export function unitOnlyUnion(unions: UnionRegistry): IrType {
  * answers undefined). ONE shape per channel pair — `g.next()`'s lowering,
  * `.return()`, `.throw()`, the for-of desugar, and mapType's
  * IteratorResult alias mapping all intern through here, so reads agree.
- * Null when the combined union would be illegal (a func/set arm beside
- * data arms, a map/regex/Date arm — kinds with no narrowing test): such
+ * Null when the combined union would be illegal (a container arm beside
+ * data arms, a regex/Date arm — kinds with no narrowing test here): such
  * generators stay unmapped. */
 export function genResultRecord(
   yieldT: IrType,
@@ -3132,7 +3368,7 @@ export function genResultRecord(
         return true;
       }
       if (
-        t.kind === "map" || t.kind === "regex" || t.kind === "date" ||
+        t.kind === "regex" || t.kind === "date" ||
         t.kind === "jsval" || t.kind === "generator"
       ) {
         return false; // no legal union arm exists for these kinds
@@ -3143,11 +3379,11 @@ export function genResultRecord(
     if (!add(yieldT) || !add(retT)) return null;
     byKey.set(typeKey(UNDEFINED_T), UNDEFINED_T);
     const arms = [...byKey.values()];
-    // func/set arms are legal only beside unit arms (no narrowing test
-    // against data siblings — the union rule).
+    // Containers keep the shared nullable-only rule. Generator function
+    // payloads retain their existing unit-only boundary too.
     if (
-      arms.some(
-        (a) => (a.kind === "func" || a.kind === "set") && !arms.every((b) => b === a || isUnitType(b)),
+      !unionContainerArmsOk(arms) || arms.some(
+        (a) => a.kind === "func" && !arms.every((b) => b === a || isUnitType(b)),
       )
     ) {
       return null;
@@ -3183,8 +3419,8 @@ export function isUnitOnlyTsType(t: ts.Type): boolean {
 }
 
 /** IR-level `t | undefined`, canonicalized and fenced exactly like the
- * ts-union branch of mapType (typeKey-sorted arms, deduplicated; map/
- * regex/Date/dyn/void arms unrepresentable; a func arm IS representable — the
+ * ts-union branch of mapType (typeKey-sorted arms, deduplicated;
+ * Date/dyn/void arms unrepresentable; a func arm IS representable — the
  * result is exactly the nullable-callback shape mapType's union branch
  * admits, `(() => void) | undefined`) so the interned union is IDENTICAL
  * to what mapping the checker's own `T | undefined` produces. */
@@ -3199,7 +3435,7 @@ export function withUndefinedArm(t: IrType, unions: UnionRegistry): IrType | nul
     return { kind: "union", unionId: unions.intern(arms) };
   }
   if (
-    t.kind === "void" || t.kind === "map" || t.kind === "date" || t.kind === "dyn" ||
+    t.kind === "void" || t.kind === "date" || t.kind === "dyn" ||
     // A bare unit field type cannot occur (units live only inside unions),
     // but guard against constructing a single-arm union from one.
     isUnitType(t)
@@ -3813,15 +4049,15 @@ function armHasUnionHome(arm: IrType, siblingCount: number): boolean {
   switch (arm.kind) {
     case "void":
     case "union":
-    case "map":
-    case "set":
     case "regex":
     case "date":
     case "generator":
     case "dyn":
       return false;
-    // Promise arms map only beside unit siblings (the promise-or-absent
-    // shape); a data sibling has no narrowing test against them.
+    // Containers map only beside unit siblings; data siblings have no
+    // supported runtime narrowing test against them.
+    case "map":
+    case "set":
     case "promise":
       return siblingCount === 0;
     default:
@@ -3860,14 +4096,14 @@ export function describeComponentBlocker(widened: ts.Type, ctx: TypeMapperCtx): 
       if (!mapped) {
         return `the ${container} shape is supported, but its ${role} type '${text(arg)}' does not compile`;
       }
-      if ((container === "Map" || container === "ReadonlyMap") && i === 0 && !isSupportedMapKey(mapped)) {
-        return `the ${container} shape is supported, but keys are limited to numbers and strings — '${text(arg)}' is outside that domain`;
+      if ((container === "Map" || container === "ReadonlyMap") && i === 0 && !isSupportedMapKey(mapped, mapped.kind === "union" ? ctx.unions.get(mapped.unionId)?.arms : undefined)) {
+        return `the ${container} shape is supported, but '${text(arg)}' is outside its supported key domain (numbers, strings, identity references, or unions of identity references)`;
       }
       if ((container === "Map" || container === "ReadonlyMap") && i === 1 && !isSupportedMapValue(mapped)) {
         return `the ${container} shape is supported, but '${text(arg)}' values have no Map slot yet (functions, promises, and nested Maps stay out)`;
       }
-      if ((container === "Set" || container === "ReadonlySet") && !isSupportedSetElem(mapped)) {
-        return `the ${container} shape is supported, but elements are limited to numbers and strings — '${text(arg)}' is outside that domain`;
+      if ((container === "Set" || container === "ReadonlySet") && !isSupportedSetElem(mapped, mapped.kind === "union" ? ctx.unions.get(mapped.unionId)?.arms : undefined)) {
+        return `the ${container} shape is supported, but '${text(arg)}' is outside its supported element domain (numbers, strings, identity references, or unions of identity references)`;
       }
     }
     // Every argument passed the per-slot checks and the type still failed:

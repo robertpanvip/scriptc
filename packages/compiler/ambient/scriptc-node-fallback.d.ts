@@ -110,6 +110,42 @@ declare const console: {
   trace(...data: unknown[]): void;
 };
 
+// node:console exports the global instance's bound methods. The constructor
+// and remaining methods are declared so unsupported uses reach named fences.
+type ScriptcConsoleMethods = typeof console;
+declare module "node:console" {
+  export class Console {
+    constructor(stdout: unknown, stderr?: unknown, ignoreErrors?: boolean);
+  }
+  export interface Console extends ScriptcConsoleMethods {}
+  export const log: ScriptcConsoleMethods["log"];
+  export const info: ScriptcConsoleMethods["info"];
+  export const debug: ScriptcConsoleMethods["debug"];
+  export const error: ScriptcConsoleMethods["error"];
+  export const warn: ScriptcConsoleMethods["warn"];
+  export const assert: ScriptcConsoleMethods["assert"];
+  export const clear: ScriptcConsoleMethods["clear"];
+  export const count: ScriptcConsoleMethods["count"];
+  export const countReset: ScriptcConsoleMethods["countReset"];
+  export const dir: ScriptcConsoleMethods["dir"];
+  export const dirxml: ScriptcConsoleMethods["dirxml"];
+  export const group: ScriptcConsoleMethods["group"];
+  export const groupCollapsed: ScriptcConsoleMethods["groupCollapsed"];
+  export const groupEnd: ScriptcConsoleMethods["groupEnd"];
+  export const table: ScriptcConsoleMethods["table"];
+  export const time: ScriptcConsoleMethods["time"];
+  export const timeEnd: ScriptcConsoleMethods["timeEnd"];
+  export const timeLog: ScriptcConsoleMethods["timeLog"];
+  export const timeStamp: ScriptcConsoleMethods["timeStamp"];
+  export const trace: ScriptcConsoleMethods["trace"];
+  const defaultConsole: ScriptcConsoleMethods & { Console: typeof Console };
+  export default defaultConsole;
+}
+declare module "console" {
+  export * from "node:console";
+  export { default } from "node:console";
+}
+
 /* The process global (Node-like, deliberately tiny). Every member lowers to
  * a `libCall` and is implemented in the runtime's scr_lib.c. `argv` is one
  * interned array (identity and mutation semantics match Node's stable
@@ -532,19 +568,10 @@ interface BufferConstructor {
 }
 declare var Buffer: BufferConstructor;
 
-/* The WHATWG encoders (Node globals). The COMPOSED forms lower —
- * `new TextEncoder().encode(s)` and `new TextDecoder().decode(bytes)` —
- * as do same-scope const store-then-call forms. Recognized literal WHATWG
- * labels compile statically; runtime-valued/unknown labels and the
- * fatal/ignoreBOM options fence at the use site). */
-interface TextEncoder {
-  encode(input?: string): Uint8Array;
-}
+/* The WHATWG codec constructors. Instance types live in scriptc.d.ts so
+ * programs with @types/node have the same global type names. */
 declare var TextEncoder: { new (): TextEncoder };
-interface TextDecoder {
-  decode(input?: ArrayBufferView | ArrayBuffer): string;
-}
-declare var TextDecoder: { new (label?: string): TextDecoder };
+declare var TextDecoder: { new (label?: string, options?: { fatal?: boolean; ignoreBOM?: boolean }): TextDecoder };
 
 /* The WHATWG event surface (Node globals since v15): declared so the
  * suite's event-plumbing tests typecheck and fence per SITE with the
@@ -1780,6 +1807,10 @@ declare module "node:child_process" {
  * the latter resolves the callback's data argument. Other targets and bare
  * promisify values fence per site. */
 declare module "util" {
+  export type TextEncoder = globalThis.TextEncoder;
+  export type TextDecoder = globalThis.TextDecoder;
+  export var TextEncoder: typeof globalThis.TextEncoder;
+  export var TextDecoder: typeof globalThis.TextDecoder;
   export function promisify(
     fn: typeof import("node:fs").readFile,
   ): (path: string, encoding: "utf8" | "utf-8") => Promise<string>;

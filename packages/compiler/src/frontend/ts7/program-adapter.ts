@@ -18,7 +18,7 @@ import { InternalCompilerError } from "../../errors.js";
 
 import { writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { API } from "typescript/unstable/sync";
+import { Ts7Api } from "./rpc-api.js";
 import type {
   CompilerOptions,
   Diagnostic,
@@ -92,50 +92,13 @@ function stripSourceBom(text: string): string {
 
 let nextConfigId = 0;
 
-type Ts7TransportDecoder = {
-  readonly ignoreBOM?: boolean;
-  decode(input?: Uint8Array, options?: { stream?: boolean }): string;
-};
-
-const bomPreservingDecoderPrototypes = new WeakSet<object>();
-
-/** TypeScript 7.0.2's Wtf8Decoder inherits TextDecoder's default BOM
- * handling, so decoding an individual AST/checker string-table cell strips
- * one leading U+FEFF. Patch that decoder class once after the first project
- * exposes an instance: delegate to its WTF-8-aware implementation, then
- * restore the one BOM TextDecoder consumed. */
-function preserveTransportBoms(project: Project): void {
-  const decoder = (project.program as unknown as { decoder?: Ts7TransportDecoder }).decoder;
-  if (decoder === undefined) {
-    throw new InternalCompilerError("ts7 createProgram: program decoder is unavailable");
-  }
-  const prototype = Object.getPrototypeOf(decoder) as Ts7TransportDecoder | null;
-  if (prototype === null || typeof prototype.decode !== "function") {
-    throw new InternalCompilerError("ts7 createProgram: program decoder prototype is unavailable");
-  }
-  if (bomPreservingDecoderPrototypes.has(prototype)) return;
-  const decode = prototype.decode;
-  prototype.decode = function (input, options): string {
-    const text = decode.call(this, input, options);
-    return this.ignoreBOM !== true &&
-      input !== undefined &&
-      input.length >= 3 &&
-      input[0] === 0xef &&
-      input[1] === 0xbb &&
-      input[2] === 0xbf
-      ? "\uFEFF" + text
-      : text;
-  };
-  bomPreservingDecoderPrototypes.add(prototype);
-}
-
 /** One spawned tsgo server plus the virtual-FS overlay serving synthesized
  * tsconfigs. Share a host across programs to pay the spawn once; the overlay
  * is a live map, so each createProgram call adds its config before taking
  * the snapshot. */
 export class Ts7Host {
   private readonly virtualFiles = new Map<string, string>();
-  private readonly api: API;
+  private readonly api: Ts7Api;
   private closed = false;
 
   constructor(options?: {
@@ -153,7 +116,7 @@ export class Ts7Host {
   }) {
     const virtualFiles = this.virtualFiles;
     const shadow = options?.fsShadow ?? null;
-    this.api = new API({
+    this.api = new Ts7Api({
       cwd: options?.cwd ?? process.cwd(),
       ...(options?.collectTiming !== undefined ? { collectTiming: options.collectTiming } : {}),
       fs: {
@@ -217,7 +180,6 @@ export class Ts7Host {
       snapshot.dispose();
       throw new InternalCompilerError(`ts7 createProgram: project failed to open for ${first}`);
     }
-    preserveTransportBoms(project);
     return new Ts7Program(project, snapshot, this, !programOwnsHost);
   }
 

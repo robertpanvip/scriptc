@@ -1392,6 +1392,9 @@ const ASSERT_MODULE_HINTS: Record<string, string | undefined> = {
 };
 
 export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | undefined> | undefined> = {
+  console: {
+    Console: "custom Console instances are not supported yet; direct node:console log/info/debug/error/warn calls use the process output streams",
+  },
   assert: ASSERT_MODULE_HINTS,
   // The strict module's equal/notEqual/deepEqual/notDeepEqual ARE the
   // strict comparisons (aliased in the spoke) — only the members with no
@@ -1417,7 +1420,7 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
   },
   module: {
     createRequire:
-      "the lowered shape is a const binding over createRequire(import.meta.url) (or __filename) " +
+      "the lowered shape is a const binding (or a proven stable top-level let/var) over createRequire(import.meta.url) (or __filename) " +
       "whose require calls take STATIC string literals — builtins, project modules (including #imports), " +
       "relative .json documents, --npm-static packages, and installed npm packages under --dynamic resolve at build time; " +
       "dynamic specifiers cannot exist in a compiled binary's fixed module graph",
@@ -1594,14 +1597,12 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
         "everything else through the static util.inspect)";
     } else if (container === "TextEncoder") {
       hint =
-        "the inline new TextEncoder().encode(s) form and same-scope const store-then-call " +
-        "(const encoder = new TextEncoder(); encoder.encode(s)) compile; captured/imported " +
-        "instances and other members need a runtime object representation";
+        "TextEncoder instances can be stored, passed, and captured; encode(string) and encode() compile, " +
+        "while encodeInto and other members have no static lowering";
     } else if (container === "TextDecoder") {
       hint =
-        "the inline new TextDecoder(<literal label>).decode(bytes) form and same-scope const store-then-call " +
-        "(const decoder = new TextDecoder(<literal label>); decoder.decode(bytes)) compile; captured/imported " +
-        "instances, streaming state, and other members need a runtime object representation";
+        "TextDecoder instances with recognized literal WHATWG labels and default options can be stored, passed, and captured; " +
+        "decode(Uint8Array/Buffer) and decode() compile; streaming, constructor options, and other members have no static lowering";
     } else if (member === "prototype") {
       hint =
         "prototype objects are not values here (method lookup is static) — call the method on an instance instead";

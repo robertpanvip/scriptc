@@ -1,3 +1,4 @@
+import { f64Lit } from "./common.js";
 import { InternalCompilerError } from "../../errors.js";
 /* The dyn (ScrDyn dyn) helper EMITTERS for the LLVM backend — the .ll
  * mirror of walkers.ts's dyn slice: per-type match predicates
@@ -23,7 +24,7 @@ import { InternalCompilerError } from "../../errors.js";
  *               FUNC=8 HANDLE=9.
  *   ScrBytes { rc +0; len +8; elem +16; data +24 }.
  *   ScrDynPath { parent, key, index } — the %ScrDynPath type. */
-import type { IrType } from "../../ir/ir.js";
+import type { IrType, IrUnionDef } from "../../ir/ir.js";
 import { DYN_HANDLE_KINDS, isDynTypedRefType, isRefCounted, typeKey } from "../../ir/ir.js";
 import { dynDesc, undefinedArmTag } from "../../ir/analysis.js";
 import { mangleRecordNew, mangleRecordStruct } from "../mangle.js";
@@ -69,13 +70,6 @@ export interface DynHost extends WalkerHost {
   liveDynRefAdapter(t: IrType): { snapshot: string; commit: string };
 }
 
-/** Exact double literal (the emitter's f64Lit — the walkers' copy). */
-function f64Lit(n: number): string {
-  const buf = new ArrayBuffer(8);
-  new DataView(buf).setFloat64(0, n);
-  return `0x${[...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
-}
-
 const FN_ATTRS = "#0";
 
 export class LlDyn {
@@ -92,6 +86,32 @@ export class LlDyn {
   readonly defs: string[] = [];
 
   constructor(private readonly host: DynHost) {}
+
+  /** Branch to a variant only after its literal discriminator and complete
+   * structure match. Use the same path for predicates and builders. */
+  private unionArmMatch(B: BlockBuilder, def: IrUnionDef, tag: number, yes: string, no: string): void {
+    const guard = def.discriminant?.cases.find((candidate) => candidate.tag === tag);
+    if (guard && def.discriminant) {
+      const structure = B.newLabel("du.shape");
+      const field = this.host.internLiteral(def.discriminant.field);
+      guard.values.forEach((value, index) => {
+        const suffix = typeof value === "string" ? "str" : typeof value === "boolean" ? "bool" : "num";
+        const ty = typeof value === "string" ? "ptr" : typeof value === "boolean" ? "i1" : "double";
+        const operand = typeof value === "string" ? this.host.internLiteral(value)
+          : typeof value === "boolean" ? String(value) : f64Lit(value);
+        this.host.declare(`declare zeroext i1 @scr_dyn_field_eq_${suffix}(ptr, ptr, ${ty}${ty === "i1" ? " zeroext" : ""})`);
+        const matches = B.tmp();
+        B.line(`${matches} = call zeroext i1 @scr_dyn_field_eq_${suffix}(ptr %d, ptr ${field}, ${ty} ${operand})`);
+        const next = index === guard.values.length - 1 ? no : B.newLabel("du.literal");
+        B.condBr(matches, structure, next);
+        if (index !== guard.values.length - 1) B.startBlock(next);
+      });
+      B.startBlock(structure);
+    }
+    const matches = B.tmp();
+    B.line(`${matches} = call zeroext i1 @${this.dynMatchHelper(def.arms[tag]!)}(ptr %d)`);
+    B.condBr(matches, yes, no);
+  }
 
   private get S(): "i32" | "i64" { return this.host.sizeType; }
   private abiOffset(native64: number, wasm32: number): number {
@@ -525,11 +545,9 @@ export class LlDyn {
         if (!def) throw new InternalCompilerError(`llvm emitter bug: dynCheck of unknown union ${t.unionId}`);
         // Arms in canonical order; any full match answers true.
         const yes = B.newLabel("dm.y");
-        for (const arm of def.arms) {
-          const ok = B.tmp();
-          B.line(`${ok} = call zeroext i1 @${this.dynMatchHelper(arm)}(ptr %d)`);
+        for (let tag = 0; tag < def.arms.length; tag++) {
           const ln = B.newLabel("dm.n");
-          B.condBr(ok, yes, ln);
+          this.unionArmMatch(B, def, tag, yes, ln);
           B.startBlock(ln);
         }
         B.terminate(`ret i1 false`);
@@ -1047,12 +1065,9 @@ export class LlDyn {
         // Arms in CANONICAL order, first FULL match wins. The matched
         // arm's builder can no longer fail.
         def.arms.forEach((arm, i) => {
-          const m = this.dynMatchHelper(arm);
-          const hit = B.tmp();
-          B.line(`${hit} = call zeroext i1 @${m}(ptr %d)`);
           const lHit = B.newLabel("dcu.h");
           const lNext = B.newLabel("dcu.n");
-          B.condBr(hit, lHit, lNext);
+          this.unionArmMatch(B, def, i, lHit, lNext);
           B.startBlock(lHit);
           if (arm.kind === "undefinedT" || arm.kind === "nullT") {
             // A matched unit arm builds nothing: THE interned immortal
@@ -1130,13 +1145,14 @@ export class LlDyn {
         const lCache = B.newLabel("dcu.put");
         B.condBr(hasCached, lRefresh, lCache);
         B.startBlock(lRefresh);
-        ([
+        const fields: [number, string, string][] = [
           [1, "i32", "tag"],
           [2, "ptr", "retain"],
           [3, "ptr", "release"],
           [4, "ptr", "trace"],
           [5, "i64", "slot"],
-        ] as const).forEach(([index, fieldType, fieldName]) => {
+        ];
+        fields.forEach(([index, fieldType, fieldName]) => {
           const cachedPtr = B.tmp();
           const checkedPtr = B.tmp();
           const oldValue = B.tmp();
@@ -1740,9 +1756,9 @@ export class LlDyn {
       for (const k of [DYN_KIND.NULL, DYN_KIND.BOOL, DYN_KIND.NUM, DYN_KIND.STR, DYN_KIND.ARR, DYN_KIND.OBJ, DYN_KIND.UNDEF, DYN_KIND.BYTES, DYN_KIND.FUNC, DYN_KIND.HANDLE, DYN_KIND.PROMISE, DYN_KIND.JSVAL, DYN_KIND.TYPED_REF]) {
         labels.set(k, B.newLabel(`ds.k${k}`));
       }
-      B.terminate(
-        `switch i32 ${kd}, label %${done} [ ${[...labels].map(([k, l]) => `i32 ${k}, label %${l}`).join(" ")} ]`,
-      );
+      const branches: string[] = [];
+      for (const [kind, label] of labels) branches.push(`i32 ${kind}, label %${label}`);
+      B.terminate(`switch i32 ${kd}, label %${done} [ ${branches.join(" ")} ]`);
       B.startBlock(labels.get(DYN_KIND.JSVAL)!);
       {
         // Island-held: the engine's own ToString (a bridged failure
@@ -2256,7 +2272,7 @@ export class LlDyn {
       B.terminate(`ret ptr ${r}`);
       B.startBlock(lNext);
     }
-    // OBJ: the own member (+1) or the undefined singleton.
+    // OBJ: the own member or the inherited builtin Error constructor.
     {
       const isObj = B.tmp();
       B.line(`${isObj} = icmp eq i32 ${kd}, ${DYN_KIND.OBJ}`);
@@ -2264,15 +2280,9 @@ export class LlDyn {
       const lNext = B.newLabel("kg.n");
       B.condBr(isObj, lObj, lNext);
       B.startBlock(lObj);
-      host.declare(`declare ptr @scr_dyn_obj_get(ptr, ptr, ${host.sizeType})`);
-      const m = B.tmp();
-      B.line(`${m} = call ptr @scr_dyn_obj_get(ptr %d, ptr ${kParts.data}, ${host.sizeType} ${kParts.len})`);
-      const has = B.tmp();
-      B.line(`${has} = icmp ne ptr ${m}, null`);
-      const u = this.undef(B);
-      const sel = B.tmp();
-      B.line(`${sel} = select i1 ${has}, ptr ${m}, ptr ${u}`);
-      const r = this.retainDyn(B, sel);
+      host.declare(`declare ptr @scr_dyn_obj_read(ptr, ptr, ${host.sizeType})`);
+      const r = B.tmp();
+      B.line(`${r} = call ptr @scr_dyn_obj_read(ptr %d, ptr ${kParts.data}, ${host.sizeType} ${kParts.len})`);
       B.terminate(`ret ptr ${r}`);
       B.startBlock(lNext);
     }

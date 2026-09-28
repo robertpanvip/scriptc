@@ -18,8 +18,10 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "./ir.js";
-import { arrayOf, BOOL, BYTES_U8, bytesOf, canAdaptDynFuncTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, CHILDWRITER_T, CRYPTOHASH_T, CRYPTOHMAC_T, DATE_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, ffiClassType, ffiSourceParamTypes, FILEHANDLE_T, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isDynTypedRefType, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isJsonSafeType, isJsonStringifySafeType, isRefCounted, isSupportedArrayElem, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, shapeHasAccessorSlots, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionFuncSetArmsOk, URL_T, VOID } from "./ir.js";
+import { arrayOf, BOOL, BYTES_U8, bytesOf, canAdaptDynFuncTo, canDynCheckTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, CHILDWRITER_T, CRYPTOHASH_T, CRYPTOHMAC_T, DATE_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, ffiClassType, ffiSourceParamTypes, FILEHANDLE_T, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isDynTypedRefType, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isJsonSafeType, isJsonStringifySafeType, isRefCounted, isSupportedArrayElem, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, shapeHasAccessorSlots, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionContainerArmsOk, URL_T, VOID } from "./ir.js";
 import { BIGINT_T } from "./ir.js";
+import { unionWideningTags } from "./analysis.js";
+import { alwaysReturns } from "./control-flow.js";
 
 /** Per-method signature for strIntrinsic: `argTypes` lists every argument
  * position (optional ones included); `minArgs` is how many may be omitted
@@ -107,6 +109,8 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   // checked in the libCall case, like error.new.
   "island.castFail": { argTypes: [JSVAL, STRING], result: VOID },
   "json.parse": { argTypes: [STRING], result: DYN },
+  "json.parseReviver": { argTypes: [STRING, DYN], result: DYN },
+  "json.stringifyReplacer": { argTypes: [DYN, DYN, STRING], result: DYN },
   "dyn.keySet": { argTypes: [DYN, STRING, DYN], result: VOID },
   "dyn.iterPack": { argTypes: [DYN, STRING], result: DYN },
   "dyn.arrLen": { argTypes: [DYN], result: F64 },
@@ -970,6 +974,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "zlib.deflateSync": { argTypes: [BYTES_U8], result: BYTES_U8 },
   "zlib.inflateSync": { argTypes: [BYTES_U8], result: BYTES_U8 },
   "zlib.deflateRawSync": { argTypes: [BYTES_U8], result: BYTES_U8 },
+  "zlib.deflateLevelSync": { argTypes: [BYTES_U8, F64, F64], result: BYTES_U8 },
   "zlib.inflateRawSync": { argTypes: [BYTES_U8], result: BYTES_U8 },
   "zlib.gzipSync": { argTypes: [BYTES_U8], result: BYTES_U8 },
   "zlib.gunzipSync": { argTypes: [BYTES_U8], result: BYTES_U8 },
@@ -1048,6 +1053,10 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   // error.new's result and the receiver slots are builtin-error classes —
   // program-dependent object types, checked in the libCall case.
   "error.new": { argTypes: [STRING], result: VOID },
+  "error.newOptions": { argTypes: [DYN, DYN], result: VOID },
+  "error.ctorOptions": { argTypes: [null, DYN, DYN], result: VOID },
+  "error.cause": { argTypes: [null], result: DYN },
+  "error.hasCause": { argTypes: [null], result: BOOL },
   "error.nodeThrow": { argTypes: [F64, STRING, STRING], result: VOID },
   "dyn.toStringCoerce": { argTypes: [DYN], result: STRING },
   "dyn.toNumberCoerce": { argTypes: [DYN], result: F64 },
@@ -1694,10 +1703,17 @@ export function validateModule(mod: IrModule): IrValidationError[] {
     // field count) — anything else has no honest index/JSON story.
     if (rec.tuple) {
       const names = new Set(rec.fields.map((f) => f.name));
+      let positionsComplete = true;
+      for (let i = 0; i < rec.fields.length; i++) {
+        if (!names.has(String(i))) {
+          positionsComplete = false;
+          break;
+        }
+      }
       if (
         rec.fields.length === 0 ||
         names.size !== rec.fields.length ||
-        [...Array(rec.fields.length).keys()].some((i) => !names.has(String(i)))
+        !positionsComplete
       ) {
         errors.push({ message: `record ${rec.id}: tuple fields are not "0".."${rec.fields.length - 1}"`, loc: noLoc });
       }
@@ -1720,24 +1736,57 @@ export function validateModule(mod: IrModule): IrValidationError[] {
       errors.push({ message: `duplicate union "${u.id}"`, loc: noLoc });
     }
     unionsById.set(u.id, u);
+  }
+  for (const u of mod.unions ?? []) {
     if (u.arms.length < 2) {
       errors.push({ message: `union ${u.id}: fewer than 2 arms`, loc: noLoc });
     }
+    if (u.discriminant) {
+      const { field, cases } = u.discriminant;
+      const tags = new Set<number>();
+      const values = new Set<string>();
+      for (const candidate of cases) {
+        const arm = u.arms[candidate.tag];
+        const record = arm?.kind === "record" ? recordsById.get(arm.shapeId) : undefined;
+        const member = record?.fields.find((entry) => entry.name === field);
+        if (!Number.isInteger(candidate.tag) || candidate.tag < 0 || !member || tags.has(candidate.tag)) {
+          errors.push({ message: `union ${u.id}: invalid discriminant tag ${candidate.tag}`, loc: noLoc });
+        }
+        tags.add(candidate.tag);
+        if (candidate.values.length === 0) {
+          errors.push({ message: `union ${u.id}: empty discriminant values for tag ${candidate.tag}`, loc: noLoc });
+        }
+        for (const value of candidate.values) {
+          if (value === undefined) {
+            errors.push({ message: `union ${u.id}: undefined discriminant value`, loc: noLoc });
+            continue;
+          }
+          const fieldTypes = member?.type.kind === "union"
+            ? unionsById.get(member.type.unionId)?.arms ?? [] : member ? [member.type] : [];
+          const valid = fieldTypes.some((type) => typeof value === "string" ? type.kind === "string"
+            : typeof value === "boolean" ? type.kind === "bool"
+            : typeof value === "number" && Number.isFinite(value) && type.kind === "f64");
+          const key = typeof value + ":" + String(value);
+          if (!valid || values.has(key)) {
+            errors.push({ message: `union ${u.id}: invalid or repeated discriminant value ${key}`, loc: noLoc });
+          }
+          values.add(key);
+        }
+      }
+      for (let tag = 0; tag < u.arms.length; tag++) {
+        if (u.arms[tag]!.kind === "record" && !tags.has(tag)) {
+          errors.push({ message: `union ${u.id}: missing discriminant for record arm ${tag}`, loc: noLoc });
+        }
+      }
+    }
     u.arms.forEach((arm, i) => {
       // The unit kinds (undefinedT/nullT) are valid arms — union membership
-      // is the ONLY place they may appear; void/union/map/dyn/jsval/date
-      // stay out (maps and scalar Date values have no supported union
-      // representation/discriminant to narrow on). Func/set arm
-      // sibling rules live in unionFuncSetArmsOk (shared with the frontend's
-      // union builders): a func arm allows unit and FUNC siblings (the
-      // nullable-callback shape, and the primitive-constructor tables where
-      // closure pointer identity per tag is the narrowing); a set arm is
-      // valid exactly when every other arm is a unit (the defaulted-Set-
-      // param ABI); func/set-beside-data stays out.
+      // is the ONLY place they may appear. Containers are valid beside
+      // unit arms: tag tests distinguish absence while the reference
+      // payload preserves identity. The shared rule refuses data siblings.
       if (
         arm.kind === "void" ||
         arm.kind === "union" ||
-        arm.kind === "map" ||
         arm.kind === "dyn" ||
         arm.kind === "jsval" ||
         arm.kind === "date" ||
@@ -1746,8 +1795,8 @@ export function validateModule(mod: IrModule): IrValidationError[] {
         errors.push({ message: `union ${u.id}: arm ${i} is ${arm.kind}`, loc: noLoc });
       }
       if (
-        (arm.kind === "func" || arm.kind === "set") &&
-        !unionFuncSetArmsOk(u.arms)
+        (arm.kind === "map" || arm.kind === "set" || arm.kind === "promise") &&
+        !unionContainerArmsOk(u.arms)
       ) {
         errors.push({ message: `union ${u.id}: ${arm.kind} arm ${i} beside non-unit arms`, loc: noLoc });
       }
@@ -1834,6 +1883,9 @@ export function validateModule(mod: IrModule): IrValidationError[] {
     }
   };
   for (const g of mod.globals ?? []) {
+    if (g.tdz && g.type.kind !== "record") {
+      errors.push({ message: `TDZ global "${g.name}" must have record storage`, loc: noLoc });
+    }
     if (isUnitType(g.type)) {
       errors.push({ message: `global "${g.name}" has bare unit type ${g.type.kind}`, loc: noLoc });
     }
@@ -1959,6 +2011,7 @@ function validateFunction(
   // Unit kinds live only inside unions: a bare-unit local, param, or
   // return type is frontend breakage (mapType never produces them).
   for (const l of fn.locals) {
+    if (l.tdz && !l.boxed) err(`TDZ local "${l.name}" must be boxed`, fn.loc);
     if (isUnitType(l.type)) err(`local "${l.name}" has bare unit type ${l.type.kind}`, fn.loc);
   }
   if (isUnitType(fn.returnType)) {
@@ -2356,12 +2409,12 @@ function validateFunction(
           break;
         }
         const rest = def.arms.filter((a) => !isUnitType(a));
-        if (rest.length !== 1 || rest.length === def.arms.length) {
-          err("optChain receiver must have unit arms and exactly one non-unit arm", e.loc);
+        if (rest.length === 0 || rest.length === def.arms.length) {
+          err("optChain receiver must have unit arms and at least one non-unit arm", e.loc);
           break;
         }
         if (activeChains.has(e.id)) err(`optChain id "${e.id}" shadows an active chain`, e.loc);
-        activeChains.set(e.id, rest[0]!);
+        activeChains.set(e.id, rest.length === 1 ? rest[0]! : e.receiver.type);
         checkExpr(e.body);
         activeChains.delete(e.id);
         if (e.type.kind === "void") {
@@ -2879,7 +2932,7 @@ function validateFunction(
           err(`mapNew must be map-typed, got ${e.type.kind}`, e.loc);
           break;
         }
-        if (!isSupportedMapKey(e.type.key)) {
+        if (!isSupportedMapKey(e.type.key, e.type.key.kind === "union" ? unions.get(e.type.key.unionId)?.arms : undefined)) {
           err(`mapNew key kind ${e.type.key.kind} (frontend must fence)`, e.loc);
         }
         if (!isSupportedMapValue(e.type.value)) {
@@ -2913,13 +2966,17 @@ function validateFunction(
           }
           checkExpr(e.args[0]!);
           expectType(e.args[0]!, key, "mapIntrinsic get key");
+          if (value.kind === "dyn") {
+            expectType(e, DYN, "mapIntrinsic get result");
+            break;
+          }
           const def = e.type.kind === "union" ? unions.get(e.type.unionId) : undefined;
-          const rest = def ? def.arms.filter((a) => a.kind !== "undefinedT") : [];
+          const rest = def ? def.arms.filter((a): boolean => a.kind !== "undefinedT") : [];
           // When V is itself a union its own undefined arm (if any) folds
           // into the result's — compare the non-undefined arms pairwise.
-          const varms =
+          const varms: IrType[] =
             value.kind === "union"
-              ? (unions.get(value.unionId)?.arms ?? []).filter((a) => a.kind !== "undefinedT")
+              ? (unions.get(value.unionId)?.arms ?? []).filter((a): boolean => a.kind !== "undefinedT")
               : [value];
           const ok =
             def &&
@@ -2964,7 +3021,7 @@ function validateFunction(
           err(`setNew must be set-typed, got ${e.type.kind}`, e.loc);
           break;
         }
-        if (!isSupportedSetElem(e.type.elem)) {
+        if (!isSupportedSetElem(e.type.elem, e.type.elem.kind === "union" ? unions.get(e.type.elem.unionId)?.arms : undefined)) {
           err(`setNew element kind ${e.type.elem.kind} (frontend must fence)`, e.loc);
         }
         // The seed is one T[]-typed expression (T = the element type).
@@ -3476,8 +3533,12 @@ function validateFunction(
         // and require the overflow to exist.
         const surfaces = (t: IrType): boolean =>
           typeEquals(t, e.type) ||
-          (e.type.kind === "union" &&
-            (unions.get(e.type.unionId)?.arms.some((a) => typeEquals(a, t)) ?? false)) ||
+          (e.type.kind === "union" && (() => {
+            const result = unions.get(e.type.unionId);
+            const source = t.kind === "union" ? unions.get(t.unionId) : undefined;
+            return !!result && (result.arms.some((a) => typeEquals(a, t)) ||
+              (!!source && unionWideningTags(source.arms, result.arms) !== null));
+          })()) ||
           e.type.kind === "dyn";
         if (e.overflowOnly && !shape.indexValue) {
           err(`recordKeyGet on ${e.shapeId}: overflowOnly read of a shape without an index signature`, e.loc);
@@ -3491,6 +3552,17 @@ function validateFunction(
         if (shape.indexValue && e.type.kind !== "dyn" && !surfaces(shape.indexValue)) {
           err(`recordKeyGet on ${e.shapeId}: the overflow value cannot surface as the result type`, e.loc);
         }
+        break;
+      }
+      case "recordOvfHas": {
+        checkExpr(e.obj);
+        checkExpr(e.key);
+        const shape = records.get(e.shapeId);
+        if (!shape) err(`recordOvfHas on undeclared shape "${e.shapeId}"`, e.loc);
+        else if (!shape.indexValue || shape.tuple) err(`recordOvfHas on ${e.shapeId}: requires an index-signature record`, e.loc);
+        expectType(e.obj, { kind: "record", shapeId: e.shapeId }, "recordOvfHas receiver");
+        expectType(e.key, STRING, "recordOvfHas key");
+        if (e.type.kind !== "bool") err("recordOvfHas must be bool", e.loc);
         break;
       }
       case "recordOvfKeys": {
@@ -3782,7 +3854,11 @@ function validateFunction(
         // arms; string keys read RECORD arms.
         const resultUnion = e.type.kind === "union" ? unions.get(e.type.unionId) : undefined;
         const surfaces = (t: IrType): boolean =>
-          typeEquals(t, e.type) || !!resultUnion?.arms.some((a) => typeEquals(a, t));
+          typeEquals(t, e.type) || !!resultUnion?.arms.some((a) => typeEquals(a, t)) ||
+          (t.kind === "union" && !!resultUnion && (() => {
+            const source = unions.get(t.unionId);
+            return !!source && unionWideningTags(source.arms, resultUnion.arms) !== null;
+          })());
         def.arms.forEach((arm, i) => {
           if (arm.kind === "undefinedT" || arm.kind === "nullT") {
             if (!resultUnion?.arms.some((a) => a.kind === "undefinedT")) {
@@ -4819,10 +4895,10 @@ function validateFunction(
           // compiler-rendered fence.
           break;
         }
-        if (e.fn === "error.new") {
+        if (e.fn === "error.new" || e.fn === "error.newOptions") {
           // Which builtin the runtime constructs is named by the result type.
           if (!isBuiltinErrorObject(e.type)) {
-            err(`libCall error.new must return a builtin error class, got ${e.type.kind}`, e.loc);
+            err(`libCall ${e.fn} must return a builtin error class, got ${e.type.kind}`, e.loc);
           }
           break;
         }
@@ -5117,7 +5193,13 @@ function validateFunction(
             break;
           }
         }
-        if (e.fn === "error.ctor" || e.fn === "error.toString") {
+        if (e.fn === "error.cause" || e.fn === "error.hasCause") {
+          const recv = e.args[0];
+          let cls = recv?.type.kind === "object" ? classes.get(recv.type.className) : undefined;
+          while (cls?.base) cls = classes.get(cls.base);
+          if (cls?.name !== "%Error") err(`libCall ${e.fn} receiver must be an error object`, e.loc);
+        }
+        if (e.fn === "error.ctor" || e.fn === "error.ctorOptions" || e.fn === "error.toString") {
           const recv = e.args[0];
           const wantErrorRoot = e.fn === "error.toString";
           const ok =
@@ -5188,7 +5270,7 @@ function validateFunction(
         // Runtime HANDLE targets unwrap the checked-dynamic tree's handle kind by tag (a
         // retained reference, no copy — DYN_HANDLE_KINDS).
         const handleOk = DYN_HANDLE_KINDS.has(e.type.kind);
-        if (!jsonOk(e.type) && !undefArmedOk && !bytesOk && !errorOk && !classOk && !funcOk && !handleOk) {
+        if (!canDynCheckTo(e.type, (id) => records.get(id), (id) => unions.get(id)) && !undefArmedOk && !bytesOk && !errorOk && !classOk && !funcOk && !handleOk) {
           err(`dynCheck against non-JSON-representable type ${e.type.kind}`, e.loc);
         }
         break;
@@ -5545,6 +5627,9 @@ function validateFunction(
       }
       case "assign": {
         const binding = locals.get(s.localId) ?? globals.get(s.localId);
+        if (s.initializes && !binding?.tdz) {
+          err(`initializing assign requires a TDZ binding "${s.localId}"`, s.loc);
+        }
         if (!binding) err(`assign to undeclared local/global "${s.localId}"`, s.loc);
         // Global initialization happens via assign inside %init functions,
         // so a const global legitimately receives exactly one assign there;
@@ -5552,7 +5637,7 @@ function validateFunction(
         // emits the init-time one. Locals keep the strict check — except a
         // TDZ const, whose source declaration IS an assign into the
         // scope-entry box (tsc rejects user reassignment there too).
-        else if (!binding.mutable && locals.has(s.localId) && !("tdz" in binding && binding.tdz)) {
+        else if (!binding.mutable && locals.has(s.localId) && !locals.get(s.localId)?.tdz) {
           err(`assign to immutable local "${binding.name}"`, s.loc);
         }
         if (binding?.type.kind === "caught") {
@@ -5844,140 +5929,4 @@ function validateFunction(
   if (!typeEquals(fn.returnType, VOID) && !alwaysReturns(fn.body, unions)) {
     err(`non-void function may complete without returning`, fn.loc);
   }
-}
-
-/** Conservative "all paths return" — mirrors what tsc already guarantees. */
-function alwaysReturns(stmts: IrStmt[], unions: Map<string, IrUnionDef>): boolean {
-  for (const s of stmts) {
-    switch (s.kind) {
-      case "return":
-        return true;
-      case "throw":
-      case "rethrow":
-      case "runtimeFence":
-        // Terminates the path like return: control unwinds (to a handler or
-        // out of the function), never falling off the end. tsc agrees —
-        // `function f(): T { throw x; }` typechecks without a return.
-        return true;
-      case "exprStmt":
-        // process.exit never returns (fflush + _Exit): the path terminates
-        // like a throw. Mirrors tsc's own never-based reachability, which
-        // accepted the function without a trailing return — the
-        // parseAsync().catch entry handler ends exactly this way.
-        if (s.expr.kind === "libCall" && s.expr.fn === "process.exit") return true;
-        break;
-      case "tryCatch":
-        // Normal completion requires the try body to complete normally (and
-        // the catch, when the try raised) — if both always terminate, so
-        // does the whole statement. Without a catch, an exception keeps
-        // propagating (never a normal completion), so the try body alone
-        // decides. A finally that always terminates (throw) also decides.
-        if (
-          alwaysReturns(s.tryBody, unions) &&
-          (s.catchBody === null || alwaysReturns(s.catchBody, unions))
-        ) {
-          return true;
-        }
-        if (s.finallyBody && alwaysReturns(s.finallyBody, unions)) return true;
-        break;
-      case "if":
-        if (s.else_ && alwaysReturns(s.then, unions) && alwaysReturns(s.else_, unions)) return true;
-        break;
-      case "while":
-        // `while (true)` with no break never completes normally (tsc treats
-        // it the same way), so anything after it is unreachable.
-        if (s.cond.kind === "boolLit" && s.cond.value && !containsBreak(s.body)) return true;
-        break;
-      case "for":
-        // `for (;;)` — no condition, or a literal-true one — with no break
-        // never completes normally either (the walk-up-until-root idiom:
-        // every exit is a return).
-        if (
-          (s.cond === null || (s.cond.kind === "boolLit" && s.cond.value)) &&
-          !containsBreak(s.body)
-        ) {
-          return true;
-        }
-        break;
-      case "block":
-        if (alwaysReturns(s.body, unions)) return true;
-        break;
-      case "doWhile":
-        // The body runs at least once: if it returns on all paths, so does
-        // the loop. `do {} while (true)` with no break never completes.
-        if (alwaysReturns(s.body, unions)) return true;
-        if (s.cond.kind === "boolLit" && s.cond.value && !containsBreak(s.body)) return true;
-        break;
-      case "switch": {
-        // A switch always returns when no case body ever breaks out, every
-        // possible entry point (any case) reaches a return, and dispatch
-        // cannot miss every case: either a default exists, or the switch is
-        // an EXHAUSTIVE discriminant switch — the discriminant is a
-        // `unionDisc` over a union with N arms, every test is a distinct
-        // literal, and there are at least N of them. (At least: several
-        // discriminant VALUES can share one deduped IR arm, e.g.
-        // `{op: 0; a} | {op: 2; a}` is one record shape.) The real
-        // exhaustiveness guarantee is tsc's — it accepted the function
-        // without a trailing return (trust-the-checker, like narrowing
-        // itself); this condition only keeps hand-written IR conservative.
-        // With no switch-level breaks, execution from case i runs bodies
-        // i..end as a straight line — check that flattened suffix.
-        const hasDefault = s.cases.some((c) => c.test === null);
-        const literalTests = s.cases.map((c) => c.test).filter(
-          (t): t is IrExpr & { kind: "numLit" | "strLit" | "boolLit" } =>
-            t !== null && (t.kind === "numLit" || t.kind === "strLit" || t.kind === "boolLit"),
-        );
-        const distinct = new Set(literalTests.map((t) => `${t.kind}:${String(t.value)}`));
-        const exhaustive =
-          !hasDefault &&
-          s.disc.kind === "unionDisc" &&
-          literalTests.length === s.cases.length &&
-          distinct.size === s.cases.length &&
-          s.cases.length >= (unions.get(s.disc.unionId)?.arms.length ?? Infinity);
-        if (!hasDefault && !exhaustive) break;
-        if (s.cases.some((c) => containsBreak(c.body))) break;
-        const bodies = s.cases.map((c) => c.body);
-        const everyEntryReturns = bodies.every((_, i) =>
-          alwaysReturns(bodies.slice(i).flat(), unions),
-        );
-        if (everyEntryReturns) return true;
-        break;
-      }
-      default:
-        break;
-    }
-  }
-  return false;
-}
-
-/** Break at this level (not inside a nested loop or switch, whose bodies
- * own their breaks). */
-function containsBreak(stmts: IrStmt[]): boolean {
-  for (const s of stmts) {
-    switch (s.kind) {
-      case "break":
-        return true;
-      case "if":
-        if (containsBreak(s.then) || (s.else_ && containsBreak(s.else_))) return true;
-        break;
-      case "block":
-        if (containsBreak(s.body)) return true;
-        break;
-      case "tryCatch":
-        // Plain try/catch does not capture breaks — a break inside binds to
-        // the enclosing loop/switch (finally-crossing jumps are rejected
-        // upstream, so reachable IR only has these in plain try/catch).
-        if (
-          containsBreak(s.tryBody) ||
-          (s.catchBody !== null && containsBreak(s.catchBody)) ||
-          (s.finallyBody !== null && containsBreak(s.finallyBody))
-        ) {
-          return true;
-        }
-        break;
-      default:
-        break; // while/for/doWhile/switch bodies own their breaks
-    }
-  }
-  return false;
 }

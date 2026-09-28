@@ -100,7 +100,13 @@ function lowerArraySpreadItems(
   ];
   for (const node of nodes) {
     if (ts.isSpreadElement(node)) {
-      const source = lowerer.lowerExpr(node.expression);
+      let source = lowerer.lowerExpr(node.expression);
+      if (source.type.kind === "set" && typeEquals(source.type.elem, elem)) {
+        source = { kind: "setIntrinsic", method: "toArray", receiver: source, args: [], type: arrType, loc };
+      }
+      if (source.type.kind === "record" && lowerer.shapes.get(source.type.shapeId)?.tuple) {
+        source = lowerer.widthCoerce(source, arrType) ?? source;
+      }
       if (!typeEquals(source.type, arrType)) {
         lowerer.noLowering(`Array insertion spread from '${lowerer.fmt(source.type)}'`, node);
       }
@@ -513,6 +519,17 @@ function fenceProducedArrayElem(lowerer: Lowerer, node: ts.Node, producer: strin
           loc,
         };
       }
+      if (call.arguments.some(ts.isSpreadElement)) {
+        // Finish argument evaluation before mutating the receiver. Each
+        // spread snapshots its elements immediately, so a later argument
+        // can mutate that source without changing already-collected values.
+        const items = lowerArraySpreadItems(lowerer, call.arguments, elem, receiverIr, loc);
+        return {
+          kind: "arrIntrinsic",
+          method: name === "push" ? "pushSpread" : "unshiftSpread",
+          receiver, args: [items], type: F64, loc,
+        };
+      }
       const valueProbes = call.arguments.map((arg) => tryLowerExpression(lowerer, arg));
       if (valueProbes.some((probe) =>
         probe !== null && lowerer.runtimeOptionalWidening(probe.type, elem) !== null)) {
@@ -548,16 +565,11 @@ function fenceProducedArrayElem(lowerer: Lowerer, node: ts.Node, producer: strin
       };
     }
     if (name === "pop") {
-      // Like shift(), pop() returns undefined for an empty array. Union
-      // element arrays remain fenced here because their existing boxed
-      // element already carries the result union and a second undefined
-      // wrapper would lose the element identity contract.
+      // Widen a union payload through the normal array-read machinery
+      // before removing it. Reinterpreting the stored union's tag as the
+      // result union would confuse arms when undefined changes their order.
       if (elem.kind === "union" && lowerer.armTag(elem.unionId, UNDEFINED_T) < 0) {
-        lowerer.unsupported(
-          "SC1090",
-          call,
-          "'.pop()' on union-element arrays without an undefined arm (read the last element and splice it after narrowing instead)",
-        );
+        return lowerUnionArrayRemoval(lowerer, access.expression, elem, false, loc);
       }
       const receiver = lowerer.lowerExpr(access.expression);
       return {
@@ -665,18 +677,9 @@ function fenceProducedArrayElem(lowerer: Lowerer, node: ts.Node, producer: strin
       return { kind: "arrIntrinsic", method: "spliceInsert", receiver, args: [...args, items], type: receiverIr, loc };
     }
     if (name === "shift") {
-      // JS shift exactly: undefined on an empty array, else the first
-      // element with the tail sliding down — the result is the interned
-      // `elem | undefined` union, the env-read convention. Union-element
-      // arrays are fenced: their shift result would collapse arms
-      // (`(string | undefined)[]`'s shift is `string | undefined` too, and
-      // the box can't say which world the undefined came from).
+      // Like pop, a union without undefined needs an explicit tag widening.
       if (elem.kind === "union" && lowerer.armTag(elem.unionId, UNDEFINED_T) < 0) {
-        lowerer.unsupported(
-          "SC1090",
-          call,
-          "'.shift()' on union-element arrays without an undefined arm (read [0] and splice(0, 1) with the narrowed value instead)",
-        );
+        return lowerUnionArrayRemoval(lowerer, access.expression, elem, true, loc);
       }
       const receiver = lowerer.lowerExpr(access.expression);
       return { kind: "arrIntrinsic", method: "shift", receiver, args: [], type: arrayValueType(lowerer, elem), loc };
@@ -723,6 +726,45 @@ function fenceProducedArrayElem(lowerer: Lowerer, node: ts.Node, producer: strin
     // reduce / reduceRight
     return lowerArrayReduceCall(lowerer, call, access, name as "reduce" | "reduceRight", elem);
   }
+
+/** Read before splice so removal cannot destroy the result's owned payload.
+ * The source is evaluated once and empty/sparse arrays yield undefined using
+ * the same slot-state checks as an indexed read. */
+function lowerUnionArrayRemoval(
+  lowerer: Lowerer,
+  source: ts.Expression,
+  elem: IrType,
+  first: boolean,
+  loc: SrcLoc,
+): IrExpr {
+  const receiver = lowerer.lowerExpr(source);
+  const arr = lowerer.declareHiddenLocal("%removeArray", receiver.type);
+  const arrRef = varRef(arr.id, arr.type, loc);
+  const index = lowerer.declareHiddenLocal("%removeIndex", F64);
+  const indexRef = varRef(index.id, F64, loc);
+  const value = arrayValueRead(lowerer, arrRef, indexRef, elem, loc);
+  const result = lowerer.declareHiddenLocal("%removedValue", value.type);
+  return {
+    kind: "seqExpr",
+    stmts: [
+      { kind: "varDecl", localId: arr.id, init: receiver, loc },
+      {
+        kind: "varDecl", localId: index.id,
+        init: first ? numLit(0, loc) : {
+          kind: "bin", op: "-",
+          left: { kind: "arrIntrinsic", method: "length", receiver: arrRef, args: [], type: F64, loc },
+          right: numLit(1, loc), type: F64, loc,
+        }, loc,
+      },
+      { kind: "varDecl", localId: result.id, init: value, loc },
+      {
+        kind: "exprStmt",
+        expr: { kind: "arrIntrinsic", method: "splice", receiver: arrRef, args: [indexRef, numLit(1, loc)], type: arr.type, loc }, loc,
+      },
+    ],
+    result: varRef(result.id, result.type, loc), type: result.type, loc,
+  };
+}
 
 function literalFlatDepth(value: IrExpr): number | null {
   if (value.kind === "numLit") return value.value;
@@ -1201,6 +1243,16 @@ function arraySearchHelper(
         else lowerer.runtimeOptionalBindingTypes.set(symbol, previous);
       }
       lowerer.implicitParamTypes = previousImplicit;
+    }
+    // A callback can accept a wider parameter type than the array supplies
+    // (a reusable predicate over a union is common). Its closure still has
+    // that wider ABI: adapt each actual argument before invoking it, just
+    // as assignment to a narrower function slot does. Require a conversion
+    // plan so this path never manufactures a stranded callback.
+    if (fnArg.type.kind === "func" && fnArg.type.params.length <= full.length &&
+      fnArg.type.params.every((param, i) => lowerer.coercibleValue(full[i]!, param))) {
+      const callbackType = funcOf(full.slice(0, fnArg.type.params.length), fnArg.type.ret);
+      if (!typeEquals(fnArg.type, callbackType)) fnArg = lowerer.coerceToExpected(fnArg, callbackType);
     }
     // Array storage widens indexed reads with undefined so holes remain
     // observable. The HOF helper guards every callback behind arrayHas,
@@ -2000,16 +2052,31 @@ export function tryLowerNumericIndexRead(lowerer: Lowerer, operand: IrExpr, loc:
         loc,
       };
     }
-    // find: the result is the checker's `T | undefined` union. When the
-    // element type IS that union already (it carries an undefined arm), the
-    // found element passes through untouched; otherwise it wraps into its
-    // arm. A union element whose result union differs would need the
-    // union-into-union re-tag that doesn't exist — fenced.
+    // find visits holes as undefined and can infer a predicate that selects
+    // a subset of the element union. Only an inline, inferred predicate is
+    // evidence for that narrower representation; explicit assertions keep
+    // the same refusal boundary as filter.
     const resultT = bindUntyped ? arrayValueType(lowerer, elem) : lowerer.irTypeOf(call);
     if (resultT.kind !== "union") lowerer.badType(call, lowerer.typeOf(call)); // defensive: T | undefined always maps to a union
     const undefTag = lowerer.armTag(resultT.unionId, UNDEFINED_T);
     if (undefTag < 0) lowerer.badType(call, lowerer.typeOf(call));
-    const helper = findHelper(lowerer, elem, resultT, undefTag, fnRet, arity, last, loc);
+    const valueT = arrayValueType(lowerer, elem);
+    let retag: string | null = null;
+    if (!lowerer.coercibleValue(valueT, resultT)) {
+      const inline = ts.isArrowFunction(argNode) || ts.isFunctionExpression(argNode);
+      if (!inline || argNode.type !== undefined) {
+        lowerer.unsupported("SC1090", argNode,
+          `narrowing '.${method}' requires an inline callback with an inferred predicate (annotate the return ': boolean' to keep the receiver's element type)`);
+      }
+      const signature = lowerer.checker.getSignatureFromDeclaration(argNode);
+      const predicate = signature ? lowerer.checker.getTypePredicateOfSignature(signature) : undefined;
+      if (!predicate || predicate.parameterIndex !== 0 || valueT.kind !== "union") {
+        lowerer.unsupported("SC1090", call, `'.${method}' result narrowing without a predicate over its element`);
+      }
+      retag = lowerer.narrowedRetagHelper(call, valueT.unionId, resultT.unionId, loc);
+      if (retag === null) lowerer.unsupported("SC1090", call, `'.${method}' narrowing to an incompatible result layout`);
+    }
+    const helper = findHelper(lowerer, elem, resultT, undefTag, fnRet, arity, last, loc, retag);
     return { kind: "call", callee: helper, args: [receiver, fnArg], type: resultT, loc };
   }
 
@@ -2033,7 +2100,8 @@ export function tryLowerNumericIndexRead(lowerer: Lowerer, operand: IrExpr, loc:
     fnRet: IrType,
     arity: number,
     last: boolean,
-    loc: SrcLoc,): string {
+    loc: SrcLoc,
+    retag: string | null,): string {
     const method = last ? "findLast" : "find";
     const key = `${method}:${typeKey(elem)}:${typeKey(resultT)}:${typeKey(fnRet)}:${arity}`;
     const existing = lowerer.arrHofHelpers.get(key);
@@ -2045,7 +2113,8 @@ export function tryLowerNumericIndexRead(lowerer: Lowerer, operand: IrExpr, loc:
 
     const valueT = arrayValueType(lowerer, elem);
     const v = varRef("v.0", valueT, loc);
-    const found = lowerer.coerceToExpected(v, resultT);
+    const found: IrExpr = retag === null ? lowerer.coerceToExpected(v, resultT) :
+      { kind: "call", callee: retag, args: [v], type: resultT, loc };
     const miss: IrExpr = {
       kind: "unionWrap",
       unionId: resultT.unionId,
@@ -3209,7 +3278,8 @@ function buildArrayFromArrayFn(lowerer: Lowerer, name: string, elem: IrType,
       }
     }
     if (receiverIr?.kind !== "map") return null;
-    if (!lowerer.isStdlibMember(access)) return null;
+    // Collection views can refine has() while retaining its native ABI.
+    if (!lowerer.isStdlibMember(access) && name !== "has") return null;
     const loc = locOf(call);
     const receiver = lowerer.lowerExpr(access.expression);
     // The lib's `set` returns the Map (chaining typechecks); the lowered
@@ -3232,22 +3302,24 @@ function buildArrayFromArrayFn(lowerer: Lowerer, name: string, elem: IrType,
     }
 
     if (name === "get") {
-      const k = lowerer.lowerExprExpecting(call.arguments[0]!, receiverIr.key);
+      const k = lowerer.lowerCollectionKey(call.arguments[0]!, receiverIr.key);
       // The checker types the call `V | undefined`, which interns the
       // result union. `undefined` sorts LAST among all possible arm
       // typeKeys, so when V is itself a union its arms keep their tags in
       // the result union — the backend leans on that (docs/ir.md).
-      const type = lowerer.irTypeOf(call);
-      if (type.kind !== "union") lowerer.badType(call, lowerer.typeOf(call));
+      const type = receiverIr.value.kind === "dyn" ? DYN : lowerer.irTypeOf(call);
+      if (type.kind !== "union" && type.kind !== "dyn") lowerer.badType(call, lowerer.typeOf(call));
       return { kind: "mapIntrinsic", method: "get", receiver, args: [k], type, loc };
     }
     if (name === "set") {
-      const k = lowerer.lowerExprExpecting(call.arguments[0]!, receiverIr.key);
-      const v = lowerer.lowerExprExpecting(call.arguments[1]!, receiverIr.value);
+      const k = lowerer.lowerCollectionKey(call.arguments[0]!, receiverIr.key);
+      const v = receiverIr.value.kind === "dyn"
+        ? lowerer.lowerCollectionKey(call.arguments[1]!, receiverIr.value)
+        : lowerer.lowerExprExpecting(call.arguments[1]!, receiverIr.value);
       return { kind: "mapIntrinsic", method: "set", receiver, args: [k, v], type: VOID, loc };
     }
     if (name === "has" || name === "delete") {
-      const k = lowerer.lowerExprExpecting(call.arguments[0]!, receiverIr.key);
+      const k = lowerer.lowerCollectionKey(call.arguments[0]!, receiverIr.key);
       return { kind: "mapIntrinsic", method: name, receiver, args: [k], type: BOOL, loc };
     }
     if (name === "clear") {
@@ -3586,7 +3658,10 @@ const MAP_ITER_METHODS = new Set(["keys", "values", "entries"]);
       if (probed?.type.kind === "set") receiverIr = probed.type;
     }
     if (receiverIr?.kind !== "set") return null;
-    if (!lowerer.isStdlibMember(access)) return null;
+    // A collection interface may refine has() into a type predicate.
+    // Type mapping checked that view's native ABI; the value check below
+    // still rejects structural mocks and assertions over other objects.
+    if (!lowerer.isStdlibMember(access) && name !== "has") return null;
     const loc = locOf(call);
     const receiver = lowerer.lowerExpr(access.expression);
     // The lib's `add` returns the Set (chaining typechecks); the lowered
@@ -3609,11 +3684,11 @@ const MAP_ITER_METHODS = new Set(["keys", "values", "entries"]);
       return lowerSetCombineCall(lowerer, call, name, receiver, receiverIr);
     }
     if (name === "add") {
-      const v = lowerer.lowerExprExpecting(call.arguments[0]!, receiverIr.elem);
+      const v = lowerer.lowerCollectionKey(call.arguments[0]!, receiverIr.elem);
       return { kind: "setIntrinsic", method: "add", receiver, args: [v], type: VOID, loc };
     }
     if (name === "has" || name === "delete") {
-      const v = lowerer.lowerExprExpecting(call.arguments[0]!, receiverIr.elem);
+      const v = lowerer.lowerCollectionKey(call.arguments[0]!, receiverIr.elem);
       return { kind: "setIntrinsic", method: name, receiver, args: [v], type: BOOL, loc };
     }
     if (name === "clear") {

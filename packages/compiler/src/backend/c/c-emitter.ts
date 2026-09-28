@@ -1,4 +1,5 @@
 import { InternalCompilerError } from "../../errors.js";
+import { SourceLocations } from "../source-locations.js";
 /* IR → C. Three-address style: every IR expression lands in a fresh C temp.
  * Verbose (clang -O2 erases it) but buys three things: short-circuit
  * emission is trivially correct, reference counting has one mechanical
@@ -40,7 +41,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/ir.js";
-import { ffiCallbackType, funcOf, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isRefCounted, isUnitType, mapOf, moduleEmbedsCompressedNpm, moduleUsesChildProcess, moduleUsesDgram, moduleUsesDynInvoke, moduleEmbedsBuiltin, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesStream, moduleUsesTls, moduleUsesTlsCa, POINTER_KINDS, type PointerKind, RUNTIME_EMITTER_CLASS, STRING, VOID } from "../../ir/ir.js";
+import { ffiCallbackType, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isRefCounted, isUnitType, moduleEmbedsCompressedNpm, moduleUsesChildProcess, moduleUsesDgram, moduleUsesDynInvoke, moduleEmbedsBuiltin, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesStream, moduleUsesTls, moduleUsesTlsCa, POINTER_KINDS, type PointerKind, RUNTIME_EMITTER_CLASS, VOID } from "../../ir/ir.js";
 import { undefinedArmTag } from "../../ir/analysis.js";
 import { scalarizeNumericRecords } from "../../ir/scalar-records.js";
 import type { IntegerRanges } from "../../ir/integer-ranges.js";
@@ -60,9 +61,10 @@ import {
   mangleWrapper,
 } from "../mangle.js";
 import { cCommentText, cFnPtrCast, cType, releaseCallC, cStringLiteral, cDecl, cNumberLiteral } from "./types.js";
+import { computeTraced } from "../cycle-analysis.js";
 import { computeMayThrow } from "./may-throw.js";
 import { unionTruthyHelper, unionEqHelper, unionToStrHelper, unionJoinHelper, jsonWriteHelper, jsonIndentHelper, dynMatchHelper, dynCheckHelper, dynFuncBoxHelper, dynToStrHelper, caughtToDynHelper, toDynHelper, recordKeyGetHelper, recordKeySetHelper } from "./walkers.js";
-import { VtSlot, ClassMeta, emitStructDefs, vtEntriesFor, vtSlotParams, emitVtableDecls, emitVtableInstances, emitVtAdapterDefs, emitHierarchyClassHelpers, emitClassObjs, emitCtorThunkDefs, errorVtStampLines, emitterVtStampLines, streamVtStampLines, traceAdapterC, traceArgC, boxNewC, arrNewC } from "./shapes.js";
+import { type StructShape, type VtSlot, ClassMeta, emitStructDefs, vtEntriesFor, vtSlotParams, emitVtableDecls, emitVtableInstances, emitVtAdapterDefs, emitHierarchyClassHelpers, emitClassObjs, emitCtorThunkDefs, errorVtStampLines, emitterVtStampLines, streamVtStampLines, traceAdapterC, traceArgC, boxNewC, arrNewC } from "./shapes.js";
 import { emitAsyncScaffolding, childDataThunkFor, childExitThunkFor, childExitSignalThunkFor, execFileThunkFor, ipcMessageThunkFor, ipcSendThunkFor, closeBindThunkFor, connectResThunkFor, connectSockThunkFor, closeOverrideWrapFor, cryptoBytesThunkFor, dgramMsgThunkFor, dnsLookupThunkFor, fsRenameThunkFor, genResultThunkFor, netLookupAnswerThunkFor, emitterInvokeThunkFor, streamCbThunkFor, streamDataThunkFor, raceAdapterFor, resolveThunkFor, sniAnswerThunkFor, zlibBytesThunkFor } from "./async.js";
 import { emitNpmEmbedding, islandAdapter, islandTypedAdapter } from "./island.js";
 import { emitFunction, emitBlock, emitStmts, emitStmt, emitTryCatch, emitSwitch, mergeBrace, emitBranchInto, emitCondition } from "./stmts.js";
@@ -70,6 +72,8 @@ import { emitExpr, liveDynRefAdapter as buildLiveDynRefAdapter, type StreamTyped
 import { emitLibraryIdentityLines } from "../library-identity-markers.js";
 
 export interface CEmitOptions {
+  /** Exact frontend sources for dev-build #line directives. */
+  debugSources?: ReadonlyMap<string, string>;
   /** Library archive assembly may move the volatile identity getters into a
    * separate translation unit. Public/direct emission keeps them by default. */
   emitLibraryIdentity?: boolean;
@@ -110,9 +114,17 @@ function ffiNativeTypeC(
   switch (cls) {
     case "f64":
       return "double";
+    case "f32":
+      return "float";
     case "bool":
     case "u8":
       return "uint8_t";
+    case "i8":
+      return "int8_t";
+    case "u16":
+      return "uint16_t";
+    case "i16":
+      return "int16_t";
     case "u32":
       return "uint32_t";
     case "i32":
@@ -121,6 +133,7 @@ function ffiNativeTypeC(
       return "const char *";
     case "string":
     case "bytes":
+    case "mutable-bytes":
       throw new InternalCompilerError(`emitter bug: span class '${cls}' has no scalar C type`);
     case "void":
       return "void";
@@ -156,6 +169,8 @@ function ffiCallbackDummyC(callback: IrFfiCallbackParam["callback"]): string {
 }
 
 export class CEmitter {
+  private readonly debug: SourceLocations | null;
+  sourceLoc: SrcLoc | null = null;
   readonly lines: string[] = [];
   indent = 0;
   tempCounter = 0;
@@ -190,8 +205,8 @@ export class CEmitter {
    * dispatches through. Registered during body emission (the regex
    * pattern); the statics and thunks are assembled around the bodies. */
   readonly classObjs = new Map<string, string>();
-  /** Stack of statement frames: refcounted temps not yet released or moved. */
-  frames: Temp[][] = [];
+  /** Statement frames own expression temps and sequence locals until cleanup. */
+  frames: ScopeEntry[][] = [];
   /** Stack of scopes: refcounted locals (with types) declared in each. */
   scopes: ScopeEntry[][] = [];
   /** The function being emitted: local table (for boxedness) and whether
@@ -332,6 +347,7 @@ export class CEmitter {
    * (scr_dyn_new_promise_adapting's callback — toDynHelper's promise arm). */
   readonly promiseDynAdapters = new Map<string, string>();
   readonly recordKeyGetFns = new Map<string, string>();
+  readonly unionWidenFns = new Map<string, string>();
   readonly recordKeySetFns = new Map<string, string>();
   readonly walkerProtos: string[] = [];
   readonly walkerDefs: string[] = [];
@@ -376,12 +392,12 @@ export class CEmitter {
         usedContinue: boolean;
         endLabel: string | null;
         usedEnd: boolean;
-        labels?: string[];
+        labels?: string[] | undefined;
         scopeDepth: number;
         frameDepth: number;
         finallyDepth: number;
       }
-    | { kind: "switch"; endLabel: string; usedEnd: boolean; labels?: string[]; scopeDepth: number; frameDepth: number; finallyDepth: number }
+    | { kind: "switch"; endLabel: string; usedEnd: boolean; labels?: string[] | undefined; scopeDepth: number; frameDepth: number; finallyDepth: number }
     | { kind: "block"; endLabel: string; usedEnd: boolean; labels: string[]; scopeDepth: number; frameDepth: number; finallyDepth: number }
   )[] = [];
   labelCounter = 0;
@@ -440,6 +456,7 @@ export class CEmitter {
     sourceText?: string,
     private readonly options: CEmitOptions = {},
   ) {
+    this.debug = options.debugSources === undefined ? null : new SourceLocations(options.debugSources);
     this.constantNumericTables = findConstantNumericTables(mod);
     this.ffiCallbackAdapters = allocateFfiCallbackAdapters(mod.ffiImports ?? []);
     this.ffiHasRetainedCallback = hasRetainedFfiCallback(mod.ffiImports ?? []);
@@ -464,16 +481,7 @@ export class CEmitter {
     // redeclares it — never-overridden methods stay direct calls
     // everywhere (whole-program devirtualization).
     for (const cls of mod.classes ?? []) {
-      const meta: ClassMeta = {
-        def: cls,
-        base: null,
-        children: [],
-        root: undefined as unknown as ClassMeta,
-        pre: 0,
-        post: 0,
-        hierarchy: false,
-        slots: [],
-      };
+      const meta = new ClassMeta(cls);
       this.classMeta.set(cls.name, meta);
     }
     for (const meta of this.classMeta.values()) {
@@ -504,7 +512,7 @@ export class CEmitter {
     const collectSlots = (m: ClassMeta, root: ClassMeta, seen: Map<string, number>): void => {
       for (const method of m.def.methods ?? []) {
         let inherited = false;
-        for (let a = m.base; a; a = a.base) inherited ||= declares(a, method);
+        for (let a = m.base; a; a = a.base) inherited = inherited || declares(a, method);
         if (!inherited && declaredBelow(m, method)) {
           let fn = this.fnByName.get(`%${m.def.name}.${method}`);
           if (!fn && m.def.abstractMethods?.includes(method)) {
@@ -546,109 +554,13 @@ export class CEmitter {
         if (this.mayThrow.has(`%${cls.name}.${m}`)) this.mayThrowMethods.add(m);
       }
     }
-    // Cycle capability, as a greatest fixpoint over shapes and unions:
-    // start optimistic (everything cycle-capable), then repeatedly drop
-    // shapes with no cycle-capable field and unions with no cycle-capable
-    // arm until stable. Closures and promises are always cycle-capable
-    // (a captured box can hold anything; a rejection payload is an
-    // arbitrary thrown value); strings never are, and arrays/maps inherit
-    // their element/value type's capability (a record element can point
-    // back at the array holding it). The optimistic start is what keeps
-    // self- and mutually-recursive classes traced (`class A { next: A }`).
-    const shapeDefs = [
-      // The emitter class carries a synthetic closure-typed pseudo-field:
-      // its runtime registry OWNS listener closures, so the emitter
-      // hierarchy is unconditionally cycle-capable — the fixpoint must
-      // never drop it (the pseudo-field never reaches struct emission;
-      // runtime classes emit no structs).
-      ...(mod.classes ?? []).map((c) => ({
-        key: `object:${c.name}`,
-        fields: c.name === RUNTIME_EMITTER_CLASS
-          ? [...c.fields, { name: "<listeners>", type: funcOf([], VOID) }]
-          : c.fields,
-      })),
-      // An index-signature shape's overflow map participates like a field
-      // of map type: the shape is cycle-capable when the overflow VALUE
-      // type is (a record/object/union value in the map can point back at
-      // the record embedding it) — cycleCapable's map rule answers that.
-      ...(mod.records ?? []).map((r) => ({
-        key: `record:${r.id}`,
-        fields: r.indexValue
-          ? [...r.fields, { name: "<overflow>", type: mapOf(STRING, r.indexValue) }]
-          : r.fields,
-      })),
-    ];
-    for (const s of shapeDefs) this.tracedShapes.add(s.key);
-    // A hierarchy is ONE unit of cycle capability: a base-typed slot can
-    // hold any subclass and retain touches the cycle header, so header
-    // presence must be uniform across an extends-hierarchy — it is
-    // cycle-capable iff ANY member is. Standalone classes and records are
-    // singleton units (today's behavior exactly).
-    const unitKeyOf = (key: string): string => {
-      if (!key.startsWith("object:")) return key;
-      const meta = this.classMeta.get(key.slice("object:".length));
-      return meta && meta.hierarchy ? `object:${meta.root.def.name}` : key;
-    };
-    const units = new Map<string, typeof shapeDefs>();
-    for (const s of shapeDefs) {
-      const unit = unitKeyOf(s.key);
-      let members = units.get(unit);
-      if (!members) units.set(unit, (members = []));
-      members.push(s);
-    }
-    for (const u of mod.unions ?? []) this.tracedUnions.add(u.id);
-    const cycleCapable = (t: IrType): boolean => {
-      switch (t.kind) {
-        case "func":
-        case "promise":
-          return true;
-        case "object":
-          return this.tracedShapes.has(`object:${t.className}`);
-        case "record":
-          return this.tracedShapes.has(`record:${t.shapeId}`);
-        case "union":
-          return this.tracedUnions.has(t.unionId);
-        // A map is cycle-capable exactly when its VALUE type is: a record/
-        // object/union value can hold the map that owns it, while string/
-        // array/scalar values cannot point back. Map-valued maps (an
-        // index-signature overflow over `Map<K, V>` values) recurse on the
-        // inner value. Terminates: IrTypes are finite trees, and the
-        // record/union cases read the fixpoint sets.
-        case "map":
-          return cycleCapable(t.value);
-        // An array is cycle-capable exactly when its ELEMENT type is —
-        // record/object/union elements (and cycle-capable inner arrays)
-        // can point back at the array. Terminates: element types are
-        // finite trees, and the record/union cases read the fixpoint sets.
-        case "array":
-          return cycleCapable(t.elem);
-        default:
-          return false;
-      }
-    };
-    let shrunk = true;
-    while (shrunk) {
-      shrunk = false;
-      for (const members of units.values()) {
-        if (
-          this.tracedShapes.has(members[0]!.key) &&
-          !members.some((s) => s.fields.some((f) => cycleCapable(f.type)))
-        ) {
-          for (const s of members) this.tracedShapes.delete(s.key);
-          shrunk = true;
-        }
-      }
-      for (const u of mod.unions ?? []) {
-        if (this.tracedUnions.has(u.id) && !u.arms.some(cycleCapable)) {
-          this.tracedUnions.delete(u.id);
-          shrunk = true;
-        }
-      }
-    }
+    const traced = computeTraced(mod);
+    for (const shape of traced.shapes) this.tracedShapes.add(shape);
+    for (const union of traced.unions) this.tracedUnions.add(union);
     if (sourceText !== undefined) {
       this.lineStarts = [0];
       for (let i = 0; i < sourceText.length; i++) {
-        if (sourceText[i] === "\n") this.lineStarts.push(i + 1);
+        if (sourceText.charAt(i) === "\n") this.lineStarts.push(i + 1);
       }
     }
   }
@@ -676,7 +588,9 @@ export class CEmitter {
     // table is complete; the file is then assembled around them.
     for (const fn of this.mod.functions) {
       this.emitFunction(fn);
-      body.push(...this.lines);
+      // Large compiler functions can emit more lines than JavaScript's
+      // argument-count limit, particularly with sanitizer cleanup paths.
+      for (const line of this.lines) body.push(line);
       this.lines.length = 0;
     }
 
@@ -796,20 +710,10 @@ export class CEmitter {
           return [ffiCallbackPointerTypeC(param.callback)];
         }
         if (isFfiContextParam(param)) return ["void *"];
-        switch (param) {
-          case "f64":
-            return ["double"];
-          case "bool":
-          case "u8":
-            return ["uint8_t"];
-          case "u32":
-            return ["uint32_t"];
-          case "i32":
-            return ["int32_t"];
-          case "string":
-          case "bytes":
-            return ["const uint8_t *", "size_t"];
-        }
+        if (param === "mutable-bytes") return ["uint8_t *", "size_t"];
+        return param === "string" || param === "bytes"
+          ? ["const uint8_t *", "size_t"]
+          : [ffiNativeTypeC(param)];
       });
       const ret = ffiNativeTypeC(entry.returns);
       out.push(`extern ${ret} ${entry.symbol}(${params.length > 0 ? params.join(", ") : "void"});`);
@@ -1365,16 +1269,7 @@ export class CEmitter {
 
   emitHierarchyClassHelpers(out: string[],
     meta: ClassMeta,
-    s: {
-      struct: string;
-      newFn: string;
-      retain: string;
-      release: string;
-      trace: string;
-      gcFree: string;
-      traced: boolean;
-      fields: { name: string; type: IrType }[];
-    },): void {
+    s: StructShape,): void {
     return emitHierarchyClassHelpers(this, out, meta, s);
   }
 
@@ -1529,8 +1424,10 @@ export class CEmitter {
         `}`,
       );
     }
-    for (const elem of ["u8", "u32", "i32", "f32", "f64"] as const) {
-      for (const mode of ["f64", "u64"] as const) {
+    const elements: ("u8" | "u32" | "i32" | "f32" | "f64")[] = ["u8", "u32", "i32", "f32", "f64"];
+    const modes: ("f64" | "u64")[] = ["f64", "u64"];
+    for (const elem of elements) {
+      for (const mode of modes) {
         const suffix = mode === "u64" ? "_u64" : "";
         const indexType = mode === "u64" ? "uint64_t" : "double";
         const checked = mode === "u64" ? "sc_bytes_index_u64_checked" : "sc_bytes_index_checked";
@@ -1580,7 +1477,18 @@ export class CEmitter {
   }
 
   line(text: string): void {
+    const pos = this.sourceLoc === null ? null : this.debug?.position(this.sourceLoc);
+    if (pos !== null && pos !== undefined && text.trim() !== "") {
+      // Repeat the directive for every generated line: one TS statement can
+      // expand into many native instructions, all belonging to that line.
+      this.lines.push(`#line ${pos.line} ${JSON.stringify(pos.file)}`);
+    }
     this.lines.push("  ".repeat(this.indent) + text);
+  }
+
+  endSourceFunction(): void {
+    this.sourceLoc = null;
+    if (this.debug !== null) this.lines.push('#line 1 "<scriptc>"');
   }
 
   srcComment(loc: SrcLoc): string {
@@ -1621,7 +1529,7 @@ export class CEmitter {
     return t;
   }
 
-  currentFrame(): Temp[] {
+  currentFrame(): ScopeEntry[] {
     const frame = this.frames[this.frames.length - 1];
     if (!frame) throw new InternalCompilerError("emitter bug: no active statement frame");
     return frame;
@@ -1798,13 +1706,20 @@ export class CEmitter {
    * assigns later, a constructor branch skips it, a base constructor's
    * virtual call reads a derived field before super() returns. Node reads
    * `undefined` there; a NULL payload pointer would be a segfault (union
-   * fields) or a silent nothing (jsval fields). Undefined-armed unions get
+   * fields), or an invalid dyn/jsval cell. Native checked-dynamic fields
+   * get the immortal dyn undefined. Undefined-armed unions get
    * the interned immortal unit instance (free; releases skip it); jsval
    * (`any`) fields get an engine undefined cell — such classes exist only
    * in --dynamic builds, and the field's release balances it. Empty for
    * every type that cannot hold undefined (tsc's SPI guards those) and for
    * record shapes' construction paths, which write every field. */
   undefFieldInitLineC(name: string, t: IrType): string[] {
+    // Error.cause uses NULL for absence; only the options constructor may
+    // install a present value (including undefined) in this runtime slot.
+    if (name === "%cause") return [];
+    if (t.kind === "dyn") {
+      return [`  o->${mangleField(name)} = scr_dyn_undefined(); /* ${cCommentText(name)} starts undefined */`];
+    }
     if (t.kind === "jsval") {
       return [`  o->${mangleField(name)} = scr_jsval_undefined(); /* ${cCommentText(name)} starts undefined */`];
     }
@@ -1853,6 +1768,10 @@ export class CEmitter {
           if (isFfiContextParam(param)) return [];
           switch (param) {
             case "f64":
+            case "f32":
+            case "i8":
+            case "u16":
+            case "i16":
               return [`scr_ffi_call_get_f64(sc_call, ${i})`];
             case "bool":
               return [`scr_ffi_call_get_bool(sc_call, ${i})`];
@@ -1881,6 +1800,10 @@ export class CEmitter {
           if (isFfiContextParam(param)) return;
           switch (param) {
             case "f64":
+            case "f32":
+            case "i8":
+            case "u16":
+            case "i16":
               out.push(`  scr_ffi_call_set_f64(sc_call, ${i}, sc_a${i});`);
               break;
             case "bool":
@@ -1957,6 +1880,10 @@ export class CEmitter {
           case "bool":
             return [`(sc_a${i} != 0)`];
           case "u8":
+          case "f32":
+          case "i8":
+          case "u16":
+          case "i16":
           case "u32":
           case "i32":
             return [`(double)sc_a${i}`];
@@ -1988,6 +1915,19 @@ export class CEmitter {
       switch (cb.returns) {
         case "f64":
           out.push(`  return sc_result;`);
+          break;
+        case "f32":
+          out.push(`  return (float)sc_result;`);
+          break;
+        case "i8":
+        case "i16": {
+          const bits = cb.returns === "i8" ? 8 : 16;
+          out.push(`  uint32_t sc_bits = (uint32_t)scr_bit_ushr(sc_result, 0.0) & ${(2 ** bits) - 1}u;`);
+          out.push(`  return (${ffiNativeTypeC(cb.returns)})(sc_bits < ${2 ** (bits - 1)}u ? (int32_t)sc_bits : (int32_t)sc_bits - ${2 ** bits});`);
+          break;
+        }
+        case "u16":
+          out.push(`  return (uint16_t)(uint32_t)scr_bit_ushr(sc_result, 0.0);`);
           break;
         case "bool":
           out.push(`  return (uint8_t)(sc_result ? 1 : 0);`);
@@ -2044,12 +1984,12 @@ export class CEmitter {
    * (a C break only exits the innermost loop). */
   loopTarget(continueLabel: string | null, labels: string[] | undefined): (typeof this.jumpTargets)[number] & { kind: "loop" } {
     return {
+      labels,
       kind: "loop",
       continueLabel: continueLabel === null && labels !== undefined ? `sc_cont_${this.labelCounter++}` : continueLabel,
       usedContinue: false,
       endLabel: labels !== undefined ? `sc_end_${this.labelCounter++}` : null,
       usedEnd: false,
-      ...(labels !== undefined && { labels }),
       scopeDepth: this.scopes.length,
       frameDepth: this.frames.length,
       finallyDepth: this.finallyStack.length,

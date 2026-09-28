@@ -14,6 +14,7 @@ import { InternalCompilerError } from "../../errors.js";
  *   ("x.0", "x.1" for shadowing); the IR is scope-flat.
  */
 import { resolve } from "node:path";
+import { bindingSource } from "../binding-source.js";
 import { tsgoPath } from "../dts-paths.js";
 import * as ts from "../ts7/adapter.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
@@ -52,7 +53,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/ir.js";
-import { arrayOf, BOOL, canAdaptDynFuncTo, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, DYN_HANDLE_KINDS, F64, isDynTypedRefType, isJsonSafeType, isJsonStringifySafeType, isUndefinedArmedUnion, isUnitType, JSVAL, NULL_T, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/ir.js";
+import { arrayOf, BOOL, canAdaptDynFuncTo, canDynCheckTo, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, DYN_HANDLE_KINDS, F64, isDynTypedRefType, isJsonSafeType, isJsonStringifySafeType, isUndefinedArmedUnion, isUnitType, JSVAL, NULL_T, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/ir.js";
 import { type DynamicImportResolution, type NpmBuiltinUse, type NpmLazyTrap } from "../npm.js";
 import { provenanceActive } from "../provenance-registry.js";
 import {
@@ -83,6 +84,7 @@ import {
   formatIrType,
   ISLAND_AMBIENT_TYPES,
   isUnitOnlyTsType,
+  jsOpenObjectType,
   mapType,
   ShapeRegistry,
   type DeclaredOrderPriorityRef,
@@ -94,7 +96,7 @@ import {
 import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMsg, BuiltinModuleFn, builtinConstLit, builtinModuleConstOf, builtinModulesArrayLit, builtinFenceHintOf, builtinModuleFnOf, stdlibMemberFence, isStdlibMember, isStdlibSymbol, isStdlibGlobal, stdlibGlobalMember, nodeTypesOnlySymbol } from "./surfaces.js";
 import { FileParts, splitFiles, collectProgram, collectNpmImports, collectJsonImports, moduleArtifacts, collectGlobals, declSymbolOf, defaultExportSymbolOf, lowerFileInit, lowerDefaultExport, buildMain, appendDynamicImportModules, appendForkModules } from "./lower-modules.js";
 import { prepareCjsModuleGraph } from "./lower-node-module.js";
-import { ClassInfo, ClassIteratorInfo, GenericClassInfo, registerBuiltinErrorClasses, registerBuiltinEmitterClass, registerBuiltinStreamClasses, builtinErrorInfoOf, builtinEmitterInfoOf, builtinStreamInfoOf, analyzeClassDecoration, classIteratorDrainCall, classIteratorNextCall, classIteratorOf, classIteratorOpenCall, classIteratorRestDrainCall, classMemberNameOf, classValueRef, collectClassShape, exactClassOfReceiver, collectClassShapeInner, ctorAbiEquals, findMethodOn, findStaticOn, findGenericMethodOn, findGenericStaticOn, genericClassInstanceType, isSubclassOf, inHierarchy, overrideBelow, staticShadowBelow, upcastTo, lowerClassMembers, lowerClassCtor, lowerClassExpression, lowerClassExpressionInfo, lowerClassMethodMember, lowerClassValueProperty, lowerStaticMethod, throwingSetterFn, fieldInitStmts, lowerStaticFieldInits, lowerStaticFieldRead, lowerDerivedCtorBody, superCallStmt, lowerSuperMethodCall, superThisRef, lowerSuperAccessorRead, lowerSuperAccessorWrite, inheritsBuiltinErrorCtor, inheritsBuiltinEmitterCtor, errorMessageArg, lowerNew, accessorCall } from "./lower-classes.js";
+import { ClassInfo, ClassIteratorInfo, GenericClassInfo, registerBuiltinErrorClasses, registerBuiltinEmitterClass, registerBuiltinStreamClasses, builtinErrorInfoOf, builtinEmitterInfoOf, builtinStreamInfoOf, analyzeClassDecoration, classIteratorDrainCall, classIteratorNextCall, classIteratorOf, classIteratorOpenCall, classIteratorRestDrainCall, classMemberNameOf, classValueRef, collectClassShape, exactClassOfReceiver, collectClassShapeInner, ctorAbiEquals, findMethodOn, findStaticOn, findGenericMethodOn, findGenericStaticOn, genericClassInstanceType, isSubclassOf, inHierarchy, overrideBelow, staticShadowBelow, upcastTo, lowerClassMembers, lowerClassCtor, lowerClassExpression, lowerClassExpressionInfo, lowerClassMethodMember, lowerClassValueProperty, lowerStaticMethod, throwingSetterFn, fieldInitStmts, lowerStaticFieldInits, lowerStaticFieldRead, lowerDerivedCtorBody, superCallStmt, lowerSuperMethodCall, superThisRef, lowerSuperAccessorRead, lowerSuperAccessorWrite, inheritsBuiltinErrorCtor, inheritsBuiltinEmitterCtor, errorConstructorArgs, lowerNew, accessorCall } from "./lower-classes.js";
 import { MixinFnShape, mixinCallClassInfoOf, mixinIntersectionInstanceType } from "./lower-mixins.js";
 import { ParamShape, FnSig, GenericFnInfo, GenericInstance, bindingNeverReassigned, bodyReadsArguments, funcTypeFromParamShapes, implicitMonoFile, isThisParameter, paramShape, paramShapes, checkDefaultParamBodyType, completeArgs, wrappedUndefined, undefinedArgFor, requireExactArityValue, bodyReturnType, declaredReturnType, collectSignature, collectSignatureInner, collectGenericSignature, genericFnOf, lowerGenericCall, lowerGenericFnValue, inferTypeParamBindings, lowerGenericInstance, lowerCall, lowerFfiCall, lowerTimersMemberCall, lowerPromiseMethodCall, lowerFilterNarrowCall, isTopLevelFnSymbol, lowerNestedFunctionDecl, lambdaSignature, lowerLambda, lowerFunction, validateFfiImports } from "./lower-calls.js";
 import { lowerArrayMethodCall, lowerMapMethodCall, lowerMapForEachCall, buildMapForEachFn, lowerRecordOvfCaptureHelper, lowerEnvToPairsHelper, lowerSetMethodCall, lowerSetForEachCall, buildSetForEachFn } from "./lower-containers.js";
@@ -102,7 +104,7 @@ import { lowerBufferStaticCall, lowerBytesMethodCall, lowerBytesNew } from "./co
 import { lowerRegexMethodCall, lowerStringMethodCall } from "./containers/string-and-regexp.js";
 import { lowerStreamModuleCall } from "./lower-stream.js";
 import { lowerEmitOverrideSpec, type EmitSpecCtx, type EmitSpecRequest } from "./lower-event-emitter.js";
-import { builtinImportOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireProgramModuleOf, createRequireSpecOf, stripTypeCasts, lowerBuiltinModuleCall, lowerNodeModuleCall, lowerTimersPromisesSetInterval, lowerFsToUnixTimestampCall, lowerFsLadderCall, lowerChildArgsArg, lowerSpawnSyncCall, lowerSpawnCall, lowerExecFileCall, lowerExecSyncCall, recordToEnvPairs, lowerJsonMethodCall, fencedBuiltinImportOf, lowerCryptoComposedCall, lowerUrlMethodCall, lowerSearchParamsMethodCall, lowerStatsMethodCall, lowerChildMethodCall, lowerAtomicsCall, lowerBuiltinExtraProperty, registerPromisifiedBuiltinDecl, lowerExecFileAsyncCall, execFileAsyncHelper, lowerStringDecoderMethodCall, strdecHelper, lowerReadlineMethodCall, lowerDcChannelMethodCall, lowerDcChannelProperty, lowerAlsMethodCall, lowerDcTracingChannelMethodCall, lowerDcTracingChannelProperty, lowerJsonProperty, lowerErrorCodeProperty, lowerProcessProperty, isProcessEnv, envValueType, lowerProcessEnvGet, lowerProcessMethodCall, lowerProcessOptionalMethodCall, lowerTimeoutMethodCall, envSnapshotHelper, isConsoleLog, consoleCallMember, lowerNumberStaticCall, lowerNumberStaticProperty, lowerDateCall, lowerTextCodecCall, lowerCryptoModuleCall, lowerFsConstantsProperty, lowerBuiltinConstantsProperty, builtinConstantBindingOf, builtinConstantsDestructureDecl, lowerProcessStreamProperty, lowerStringStaticCall, lowerStringLastIndexOfCall, lowerPromiseStaticCall, textCodecBindingClassOf } from "./lower-builtins.js";
+import { builtinImportOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireProgramModuleOf, createRequireSpecOf, stripTypeCasts, lowerBuiltinModuleCall, lowerNodeModuleCall, lowerTimersPromisesSetInterval, lowerFsToUnixTimestampCall, lowerFsLadderCall, lowerChildArgsArg, lowerSpawnSyncCall, lowerSpawnCall, lowerExecFileCall, lowerExecSyncCall, recordToEnvPairs, lowerJsonMethodCall, fencedBuiltinImportOf, lowerCryptoComposedCall, lowerUrlMethodCall, lowerSearchParamsMethodCall, lowerStatsMethodCall, lowerChildMethodCall, lowerAtomicsCall, lowerBuiltinExtraProperty, registerPromisifiedBuiltinDecl, lowerExecFileAsyncCall, execFileAsyncHelper, lowerStringDecoderMethodCall, strdecHelper, lowerReadlineMethodCall, lowerDcChannelMethodCall, lowerDcChannelProperty, lowerAlsMethodCall, lowerDcTracingChannelMethodCall, lowerDcTracingChannelProperty, lowerJsonProperty, lowerErrorCodeProperty, lowerProcessProperty, isProcessEnv, envValueType, lowerProcessEnvGet, lowerProcessMethodCall, lowerProcessOptionalMethodCall, lowerTimeoutMethodCall, envSnapshotHelper, isConsoleLog, consoleCallMember, lowerNumberStaticCall, lowerNumberStaticProperty, lowerDateCall, lowerTextCodecCall, lowerCryptoModuleCall, lowerFsConstantsProperty, lowerBuiltinConstantsProperty, builtinConstantBindingOf, builtinConstantsDestructureDecl, lowerProcessStreamProperty, lowerStringStaticCall, lowerStringLastIndexOfCall, lowerPromiseStaticCall } from "./lower-builtins.js";
 import { fenceFetchObjectAssignment, fenceFetchObjectBinding, fenceStaticAbortControllerMemberRead, fenceStaticHeadersIteration, fenceStaticHeadersMember, fenceStaticReadableStreamMember, fenceStaticResponseMember, fenceUnsupportedFetchConstructorMember, isIslandExpr, islandFuncValueFence, islandRegexpOf, jsvalIn, requireDynamicApi, islandGlobalFnOf, lowerAbortControllerNew, lowerDynamicHeadersIteratorCall, lowerDynamicHeadersSpread, lowerDynamicImportCall, lowerFetchCall, lowerFetchElementMethodCall, lowerResponseNew, lowerStaticFetchCompanionCall, lowerStaticAbortControllerCall, lowerStaticAbortSignalListenerCall, lowerStaticReadableStreamCancelCall, lowerStaticReadableStreamControllerCall, lowerStaticReadableStreamNew, lowerStaticReadableStreamReaderCall, lowerStaticResponseCall, lowerIslandMethodCall, lowerMathProperty, npmPackageOf, npmMemberFence, npmPackageOfSymbol } from "./lower-island.js";
 import { lowerHttpHeadersElement, lowerNetModuleCall, lowerServerMethodCall, lowerServerProperty, lowerTlsRootCertificates } from "./lower-server.js";
 import { lowerDgramDnsModuleCall, lowerDgramMethodCall } from "./lower-dgram.js";
@@ -917,6 +919,7 @@ function jsFallbackFunctionType(lowerer: Lowerer, node: ts.Node, t: ts.Type): Ir
     // `enabled = true`) rather than that call-site type, so recover the
     // syntactic optionality from the parameter declaration.
     const decl = lowerer.checker.valueDeclarationOf(p);
+    mapped = jsOpenObjectType(decl, mapped, lowerer.shapes, lowerer.unions);
     const optional =
       decl !== undefined &&
       ts.isParameter(decl) &&
@@ -1274,6 +1277,10 @@ export class Lowerer {
    * read can be absent at runtime. Bare reads preserve that union until a
    * surrounding JavaScript guard/default consumes it. */
   readonly runtimeOptionalLocals = new Set<IrLocal>();
+  /** An effectful switch test can change the original binding after the
+   * discriminant was captured. A case match narrows the captured value,
+   * not that mutable binding; preserve its tagged representation on reads. */
+  readonly unstableSwitchBindings = new Set<ts.Symbol>();
   /** All storage slots widened for runtime absence, including slots whose
    * current control-flow branch has temporarily narrowed the value. */
   readonly runtimeOptionalStorageLocals = new Set<IrLocal>();
@@ -1677,6 +1684,9 @@ export class Lowerer {
   /** Keyed by program-wide qualified class name (what IR object types carry). */
   readonly classes = new Map<string, ClassInfo>();
   readonly classBySymbol = new Map<ts.Symbol, ClassInfo>();
+  /** Inferred JS methods participating in an override chain keep a vtable
+   * ABI instead of call-site specialization. Filled before class collection. */
+  readonly virtualJsMethods = new WeakSet<ts.MethodDeclaration>();
   /** The class whose members are lowering — `super` binds lexically to it
    * (arrows inside methods lower within this window, so they see it too). */
   currentClass: ClassInfo | null = null;
@@ -1835,7 +1845,7 @@ export class Lowerer {
     frame: Map<ts.Symbol, IrLocal>;
     out: IrStmt[];
   }[] = [];
-  /** Forward-captured consts pre-declared as TDZ boxes, keyed by symbol:
+  /** Forward-captured bindings pre-declared as TDZ boxes, keyed by symbol:
    * lowerVarDecl consumes the entry when the source declaration arrives and
    * emits the initializing `assign` instead of a fresh declaration. */
   readonly tdzPredeclared = new Map<ts.Symbol, IrLocal>();
@@ -3740,7 +3750,7 @@ export class Lowerer {
       this.diags.length > 0
         ? null
         : {
-            irVersion: 11,
+            irVersion: 13,
             sourceFile: this.entry.fileName,
             functions,
             classes: artifacts.classes,
@@ -4624,9 +4634,9 @@ export class Lowerer {
         Segmenter: intlHint,
         DisplayNames: intlHint,
         TextEncoder:
-          "TextEncoder values have no representation — call through a const initialized with new TextEncoder(), or use the composed new TextEncoder().encode(s) form",
+          "TextEncoder instances support encode(string) and encode(); other codec operations require a dedicated lowering",
         TextDecoder:
-          "TextDecoder values have no representation — call through a const initialized with a recognized literal label, or use the composed new TextDecoder(<literal label>).decode(bytes) form",
+          "TextDecoder instances support recognized literal labels with default options and whole-buffer decode(Uint8Array); runtime labels and options remain unsupported",
       };
       this.pushDiag(
         noLoweringDiag(this.checker.typeToString(type), locOf(node), typeHints[stdlibOwnSym?.name ?? ""]),
@@ -4966,6 +4976,9 @@ export class Lowerer {
 
   irTypeOf(node: ts.Node): IrType {
     const t = this.typeOf(node);
+    // JS inference can leave mutable fields, accessor parameters and
+    // locals at undefined. They still carry values; void has no storage.
+    if (isJsSourceFile(node.getSourceFile()) && (t.flags & ts.TypeFlags.Undefined) !== 0) return DYN;
     // A never-tainted JS type (neverTaintedJsType) maps — never rides as
     // f64 — but must not: pre-empt the mapping so the JS fallback below
     // answers instead.
@@ -4986,7 +4999,7 @@ export class Lowerer {
       if (dyn) return dyn;
       this.badType(node, t);
     }
-    return mapped;
+    return jsOpenObjectType(node, mapped, this.shapes, this.unions);
   }
 
   /** Exact-shape enforcement (SC2002). Records are monomorphic structs, so
@@ -5231,9 +5244,6 @@ export class Lowerer {
       return { kind: "promiseVoidWiden", value: expr, type: expected, loc: expr.loc };
     }
     if (expected.kind === "dyn" && expr.type.kind !== "dyn") {
-      if (expr.kind === "unitLit" || this.dynConvertible(expr.type)) {
-        return { kind: "dynFrom", value: expr, type: DYN, loc: expr.loc };
-      }
       // An error-HIERARCHY object (builtin subclass or user `extends
       // Error` class) upcasts to the %Error root first — the caughtToDyn
       // encoding (scr_dyn_from_error) carries name/message/code and the
@@ -5248,6 +5258,9 @@ export class Lowerer {
           type: DYN,
           loc: expr.loc,
         };
+      }
+      if (expr.kind === "unitLit" || this.dynConvertible(expr.type)) {
+        return { kind: "dynFrom", value: expr, type: DYN, loc: expr.loc };
       }
       return expr;
     }
@@ -5289,7 +5302,7 @@ export class Lowerer {
         expected.kind === "func" &&
         canAdaptDynFuncTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id));
       const handleOk = DYN_HANDLE_KINDS.has(expected.kind);
-      if (this.jsonSafe(expected) || undefArmedOk || bytesOk || errorOk || classOk || funcOk || handleOk) {
+      if (canDynCheckTo(expected, (id) => this.shapes.get(id), (id) => this.unions.get(id)) || undefArmedOk || bytesOk || errorOk || classOk || funcOk || handleOk) {
         return { kind: "dynCheck", value: expr, type: expected, loc: expr.loc };
       }
       return expr;
@@ -7729,6 +7742,23 @@ export class Lowerer {
    * lowering goes through here (via lowerExprExpecting) or calls this
    * directly when the expression was already lowered. */
   coerceInto(node: ts.Node, expr: IrExpr, expected: IrType): IrExpr {
+    if (expected.kind === "dyn") {
+      const contextual = this.checker.getContextualType(node);
+      const parts = contextual?.isUnionType() ? ts.constituentTypes(contextual) : contextual ? [contextual] : [];
+      const errorOptions = parts.some((part) => {
+        const sym = part.getAliasSymbol() ?? part.getSymbol();
+        return sym?.name === "ErrorOptions" && this.isStdlibSymbol(sym);
+      });
+      if (errorOptions) {
+        const actual = this.typeOf(node);
+        for (const part of actual.isUnionType() ? ts.constituentTypes(actual) : [actual]) {
+          const cause = this.checker.getPropertyOfType(part, "cause");
+          if (cause && cause.flags & (ts.SymbolFlags.GetAccessor | ts.SymbolFlags.SetAccessor)) {
+            this.unsupported("SC1090", node, "Error options with a cause accessor (use a data property)");
+          }
+        }
+      }
+    }
     let e = this.coerceToExpected(expr, expected);
     // An 'any' value PROVABLY null/undefined (the unit literal itself, or
     // a read of a binding nothing ever assigns a non-unit value) flowing
@@ -7853,51 +7883,116 @@ export class Lowerer {
     return [...units].sort().join(" or ");
   }
 
-  /** Lowers an expression that flows into a slot of a known expected type,
-   * then applies the coercion path (coerceInto). An EMPTY array literal
-   * takes the slot's array type directly — the caller-supplied `expected`
-   * lowerArrayLiteral documents, for the positions where tsc's contextual
-   * API answers nothing (binding-element defaults: `{ json = [] }`) and
-   * the literal's own never[] would build the f64 representation. */
+  /** A key conversion may rebox or upcast a reference, but must never copy
+   * its referent. Apply the ordinary checked narrowing to absent arms from
+   * runtime-optional reads; only present reference arms participate here. */
+  lowerCollectionKey(node: ts.Expression, expected: IrType): IrExpr {
+    if (expected.kind === "dyn") {
+      const value = this.lowerExprExpecting(node, expected);
+      // An adapting promise changes identity, while the Error boundary
+      // snapshots mutable fields. Neither is a live collection reference.
+      const copiesReference = (type: IrType): boolean =>
+        (type.kind === "promise" && type.inner.kind !== "dyn") ||
+        (type.kind === "object" && (RUNTIME_ERROR_CLASSES.has(type.className) || this.isSubclassOf(type.className, "%Error"))) ||
+        (type.kind === "union" && (this.unions.get(type.unionId)?.arms.some(copiesReference) ?? false));
+      if (value.kind === "dynFrom" && copiesReference(value.value.type)) {
+        this.noLowering("collection slot conversion requiring an Error snapshot or promise adapter", node,
+          "use a collection with the original reference type; checked collection slots require identity-preserving conversions");
+      }
+      // Collections expose the stored reference again. Preserve records,
+      // arrays and byte views rather than taking the ordinary dyn snapshot.
+      const hasLiveReference = (type: IrType): boolean =>
+        type.kind === "record" || type.kind === "array" || type.kind === "bytes" ||
+        (type.kind === "union" && (this.unions.get(type.unionId)?.arms.some(hasLiveReference) ?? false));
+      if (value.kind === "dynFrom" && hasLiveReference(value.value.type)) {
+        return { ...value, liveRef: true };
+      }
+      return value;
+    }
+    let literal = node;
+    while (ts.isParenthesizedExpression(literal)) literal = literal.expression;
+    // Fresh literals have no previous outer identity to preserve. Build them
+    // for their storage layout, just as ordinary contextual literals do.
+    if (ts.isObjectLiteralExpression(literal) || ts.isArrayLiteralExpression(literal) || expected.kind === "f64" || expected.kind === "string") {
+      return this.lowerExprExpecting(node, expected);
+    }
+    // Assertions can perform their own conversion before slot coercion.
+    // Inspect the assertion chain so a width copy cannot hide behind its
+    // already-converted result type. Union-arm checks only unwrap a box.
+    let asserted = literal;
+    while (ts.isAsExpression(asserted) || ts.isTypeAssertion(asserted) || ts.isNonNullExpression(asserted) || ts.isParenthesizedExpression(asserted)) {
+      if (ts.isAsExpression(asserted) || ts.isTypeAssertion(asserted)) {
+        const from = this.mapTypeOf(this.typeOf(asserted.expression));
+        const to = this.mapTypeOf(this.checker.getTypeFromTypeNode(asserted.type));
+        if (from?.kind === "dyn" || from?.kind === "jsval" || (from?.kind === "record" && to?.kind === "record" && !typeEquals(from, to))) {
+          this.noLowering("collection key assertion requiring a structural copy or dynamic conversion", asserted,
+            "use the original reference with the same type as the collection key");
+        }
+      }
+      asserted = asserted.expression;
+    }
+    const value = this.lowerExpr(node);
+    const source = (value.type.kind === "union" ? this.unions.get(value.type.unionId)?.arms ?? [] : [value.type]).filter((type) => !isUnitType(type));
+    const target = expected.kind === "union" ? this.unions.get(expected.unionId)?.arms ?? [] : [expected];
+    const preservesIdentity = source.length > 0 && source.every((from) => target.some((to) =>
+      typeEquals(from, to) || (from.kind === "object" && to.kind === "object" && this.isSubclassOf(from.className, to.className))));
+    if (!preservesIdentity || value.kind === "dynCheck" || value.kind === "jsExit") {
+      this.noLowering(`collection key conversion from '${this.fmt(value.type)}' to '${this.fmt(expected)}' requiring a structural copy or dynamic conversion`, node,
+        "use the same reference type for the key and collection; copying a key would change its identity");
+    }
+    return this.coerceInto(node, value, expected);
+  }
+
+  /** Lower for a known destination, then apply ordinary value coercion.
+   * Fresh arrays and records use the destination layout directly. */
   lowerExprExpecting(node: ts.Expression, expected: IrType | undefined): IrExpr {
     if (expected?.kind === "array") {
       let x: ts.Expression = node;
       while (ts.isParenthesizedExpression(x)) x = x.expression;
-      if (ts.isArrayLiteralExpression(x) && x.elements.length === 0) {
+      // Fresh arrays are built for the actual destination, including
+      // nested literals whose checker context names a wider recursive
+      // union. Existing arrays still go through ordinary value coercion.
+      if (ts.isArrayLiteralExpression(x)) {
         return this.coerceInto(node, this.lowerArrayLiteral(x, expected), expected);
+      }
+    }
+    if (expected?.kind === "record") {
+      let x = node;
+      while (ts.isParenthesizedExpression(x)) x = x.expression;
+      if (ts.isObjectLiteralExpression(x)) {
+        return this.coerceInto(node, this.lowerObjectLiteral(x, expected), expected);
       }
     }
     // An OBJECT LITERAL against a checked-dynamic slot in a JS file (the
     // getSupportInfo options argument — a dyn-ABI param), or against the
-    // standard RequestInit type in TypeScript: the value's world IS the
+    // standard RequestInit/ErrorOptions types in TypeScript: the value's world IS the
     // checked-dynamic tree — build the dyn literal directly.
     if (expected?.kind === "dyn") {
       let x: ts.Expression = node;
       while (ts.isParenthesizedExpression(x)) x = x.expression;
+      const contextual = this.checker.getContextualType(x);
+      const widened = contextual ? this.checker.getBaseTypeOfLiteralType(contextual) : undefined;
+      const parts = widened?.isUnionType() ? ts.constituentTypes(widened) : widened ? [widened] : [];
+      const builtinOption = (name: string): boolean => parts.some((part) => {
+        const sym = part.getAliasSymbol() ?? part.getSymbol();
+        return sym?.name === name && this.isStdlibSymbol(sym);
+      });
       if (ts.isObjectLiteralExpression(x)) {
-        const contextual = this.checker.getContextualType(x);
-        const widened = contextual
-          ? this.checker.getBaseTypeOfLiteralType(contextual)
-          : undefined;
-        const sym = widened?.getAliasSymbol() ?? widened?.getSymbol();
-        const requestInit =
-          sym?.name === "RequestInit" && this.isStdlibSymbol(sym);
-        if (isJsSourceFile(x.getSourceFile()) || requestInit) {
+        if (isJsSourceFile(x.getSourceFile()) || builtinOption("RequestInit") || builtinOption("ErrorOptions")) {
           return lowerDynObjectLiteral(this, x);
         }
       }
     }
-    // An ARRAY LITERAL against a UNION slot whose own type has no static
-    // home (the JS dyn fallback — the checker gave no usable context):
-    // when the union has exactly ONE array-family arm — an array, or an
-    // arity-matching tuple (the option-table `default: [{ value: [] }]`
-    // shape) — build AS that arm and wrap; the IR-directed twin of
-    // lowerArrayLiteral's contextual-union rule.
+    // A fresh array can use the unique array-family destination inside a
+    // union too. In nullable recursive fields the checker can report the
+    // whole union as context: an identity lift of that context does not
+    // mean the literal's independently inferred element layout fits.
+    // Construct the elements for the selected arm before wrapping it.
+    // Multiple eligible arms retain the ordinary ambiguity rules.
     if (expected?.kind === "union") {
       let x: ts.Expression = node;
       while (ts.isParenthesizedExpression(x)) x = x.expression;
       if (ts.isArrayLiteralExpression(x)) {
-        const own = this.mapTypeOf(this.checker.getContextualType(x) ?? this.typeOf(x));
         // Elements beyond bare null/undefined literals can never live in
         // a unit-only-element array — a checker type that degraded to one
         // (`[]`-flavored inference over a populated literal) carries no
@@ -7908,25 +8003,19 @@ export class Lowerer {
             el.kind !== ts.SyntaxKind.NullKeyword &&
             !(ts.isIdentifier(el) && el.text === "undefined"),
         );
-        if (
-          own === null || own.kind === "dyn" || own.kind === "jsval" ||
-          (own.kind === "array" && nonUnitElems && this.unitOnlyElem(own.elem)) ||
-          this.widthLiftPlan(own, expected) === null
-        ) {
-          const def = this.unions.get(expected.unionId);
-          const arms = (def?.arms ?? []).filter(
-            (a) =>
-              (a.kind === "array" && !(nonUnitElems && this.unitOnlyElem(a.elem))) ||
-              (a.kind === "record" &&
-                !!this.shapes.get(a.shapeId)?.tuple &&
-                this.shapes.get(a.shapeId)!.fields.length === x.elements.length &&
-                !x.elements.some(ts.isSpreadElement)),
-          );
-          if (arms.length === 1) {
-            const arm = arms[0]!;
-            const built = this.lowerArrayLiteral(x, arm as IrType & { kind: "array" } | (IrType & { kind: "record" }));
-            return this.coerceInto(node, built, expected);
-          }
+        const def = this.unions.get(expected.unionId);
+        const arms = (def?.arms ?? []).filter(
+          (a) =>
+            (a.kind === "array" && !(nonUnitElems && this.unitOnlyElem(a.elem))) ||
+            (a.kind === "record" &&
+              !!this.shapes.get(a.shapeId)?.tuple &&
+              this.shapes.get(a.shapeId)!.fields.length === x.elements.length &&
+              !x.elements.some(ts.isSpreadElement)),
+        );
+        if (arms.length === 1) {
+          const arm = arms[0]!;
+          const built = this.lowerArrayLiteral(x, arm as IrType & { kind: "array" } | (IrType & { kind: "record" }));
+          return this.coerceInto(node, built, expected);
         }
       }
     }
@@ -8346,7 +8435,7 @@ export class Lowerer {
   /* ── the class graph (single inheritance) ─────────────────────────── */
 
   findMethodOn(info: ClassInfo | null,
-    name: string,): { declarer: ClassInfo; sig: { params: ParamShape[]; ret: IrType; abstract?: true; async?: true } } | null {
+    name: string,): { declarer: ClassInfo; sig: { params: ParamShape[]; ret: IrType; abstract?: true; async?: true; gen?: NonNullable<IrFunction["generator"]> } } | null {
     return findMethodOn(this, info, name);
   }
 
@@ -8569,7 +8658,7 @@ export class Lowerer {
     const ctx = this.ctx;
     const count = ctx.localCounters.get(name) ?? 0;
     ctx.localCounters.set(name, count + 1);
-    const local: IrLocal = { id: `${name}.${count}`, name, type, mutable };
+    const local: IrLocal = { id: `${name}.${count}`, name, type, mutable, source: bindingSource(nameNode) };
     ctx.locals.push(local);
     const symbol = this.checker.getSymbolAtLocation(nameNode);
     if (symbol) ctx.scopes[ctx.scopes.length - 1]!.set(symbol, local);
@@ -8654,6 +8743,16 @@ export class Lowerer {
             const pickedT = abi;
             srcType = pickedT;
             srcRef = () => ({ kind: "varRef", localId: src.id, type: pickedT, loc });
+            // An empty object pattern still rejects null after applying
+            // the default. With no property reads, nothing else performs
+            // RequireObjectCoercible; use V8's default-expression spelling.
+            if (abi.kind === "dyn" && ts.isObjectBindingPattern(decl.name) && decl.name.elements.length === 0) {
+              prologue.push({
+                kind: "exprStmt",
+                expr: { kind: "dynDestrCheck", value: srcRef(), spelling: "(intermediate value)(intermediate value)(intermediate value)", type: DYN, loc },
+                loc,
+              });
+            }
             this.lowerBindingPattern(decl.name, srcRef, srcType, true, prologue);
             return;
           }
@@ -8942,6 +9041,7 @@ export class Lowerer {
             type: origin.type,
             mutable: origin.mutable,
             boxed: true,
+            ...(origin.source ? { source: origin.source } : {}),
             // TDZ travels with the binding: reads through ANY capture of a
             // forward-captured const must trap while the box is empty.
             ...(origin.tdz ? { tdz: true as const } : {}),
@@ -9035,24 +9135,6 @@ export class Lowerer {
     // binding-form text.
     if (symbol) {
       const d = this.checker.valueDeclarationOf(symbol);
-      if (
-        d && ts.isVariableDeclaration(d) && ts.isVariableDeclarationList(d.parent) &&
-        (d.parent.flags & ts.NodeFlags.Const) !== 0
-      ) {
-        const codec = textCodecBindingClassOf(this, d.name, d.initializer);
-        if (codec !== null) {
-          const call = codec === "TextEncoder" ? `${name}.encode(s)` : `${name}.decode(bytes)`;
-          const composed =
-            codec === "TextEncoder"
-              ? "new TextEncoder().encode(s)"
-              : "new TextDecoder().decode(bytes)";
-          this.noLowering(
-            `${codec} instance stored in ${name}`,
-            node,
-            `${call} compiles through this const; the codec object itself has no representation (the composed ${composed} form also compiles)`,
-          );
-        }
-      }
       if (d && ts.isVariableDeclaration(d) && d.initializer === undefined) {
         const t = this.checker.getTypeOfSymbol(symbol);
         const parts = t.isUnionType() ? ts.constituentTypes(t) : [t];
@@ -9454,8 +9536,8 @@ export class Lowerer {
     return lowerArrayLiteral(this, expr, expected);
   }
 
-  lowerObjectLiteral(expr: ts.ObjectLiteralExpression): IrExpr {
-    return lowerObjectLiteral(this, expr);
+  lowerObjectLiteral(expr: ts.ObjectLiteralExpression, expected?: IrType & { kind: "record" }): IrExpr {
+    return lowerObjectLiteral(this, expr, expected);
   }
 
   lowerShorthandValue(prop: ts.ShorthandPropertyAssignment): IrExpr {
@@ -9830,8 +9912,8 @@ export class Lowerer {
     return lowerFieldCompound(this, access, op, rhsNode, loc);
   }
 
-  errorMessageArg(args: readonly ts.Expression[], loc: SrcLoc, blame: ts.Node): IrExpr {
-    return errorMessageArg(this, args, loc, blame);
+  errorConstructorArgs(args: readonly ts.Expression[], loc: SrcLoc, blame: ts.Node): IrExpr[] {
+    return errorConstructorArgs(this, args, loc, blame);
   }
 
   inheritsBuiltinErrorCtor(info: ClassInfo): boolean {

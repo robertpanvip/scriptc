@@ -7,19 +7,20 @@ import { InternalCompilerError } from "../../errors.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { BOOL, DATE_T, DYN, F64, bytesOf, IrClassDef, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, JSVAL, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, STRING, SrcLoc, UNDEFINED_T, URL_T, VOID, arrayOf, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, typeEquals } from "../../ir/ir.js";
-import { MAX_GENERIC_INSTANCES, appendImplicitUndefinedReturn, generatorMeta, genericCallInstance, implicitAnyParamSymbolsOf, implicitCallInstance, implicitMonoFile, omittedArgFor, type GenericFnInfo, type ParamShape } from "./lower-calls.js";
-import { isGenericCallableMemberType, typeKey } from "../type-mapper.js";
+import { MAX_GENERIC_INSTANCES, appendImplicitUndefinedReturn, bodyReadsArguments, generatorMeta, genericCallInstance, implicitAnyParamSymbolsOf, implicitCallInstance, implicitMonoFile, omittedArgFor, type GenericFnInfo, type ParamShape } from "./lower-calls.js";
+import { isGenericCallableMemberType, jsOpenObjectType, typeKey } from "../type-mapper.js";
 import { cjsClassExprWholeExportOf, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeTypesPath, locOf } from "../program.js";
 import { PoisonError, dynFallbackType, dynUndefinedExpr, newFnCtx, own } from "./lowerer.js";
-import { lowerArrayConstructor, lowerMapSeedArrayNew } from "./lower-containers.js";
+import { lowerArrayConstructor, lowerMapSeedArrayNew, strCharsCall } from "./lower-containers.js";
 import { bufEncoding } from "./containers/bytes.js";
 import { isSafeToRepeat } from "./expressions/evaluation-safety.js";
-import { lowerSearchParamsNew } from "./lower-builtins.js";
+import { lowerSearchParamsNew, lowerTextCodecNew } from "./lower-builtins.js";
 import { requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { STREAM_API_MEMBERS, STREAM_PROP_MEMBERS, UNDERSCORE_METHODS, lowerStreamNew, lowerStreamSuperCall, streamCtorShape } from "./lower-stream.js";
 import { emitOverrideShapeReason, emitSpecSuperForward, emitterRooted, lowerEmitterSuperCall, type EmitOverrideRec } from "./lower-event-emitter.js";
 import { declSymbolOf } from "./lower-modules.js";
-import { uniqueSymbolKeyOf } from "./lower-exprs.js";
+import { classSymbolKeyOf, classSymbolKeyOfSymbol, symbolFieldDisplayName } from "./symbol-fields.js";
+import { builtinFenceHintOf } from "./surfaces.js";
 import { lowerHttpAgentNew, lowerHttpServerNew } from "./lower-server.js";
 import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUndefinedFnSymbolOf, fenceEarlyAliasUse, fenceEarlyNsMemberRef, nsMemberIdentOf, nsUndefRead } from "./lower-namespaces.js";
 import { mixinResultBindingClassOf, type MixinInstanceInfo } from "./lower-mixins.js";
@@ -34,7 +35,17 @@ export interface ClassInfo {
   /** OWN fields only (declaration order) with their initializers: the
    * class's constructor runs exactly these — inherited fields initialize in
    * the base constructor, before/via super(). */
-  fieldOrder: { name: string; type: IrType; initializer: ts.Expression | undefined; /** Redeclared INHERITED field: the initializer assigns the base slot at this position; no new slot (def.fields excludes it). */ redeclared?: true }[];
+  fieldOrder: {
+    name: string;
+    type: IrType;
+    initializer: ts.Expression | undefined;
+    /** A bare JS dyn field defines undefined at its declaration position,
+     * even if an earlier initializer or base constructor wrote the slot. */
+    undefinedInitializer?: SrcLoc;
+    /** Redeclared field: initialize the existing slot at this position;
+     * no new slot (def.fields excludes it). */
+    redeclared?: true;
+  }[];
   /** OWN declared methods only — inherited lookups walk the base chain
    * (findMethodOn). An `abstract` entry is a signature with no body (and
    * no module function): it declares the vtable slot; concrete subclasses
@@ -44,9 +55,8 @@ export interface ClassInfo {
    * inherited private name are fenced at collection, and tsc confines
    * every access site to the declaring class's body, so the base-chain
    * walk IS lexical resolution and privates never join vtables (JS's
-   * no-dynamic-dispatch semantics by construction). A `gen` entry is a
-   * #private GENERATOR method: the body is a generator IrFunction and
-   * calls enter through its gen-spawn wrapper. */
+   * no-dynamic-dispatch semantics by construction). A `gen` entry has a
+   * generator body whose direct calls enter through its spawn wrapper. */
   methods: Map<string, { params: ParamShape[]; ret: IrType; abstract?: true; async?: true; gen?: NonNullable<IrFunction["generator"]> }>;
   /** OWN GENERIC instance methods (own type parameters — `m<T>(x: T)`),
    * monomorphized per call site like top-level generic functions: instance
@@ -147,14 +157,13 @@ export interface ClassInfo {
    * constructor value — no value form here) fences at collection. Absent on
    * builtin classes and classes without blocks. */
   staticBlocks?: ts.ClassStaticBlockDeclaration[];
-  /** SYMBOL-KEYED fields (`this[kLimit] = v` where kLimit is a module-level
-   * `const k = Symbol(...)`): the key's unique-symbol identity is a
-   * compile-time constant, so each key resolves to an ORDINARY hidden slot
-   * in the static layout — no runtime symbol table exists. The map goes
-   * key-symbol → layout field name (`Symbol(limit)`, Node's inspect
-   * spelling); inherited entries are seeded from the base like `fields`.
+  /** SYMBOL-KEYED fields with stable module-level Symbol()/Symbol.for()
+   * keys: each identity resolves to an ordinary hidden slot in the static
+   * layout. Registry keys share one identity across declarations. The map
+   * goes key identity → reserved layout field name; inspect recovers the
+   * Symbol(limit) spelling. Inherited entries are seeded from the base.
    * Absent on builtin classes and classes with no symbol-keyed fields. */
-  symbolFields?: Map<ts.Symbol, string>;
+  symbolFields?: Map<ts.Symbol | string, string>;
   /** GENERIC class FAMILY (`class Box<T>` itself): the synthetic,
    * never-constructed ancestor every instantiation extends. It owns what
    * JS's one runtime `Box` owns — the statics (one storage location for
@@ -286,7 +295,7 @@ export interface GenericClassInfo {
   function symbolSlotReturnType(
     lowerer: Lowerer,
     fnLike: ts.MethodDeclaration,
-    symbolFields: ReadonlyMap<ts.Symbol, string>,
+    symbolFields: ReadonlyMap<ts.Symbol | string, string>,
     fields: ReadonlyMap<string, IrType>,
   ): IrType | null {
     if (symbolFields.size === 0) return null;
@@ -310,8 +319,8 @@ export interface GenericClassInfo {
       while (e !== undefined && ts.isParenthesizedExpression(e)) e = e.expression;
       if (e === undefined || !ts.isElementAccessExpression(e)) return null;
       if (e.expression.kind !== ts.SyntaxKind.ThisKeyword) return null;
-      const key = uniqueSymbolKeyOf(lowerer, e.argumentExpression);
-      const fieldName = key ? symbolFields.get(key.sym) : undefined;
+      const key = classSymbolKeyOf(lowerer, e.argumentExpression);
+      const fieldName = key ? symbolFields.get(key.identity) : undefined;
       const t = fieldName !== undefined ? fields.get(fieldName) : undefined;
       if (t === undefined || t.kind === "dyn") return null;
       if (out !== null && !typeEquals(out, t)) return null;
@@ -320,7 +329,7 @@ export interface GenericClassInfo {
     return out;
   }
 
-/** The builtin Error hierarchy (Error + TypeError/RangeError/SyntaxError)
+/** The builtin Error hierarchy
    * as eagerly-registered ClassInfos: mapType names them the moment a lib
    * Error type appears, so the infos must exist before any lowering. They
    * are runtime-provided — no decl, no lowerable bodies; `new`/super()/
@@ -343,11 +352,13 @@ export interface GenericClassInfo {
           // subclass declaring its own `code` field lays out AFTER it,
           // never colliding), and it is NOT in the fields map below: the
           // READ has its own `string | undefined` lowering (error.code),
-          // never a plain-string field access.
+          // never a plain-string field access. `%cause` is the following
+          // owned dyn slot; NULL means absent, dyn undefined means present.
           fields: [
             { name: "name", type: STRING },
             { name: "message", type: STRING },
             { name: "%code", type: STRING },
+            { name: "%cause", type: DYN },
           ],
           loc,
         },
@@ -365,10 +376,9 @@ export interface GenericClassInfo {
         decl: null,
         builtinError: true,
         ctor: null,
-        // Display shape of `new Error(message?)`. Construction and super()
-        // never complete against this — errorMessageArg owns those (the
-        // runtime ABI is one plain string; "" when omitted, like Node).
-        ctorParams: [{ type: STRING, mode: "omittable" }],
+        // Inherited constructors forward both raw arguments. The runtime
+        // applies the undefined message default and InstallErrorCause.
+        ctorParams: [{ type: DYN, mode: "omittable" }, { type: DYN, mode: "omittable" }],
         base,
         subclasses: [],
         throwingSetters: [],
@@ -754,7 +764,7 @@ function inferredEmptyCollectionFieldType(
     if (collection === "Map" && node.expression.name.text === "set" && node.arguments.length === 2) {
       const key = mappedArgument(node.arguments[0]!);
       const value = mappedArgument(node.arguments[1]!);
-      if (key !== null && value !== null && isSupportedMapKey(key) && isSupportedMapValue(value)) {
+      if (key !== null && value !== null && isSupportedMapKey(key, key.kind === "union" ? lowerer.unions.get(key.unionId)?.arms : undefined) && isSupportedMapValue(value)) {
         mapKeys.push(key);
         mapValues.push(value);
       }
@@ -765,7 +775,7 @@ function inferredEmptyCollectionFieldType(
       node.arguments.length === 1
     ) {
       const element = mappedArgument(node.arguments[0]!);
-      if (element !== null && isSupportedSetElem(element)) setElements.push(element);
+      if (element !== null && isSupportedSetElem(element, element.kind === "union" ? lowerer.unions.get(element.unionId)?.arms : undefined)) setElements.push(element);
     }
     return undefined;
   };
@@ -1167,7 +1177,11 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
       }
 
       const fields = new Map<string, IrType>(base ? base.fields : []);
-      const symbolFields = new Map<ts.Symbol, string>(base?.symbolFields ?? []);
+      const errorRooted = (() => {
+        for (let c = base; c; c = c.base) if (c.builtinError) return true;
+        return false;
+      })();
+      const symbolFields = new Map<ts.Symbol | string, string>(base?.symbolFields ?? []);
       const fieldOrder: ClassInfo["fieldOrder"] = [];
       const methods = new Map<string, { params: ParamShape[]; ret: IrType; abstract?: true; async?: true; gen?: NonNullable<IrFunction["generator"]> }>();
       // Own accessor declarations ("get:x"/"set:x" → node), for the
@@ -1294,7 +1308,7 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
           ) {
             const type = lowerer.irTypeOf(member.name);
             if (type.kind === "void") lowerer.badType(member.name, lowerer.typeOf(member.name));
-            if (type.kind === "dyn") {
+            if (type.kind === "dyn" && !isJsSourceFile(member.getSourceFile())) {
               lowerer.unsupported("SC1090", member.name, "'unknown'-typed static fields");
             }
             staticFields.push({
@@ -1312,10 +1326,12 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
             ts.isMethodDeclaration(member) &&
             (ts.isIdentifier(member.name) || ts.isPrivateIdentifier(member.name)) &&
             member.body &&
-            member.typeParameters === undefined &&
-            member.asteriskToken === undefined
+            member.typeParameters === undefined
           ) {
             const { shapes, funcType: ft } = lowerer.lambdaSignature(member);
+            if (member.asteriskToken !== undefined && ft.ret.kind !== "generator") {
+              lowerer.badType(member.name, lowerer.typeOf(member.name));
+            }
             staticMethods.set(member.name.text, { params: shapes, ret: ft.ret, member });
           }
           // GENERIC static methods monomorphize like top-level generic
@@ -1346,6 +1362,10 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
         // 7's ClassElement base carries no `name`; read it structurally
         // (every named member kind stores a PropertyName there).
         const memberName = (member as { name?: ts.PropertyName }).name;
+        if (errorRooted && memberName && classMemberNameOf(lowerer, memberName) === "cause") {
+          lowerer.unsupported("SC1090", memberName,
+            "redeclaring Error.cause (pass the cause in the Error constructor options)");
+        }
         // #PRIVATE members compile: their names ('#m') are unspellable by
         // any public identifier, so they ride the ordinary fields/methods
         // maps collision-free — with the base-chain walks doubling as
@@ -1481,6 +1501,32 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
             // get/set pair — declare the field and accessors explicitly.
             lowerer.unsupported("SC1090", member, "auto-accessor fields ('accessor x')");
           }
+          if (ts.isComputedPropertyName(member.name)) {
+            const key = classSymbolKeyOf(lowerer, member.name.expression);
+            if (!key || !member.initializer) {
+              lowerer.unsupported("SC1090", member, "computed class fields without an initializer and a stable module-level literal Symbol()/Symbol.for() key");
+            }
+            const declared = lowerer.typeOf(member);
+            const inferred = member.type ? declared : lowerer.checker.getBaseTypeOfLiteralType(lowerer.typeOf(member.initializer));
+            const mapped = lowerer.mapTypeOf(inferred);
+            const type = mapped ? jsOpenObjectType(member, mapped, lowerer.shapes, lowerer.unions) : null;
+            if (!type || type.kind === "void" || (type.kind === "dyn" && !isJsSourceFile(member.getSourceFile()))) lowerer.badType(member, inferred);
+            const previous = fields.get(key.fieldName);
+            if (previous) {
+              if (!symbolFields.has(key.identity)) {
+                lowerer.unsupported("SC1090", member.name, `distinct keys sharing the printable name '${symbolFieldDisplayName(key.fieldName)}' in one class`);
+              }
+              if (!typeEquals(previous, type)) {
+                lowerer.unsupported("SC1090", member.name, "redeclaring symbol-keyed fields at a different type");
+              }
+              fieldOrder.push({ name: key.fieldName, type, initializer: member.initializer, redeclared: true });
+            } else {
+              fields.set(key.fieldName, type);
+              fieldOrder.push({ name: key.fieldName, type, initializer: member.initializer });
+            }
+            symbolFields.set(key.identity, key.fieldName);
+            continue;
+          }
           // #private fields ride the ordinary field machinery — the '#'
           // name is unspellable publicly, so the slot never collides, and
           // enumeration surfaces (inspect) exclude it like Node.
@@ -1538,11 +1584,15 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
           // the ordinary undefined-armed union machinery.
           const type = lowerer.irTypeOf(member.name);
           if (type.kind === "void") lowerer.badType(member.name, lowerer.typeOf(member.name));
-          // dyn stays out of class fields (KEEP NARROW; record
-          // fields and array elements are unmappable via mapType already).
-          if (type.kind === "dyn") {
+          // Bundled JS declares fields without annotations before assigning
+          // them in the constructor. Use the same native checked-dynamic
+          // storage as implicit constructor-assigned JS fields.
+          if (type.kind === "dyn" && !isJsSourceFile(member.getSourceFile())) {
             lowerer.unsupported("SC1090", member.name, "'unknown'-typed class fields");
           }
+          const undefinedInitializer = type.kind === "dyn" && !member.initializer
+            ? { undefinedInitializer: locOf(member) }
+            : {};
           if (fields.has(member.name.text)) {
             // REDECLARING an inherited field: Node [[Define]]s the OWN
             // property again when THIS class's field initializers run
@@ -1552,13 +1602,12 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
             // slot, no new slot, no layout change (the `class
             // ConfigError extends Error { name = "ConfigError" }`; the
             // builtin Error prefix included — reads, toString, and throw
-            // reports all answer the overwritten name like Node). A BARE
-            // redeclare writes undefined in Node (`class B extends A
-            // { x; }` reads undefined!) and a type-changing redeclare has
-            // no single slot type — both keep the fence.
+            // reports all answer the overwritten name like Node). A bare
+            // JS dyn redeclaration resets the existing slot to undefined.
+            // Other bare or type-changing redeclarations keep the fence.
             const baseType = fields.get(member.name.text)!;
-            if (member.initializer && typeEquals(type, baseType)) {
-              fieldOrder.push({ name: member.name.text, type, initializer: member.initializer, redeclared: true });
+            if ((member.initializer || type.kind === "dyn") && typeEquals(type, baseType)) {
+              fieldOrder.push({ name: member.name.text, type, initializer: member.initializer, ...undefinedInitializer, redeclared: true });
               continue;
             }
             lowerer.unsupported(
@@ -1588,7 +1637,7 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
           const admitsUndefined =
             (type.kind === "union" &&
               (lowerer.unions.get(type.unionId)?.arms.some((a) => a.kind === "undefinedT") ?? false)) ||
-            type.kind === "jsval";
+            type.kind === "jsval" || type.kind === "dyn";
           if (!member.initializer && !admitsUndefined) {
             const opts = lowerer.program.getCompilerOptions();
             const spi = opts.strictPropertyInitialization ?? opts.strict ?? false;
@@ -1607,7 +1656,7 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
             }
           }
           fields.set(member.name.text, type);
-          fieldOrder.push({ name: member.name.text, type, initializer: member.initializer });
+          fieldOrder.push({ name: member.name.text, type, initializer: member.initializer, ...undefinedInitializer });
         } else if (ts.isConstructorDeclaration(member)) {
           // A body-less constructor is an OVERLOAD SIGNATURE: type-world,
           // lowers to nothing — tsc resolved each `new` against the
@@ -1650,6 +1699,10 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
               lowerer.unsupported("SC1090", p, "this parameter property form");
             }
             const name = (p.name as ts.Identifier).text;
+            if (errorRooted && name === "cause") {
+              lowerer.unsupported("SC1090", p.name,
+                "redeclaring Error.cause (pass the cause in the Error constructor options)");
+            }
             const shape = lowerer.paramShape(p);
             const type = shape.bodyType ?? shape.type;
             if (type.kind === "void") lowerer.badType(p.name, lowerer.typeOf(p.name));
@@ -1671,20 +1724,9 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
         } else if (ts.isMethodDeclaration(member)) {
           const mName = classMemberNameOf(lowerer, member.name);
           if (mName === null) lowerer.unsupported("SC1090", member, "computed method names");
-          // Sync PUBLIC generator methods stay fenced because virtualCall
-          // dispatch cannot hold spawn wrappers. Async generator methods
-          // use the existing static async-method dispatch discipline;
-          // overrides fence below. #private generators are always direct.
-          const asyncGenerator =
-            member.asteriskToken !== undefined &&
-            member.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) === true;
-          if (member.asteriskToken !== undefined && !asyncGenerator && !ts.isPrivateIdentifier(member.name)) {
-            lowerer.unsupported(
-              "SC1071",
-              member,
-              "generator methods (a #private generator method compiles — privates never dispatch dynamically; or declare a module-level function* and call it from the method)",
-            );
-          }
+          // Generator calls use their spawn wrapper. Public methods are
+          // direct calls only when no subclass overrides the method;
+          // override chains involving generators fence below.
           // An ABSTRACT method is a signature with no body — type-world,
           // except that it declares the vtable slot: calls through
           // base-typed receivers are ordinary virtual dispatch, and tsc
@@ -1756,22 +1798,9 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
             collectGenericMember(member, false);
             continue;
           }
-          // Async METHODS in JS classes simply do not COLLECT — each call
-          // fences at its own site (the JS deferral stance, the
-          // async-static precedent above), so a class whose driven
-          // surface is synchronous still compiles (commander: parse()
-          // works, parseAsync() traps where called). TS async methods
-          // collect below like any method: the body is an async
-          // IrFunction (fiber spawn wrapper, `this` as param 0), calls
-          // dispatch STATICALLY — override chains fence (the vtable slot
-          // machinery has no fiber-spawn story), so every call site is a
-          // direct call the emitter routes through the spawn wrapper.
-          if (
-            member.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) &&
-            isJsSourceFile(decl.getSourceFile())
-          ) {
-            continue;
-          }
+          // Async methods collect with the same direct-call spawn wrapper
+          // for JavaScript and TypeScript classes. Override chains remain
+          // fenced below because vtable slots cannot enter that wrapper.
           // IMPLICIT-ANY monomorphization (npm-static JS): a method whose
           // signature carries bindable untyped params collects like a
           // GENERIC method — into genericMethods, no vtable slot, one
@@ -1784,6 +1813,7 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
           if (
             implicitMonoFile(decl.getSourceFile()) &&
             ts.isIdentifier(member.name) &&
+            !lowerer.virtualJsMethods.has(member) &&
             inst === undefined && decl.typeParameters === undefined &&
             !fields.has(member.name.text) &&
             !lowerer.findMethodOn(base, member.name.text) &&
@@ -1841,6 +1871,19 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
               `overriding the builtin Error method '${mName}'`,
             );
           }
+          // JS overrides may ignore trailing arguments. Retain the base's
+          // checked-value ABI slots as unused parameters, and let shorter
+          // calls fill them with undefined. Typed tails and rest/arguments
+          // readers keep the exact-signature fence.
+          if (
+            overridden && isJsSourceFile(member.getSourceFile()) &&
+            shapes.length < overridden.sig.params.length &&
+            !bodyReadsArguments(member) &&
+            shapes.every((p, i) => (p.mode === "required" || p.mode === "omittable") && typeEquals(p.type, overridden.sig.params[i]!.type)) &&
+            overridden.sig.params.slice(shapes.length).every((p) => p.type.kind === "dyn" && (p.mode === "required" || p.mode === "omittable"))
+          ) {
+            shapes.push(...overridden.sig.params.slice(shapes.length).map((p): ParamShape => ({ type: p.type, mode: "omittable" })));
+          }
           if (
             overridden &&
             (overridden.sig.params.length !== shapes.length ||
@@ -1866,7 +1909,14 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
               `overriding ${overridden.sig.async === true ? "the async method" : "a method with an async method"} '${mName}' (async methods dispatch statically — the vtable slot machinery has no fiber-spawn story)`,
             );
           }
-          // A #private GENERATOR method carries its channels on the sig:
+          if (overridden && (member.asteriskToken !== undefined || overridden.sig.gen !== undefined)) {
+            lowerer.unsupported(
+              "SC1090",
+              member.name,
+              `overriding the generator method '${mName}' (generator methods dispatch statically — a virtual slot cannot enter their spawn wrapper)`,
+            );
+          }
+          // A GENERATOR method carries its channels on the sig:
           // the body lowers as a generator IrFunction (`this` as param 0),
           // and every call — direct by construction — enters through the
           // emitted gen-spawn wrapper, answering the suspended generator.
@@ -2081,6 +2131,10 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
       // forbids via strictPropertyInitialization — so they keep a named
       // fence instead of a silent undefined.
       if (isJsSourceFile(decl.getSourceFile())) {
+        const hasAccessor = (name: string): boolean =>
+          methods.has(`get:${name}`) || methods.has(`set:${name}`) ||
+          lowerer.findMethodOn(base, `get:${name}`) !== null ||
+          lowerer.findMethodOn(base, `set:${name}`) !== null;
         // Named classes (declarations and self-binding expressions) resolve
         // by name; the nameless default-export declaration by its module's
         // default-export symbol.
@@ -2115,7 +2169,7 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
               const name = assign.name.text;
               // Later assignments to an already-declared field (own or
               // inherited) are writes, not declarations.
-              if (fields.has(name)) continue;
+              if (fields.has(name) || hasAccessor(name)) continue;
               if (methods.has(name) || lowerer.findMethodOn(base, name)) {
                 lowerer.unsupported("SC1090", assign, "constructor-assigned fields shadowing methods");
               }
@@ -2129,6 +2183,7 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
               // TS-annotated `unknown` fields keep their fence (KEEP NARROW
               // applies where an annotation could say better).
               let type = t ? (lowerer.mapTypeOf(t) ?? dynFallbackType(lowerer, assign, t)) : null;
+              if (type) type = jsOpenObjectType(assign, type, lowerer.shapes, lowerer.unions);
               if (type?.kind === "dyn") {
                 type = inferredEmptyCollectionFieldType(lowerer, decl, name, rhs) ?? type;
               }
@@ -2157,7 +2212,7 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
               continue;
             }
             // `this[kLimit] = v` at the constructor's top level with a
-            // STATICALLY-RESOLVABLE unique-symbol key (uniqueSymbolKeyOf's
+            // STATICALLY-RESOLVABLE symbol key (classSymbolKeyOf's
             // contract — the countdown.js idiom): the key is a compile-time
             // identity, so the member is an ordinary hidden field of the
             // static layout under Node's inspect spelling; no runtime
@@ -2169,18 +2224,18 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
               lhs && ts.isElementAccessExpression(lhs) &&
               lhs.expression.kind === ts.SyntaxKind.ThisKeyword
             ) {
-              const key = uniqueSymbolKeyOf(lowerer, lhs.argumentExpression);
+              const key = classSymbolKeyOf(lowerer, lhs.argumentExpression);
               if (!key) continue;
               // A key already declared (own or inherited) makes later
               // assignments writes, not declarations.
-              if (symbolFields.has(key.sym)) continue;
+              if (symbolFields.has(key.identity)) continue;
               if (fields.has(key.fieldName)) {
                 // Two DISTINCT Symbol(...) consts with one description in
                 // one layout would need one printable name for two slots.
                 lowerer.unsupported(
                   "SC1090",
                   lhs,
-                  `distinct symbol keys sharing the printable name '${key.fieldName}' in one class`,
+                  `distinct symbol keys sharing the printable name '${symbolFieldDisplayName(key.fieldName)}' in one class`,
                 );
               }
               const propSym = lateBoundByKey.get(key.sym);
@@ -2199,10 +2254,11 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
                 : rhs
                   ? lowerer.checker.getBaseTypeOfLiteralType(lowerer.checker.getTypeAtLocation(rhs))
                   : undefined;
-              const type = t ? (lowerer.mapTypeOf(t) ?? dynFallbackType(lowerer, lhs, t)) : null;
+              let type = t ? (lowerer.mapTypeOf(t) ?? dynFallbackType(lowerer, lhs, t)) : null;
+              if (type) type = jsOpenObjectType(lhs, type, lowerer.shapes, lowerer.unions);
               if (!type || type.kind === "void") lowerer.badType(lhs, t ?? lowerer.typeOf(lhs));
               fields.set(key.fieldName, type);
-              symbolFields.set(key.sym, key.fieldName);
+              symbolFields.set(key.identity, key.fieldName);
               fieldOrder.push({ name: key.fieldName, type, initializer: undefined });
             }
           }
@@ -2214,7 +2270,7 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
         // assignment site.
         for (const p of instType ? lowerer.checker.getPropertiesOfType(instType) : []) {
           if (fields.has(p.name) || methods.has(p.name)) continue;
-          if (methods.has(`get:${p.name}`) || methods.has(`set:${p.name}`)) continue;
+          if (hasAccessor(p.name)) continue;
           if (base && (base.fields.has(p.name) || lowerer.findMethodOn(base, p.name))) continue;
           const site = lowerer.checker.declarationsOf(p).find(
             (d) =>
@@ -2225,16 +2281,17 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
           // Late-bound properties: the ones the scan above collected are
           // real fields under their printable names — skip. The rest keep
           // a fence that names the supported form: keys that are runtime
-          // identities (symbol parameters, Symbol.for consts, computed
+          // identities (symbol parameters, mutable bindings, computed
           // descriptions) or assignments outside the constructor's top
           // level.
           if (p.name.startsWith("__@")) {
             const keySym = lateBoundKeySymOf(lowerer, p);
-            if (keySym && symbolFields.has(keySym)) continue;
+            const key = keySym ? classSymbolKeyOfSymbol(lowerer, keySym) : null;
+            if (key && symbolFields.has(key.identity)) continue;
             lowerer.unsupported(
               "SC1090",
               site,
-              "symbol-keyed class fields outside the supported form (a module-level `const k = Symbol('desc')` key, assigned unconditionally at the top of the constructor)",
+              "symbol-keyed class fields outside the supported form (a stable module-level literal Symbol()/Symbol.for() key, assigned unconditionally at the top of the constructor)",
             );
           }
           // JS classes: a property first assigned in a method or a
@@ -2970,6 +3027,24 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
     return a.length === b.length && a.every((p, i) => p.mode === b[i]!.mode && typeEquals(p.type, b[i]!.type));
   }
 
+/** Writable storage for an own static field named through its exact class.
+ * Inherited writes create a new subclass property in JS, so they must not
+ * update the declaring class's global. */
+export function staticFieldWriteTarget(lowerer: Lowerer, access: ts.PropertyAccessExpression): { id: string; type: IrType } | null {
+  if (access.questionDotToken || !ts.isIdentifier(access.expression)) return null;
+  const info = lowerer.exactClassOfReceiver(access.expression);
+  if (!info) return null;
+  const found = lowerer.findStaticOn(info, access.name.text);
+  if (!found?.field) return null;
+  if (found.declarer !== info) {
+    lowerer.unsupported("SC1090", access, `assigning the inherited static '${access.name.text}' through a subclass name (JS creates an OWN property on the subclass — assign through '${found.declarer.def.jsName ?? found.declarer.def.name}' instead)`);
+  }
+  if (found.field.readonly) {
+    lowerer.unsupported("SC1090", access, `assigning the readonly static '${access.name.text}'`);
+  }
+  return { id: found.field.globalId, type: found.field.type };
+}
+
 /** `C.x` where C is a class declared in the program and x a static
    * member of its chain: field reads are the module global, static
    * methods become interned closures, and `.name` folds to the class's
@@ -3601,6 +3676,47 @@ export function collectClassShapeInner(lowerer: Lowerer, decl: ts.ClassLikeDecla
     );
   }
 
+/** Discover overrides before choosing inferred method ABIs. Class collection
+ * visits bases first, including imported bases and class expressions, so the
+ * collected subclass graph cannot answer this question yet. The checker
+ * hierarchy identifies the original declarations through aliases as well. */
+export function collectVirtualJsMethods(lowerer: Lowerer, files: readonly ts.SourceFile[]): void {
+  if (!files.some(implicitMonoFile)) return;
+  const visit = (node: ts.Node): void => {
+    if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+      const names = node.members.flatMap((member) =>
+        ts.isMethodDeclaration(member) && ts.isIdentifier(member.name) &&
+        !member.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.StaticKeyword)
+          ? [member.name.text] : [],
+      );
+      if (node.heritageClauses?.length && names.length > 0) {
+        const symbol = lowerer.typeOf(node).getSymbol();
+        const instance = symbol ? lowerer.checker.getDeclaredTypeOfSymbol(symbol) : null;
+        const seen = new Set<ts.Type>();
+        const markBases = (type: ts.Type): void => {
+          const target = type.isTypeReference() ? type.getTarget() : type;
+          if (!target.isClassOrInterface() || seen.has(target)) return;
+          seen.add(target);
+          for (const base of lowerer.checker.getBaseTypes(target)) {
+            for (const name of names) {
+              const property = lowerer.checker.getPropertyOfType(base, name);
+              for (const declaration of property ? lowerer.checker.declarationsOf(property) : []) {
+                if (ts.isMethodDeclaration(declaration) && implicitMonoFile(declaration.getSourceFile())) {
+                  lowerer.virtualJsMethods.add(declaration);
+                }
+              }
+            }
+            markBases(base);
+          }
+        };
+        if (instance) markBases(instance);
+      }
+    }
+    node.forEachChild(visit);
+  };
+  for (const file of files) visit(file);
+}
+
 /** The receiver's EXACT runtime class, when the expression proves it: a
    * `new C(...)` expression directly, or a const binding initialized with
    * one (the binding can never be reassigned to a subclass instance).
@@ -4162,11 +4278,9 @@ export function lowerClassMembers(lowerer: Lowerer, info: ClassInfo): IrFunction
     // spawn's argument pack). Dispatch is static by construction — the
     // override fence at collection keeps async methods out of vtables.
     const isAsync = sig.async === true;
-    // #PRIVATE GENERATOR methods: the module function is a generator
-    // IrFunction — the body returns the TReturn channel, yields ride
-    // ctx.generator, and every call (direct by construction — privates
-    // never virtualize) enters through the emitted gen-spawn wrapper with
-    // `this` in the argument pack, answering the suspended generator.
+    // GENERATOR methods: the module function returns the TReturn channel,
+    // yields ride ctx.generator, and direct calls enter through the emitted
+    // gen-spawn wrapper with `this` in the argument pack.
     const genCh = sig.gen !== undefined && sig.ret.kind === "generator" ? sig.gen : null;
     const bodyReturn = genCh !== null
       ? lowerer.genBodyReturnType(sig.ret)
@@ -4184,6 +4298,12 @@ export function lowerClassMembers(lowerer: Lowerer, info: ClassInfo): IrFunction
       // (JS allows this in method defaults; it is param 0 here).
       const declared = lowerer.declareParams(fnLike.parameters, sig.params);
       params.push(...declared.params);
+      // A shorter JS override still implements every inherited ABI slot.
+      // These tail parameters have no source binding or default prologue.
+      for (const shape of sig.params.slice(declared.params.length)) {
+        const ignored = lowerer.declareHiddenLocal("%ignored", shape.type);
+        params.push({ localId: ignored.id, name: "%ignored", type: shape.type });
+      }
       const body = [...declared.prologue, ...lowerer.lowerStmts(fnLike.body.statements)];
       appendImplicitUndefinedReturn(lowerer, body, bodyReturn, locOf(fnLike));
       const fn: IrFunction = {
@@ -4213,15 +4333,21 @@ export function lowerClassMembers(lowerer: Lowerer, info: ClassInfo): IrFunction
   export function lowerStaticMethod(lowerer: Lowerer, info: ClassInfo, name: string): IrFunction | null {
     const entry = info.staticMethods?.get(name);
     if (!entry?.member.body) return null;
-    // Async statics: an async IrFunction like any module function — the
-    // body returns the promise's INNER type, calls enter through the
-    // fiber spawn wrapper (callTargetC routes by fn.async).
-    const isAsync =
-      entry.member.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) === true &&
-      entry.ret.kind === "promise";
-    const bodyReturn = isAsync && entry.ret.kind === "promise" ? entry.ret.inner : entry.ret;
+    const isAsync = entry.member.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) === true;
+    const isGenerator = entry.member.asteriskToken !== undefined;
+    if (isGenerator && (entry.ret.kind !== "generator" || (entry.ret.async === true) !== isAsync)) {
+      lowerer.badType(entry.member.name, lowerer.typeOf(entry.member.name));
+    }
+    if (isAsync && !isGenerator && entry.ret.kind !== "promise") {
+      lowerer.badType(entry.member.name, lowerer.typeOf(entry.member.name));
+    }
+    const genCh = isGenerator && entry.ret.kind === "generator" ? generatorMeta(lowerer, entry.ret) : null;
+    const bodyReturn = genCh !== null
+      ? lowerer.genBodyReturnType(entry.ret)
+      : isAsync && entry.ret.kind === "promise" ? entry.ret.inner : entry.ret;
     const fnCtx = newFnCtx(false, null, null, bodyReturn);
     fnCtx.isAsync = isAsync;
+    if (genCh !== null) fnCtx.generator = genCh;
     lowerer.fnStack.push(fnCtx);
     try {
       rejectStaticThis(
@@ -4241,6 +4367,7 @@ export function lowerClassMembers(lowerer: Lowerer, info: ClassInfo): IrFunction
         loc: locOf(entry.member),
       };
       if (isAsync) fn.async = true;
+      if (genCh !== null) fn.generator = genCh;
       return fn;
     } catch (e) {
       // A poison OUTSIDE the per-statement catches (the this/super fence,
@@ -4315,6 +4442,17 @@ export function lowerClassMembers(lowerer: Lowerer, info: ClassInfo): IrFunction
     const out: IrStmt[] = [];
     const thisType: IrType = { kind: "object", className: info.def.name };
     for (const f of info.fieldOrder) {
+      if (f.undefinedInitializer) {
+        const loc = f.undefinedInitializer;
+        out.push({
+          kind: "fieldSet",
+          obj: { kind: "varRef", localId: thisLocal.id, type: thisType, loc },
+          className: info.def.name,
+          field: f.name,
+          value: dynUndefinedExpr(loc),
+          loc,
+        });
+      }
       if (!f.initializer) continue;
       lowerer.stats.statementsTotal++;
       lowerer.bumpFileStat(locOf(f.initializer).file, "total");
@@ -4417,7 +4555,7 @@ export function lowerClassMembers(lowerer: Lowerer, info: ClassInfo): IrFunction
         const args = forward !== undefined
           ? forward
           : base.builtinError
-            ? [lowerer.errorMessageArg(superCall.arguments, locOf(stmt), stmt)]
+            ? lowerer.errorConstructorArgs(superCall.arguments, locOf(stmt), stmt)
             : base.builtinEmitter
               ? []
               : lowerer.completeArgs(superCall.arguments, base.ctorParams, locOf(stmt), stmt);
@@ -4472,7 +4610,7 @@ export function lowerClassMembers(lowerer: Lowerer, info: ClassInfo): IrFunction
         kind: "exprStmt",
         expr: {
           kind: "libCall",
-          fn: "error.ctor",
+          fn: "error.ctorOptions",
           args: [lowerer.upcastTo(thisRef, base.def.name), ...args],
           type: VOID,
           loc,
@@ -4669,8 +4807,8 @@ export function lowerClassMembers(lowerer: Lowerer, info: ClassInfo): IrFunction
 
 /** True when `info`'s EFFECTIVE constructor — its own, or the one
    * inherited through ctor-less bases — is a builtin error class's. Such
-   * classes construct with the error message rule, and their synthesized
-   * constructors forward one plain string to error.ctor. */
+   * classes construct with the error argument rule, and their synthesized
+   * constructors forward both checked-dynamic values to error.ctorOptions. */
   export function inheritsBuiltinErrorCtor(lowerer: Lowerer, info: ClassInfo): boolean {
     for (let c: ClassInfo | null = info; c; c = c.base) {
       if (c.builtinError) return true;
@@ -4703,28 +4841,17 @@ export function lowerClassMembers(lowerer: Lowerer, info: ClassInfo): IrFunction
     return false;
   }
 
-/** `new C(args)` for a class declared in the program (imports resolve
-   * through aliases, so cross-module classes construct too). */
-  /** The single message argument of a builtin Error construction or
-   * super() call: "" when omitted or explicitly undefined (Node's message
-   * property default), the string otherwise. The lib signature's second
-   * parameter (options/cause) has no lowering. */
-  export function errorMessageArg(lowerer: Lowerer, args: readonly ts.Expression[], loc: SrcLoc, blame: ts.Node): IrExpr {
-    if (args.length > 1) {
-      lowerer.unsupported("SC1090", args[1] ?? blame, "Error constructor options ('cause')");
-    }
-    if (args.length === 0) return { kind: "strLit", value: "", type: STRING, loc };
-    const value = lowerer.lowerExpr(args[0]!);
-    if (value.type.kind === "string") return value;
-    if (value.kind === "unitLit" && value.unit === "undefined") {
-      return { kind: "strLit", value: "", type: STRING, loc };
-    }
-    lowerer.unsupported(
-      "SC1090",
-      args[0]!,
-      `Error messages of type '${lowerer.fmt(value.type)}' (the message must be a string)`,
-    );
-  }
+/** Preserve argument evaluation order and option presence through builtin
+ * and inherited Error constructors. Checked-dynamic conversion retains
+ * Error identity and distinguishes a missing cause from undefined. */
+export function errorConstructorArgs(lowerer: Lowerer, args: readonly ts.Expression[], loc: SrcLoc, blame: ts.Node): IrExpr[] {
+  if (args.length > 2) lowerer.unsupported("SC1090", blame, "Error constructors with more than two arguments");
+  return [0, 1].map((i) => {
+    const arg = args[i];
+    if (!arg) return dynUndefinedExpr(loc);
+    return lowerer.lowerExprExpecting(arg, DYN);
+  });
+}
 
 /** `new C(...)` of a registered PROGRAM class — the shared tail of the
  * identifier and namespace-qualified construction forms. */
@@ -4775,11 +4902,10 @@ function lowerProgramClassNew(lowerer: Lowerer, expr: ts.NewExpression, declared
   if (lowerer.inheritsBuiltinEmitterCtor(info) && (expr.arguments ?? []).length > 0) {
     lowerer.unsupported("SC1090", expr.arguments![0]!, "EventEmitter constructor options ('captureRejections')");
   }
-  // A ctor-less chain into a builtin error base inherits `new
-  // C(message?)` — completed by the error rule (one plain string),
-  // not the general ABI completion.
+  // A ctor-less chain into a builtin error base inherits both arguments;
+  // each synthesized constructor forwards the same pair to its base.
   const args = lowerer.inheritsBuiltinErrorCtor(info)
-    ? [lowerer.errorMessageArg(expr.arguments ?? [], loc, expr)]
+    ? lowerer.errorConstructorArgs(expr.arguments ?? [], loc, expr)
     : lowerer.completeArgs(expr.arguments ?? [], info.ctorParams, loc, expr);
   return {
     kind: "new",
@@ -4806,6 +4932,15 @@ function assignedThisFieldType(lowerer: Lowerer, expr: ts.NewExpression): IrType
 
 export function lowerNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
     const loc = locOf(expr);
+    const consoleCtor = ts.isIdentifier(expr.expression)
+      ? lowerer.builtinImportOf(expr.expression)
+      : ts.isPropertyAccessExpression(expr.expression) &&
+          lowerer.builtinNamespaceModuleOf(expr.expression.expression) === "console"
+        ? { module: "console", member: expr.expression.name.text }
+        : null;
+    if (consoleCtor?.module === "console" && consoleCtor.member === "Console") {
+      lowerer.noLowering("new console.Console", expr, builtinFenceHintOf("console", "Console"));
+    }
     // `new X(...)` where X is a package-declared class, in a static build:
     // the per-package requires-dynamic diagnostic (the constructor runs in
     // the embedded engine). Under --dynamic, X is jsval-typed and lowers
@@ -4971,7 +5106,7 @@ export function lowerNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
       // (a no-op for every non-import= binding).
       fenceEarlyAliasUse(lowerer, expr.expression, expr);
       const symbol = lowerer.resolveValueSymbol(expr.expression);
-      // `new Error(msg?)` (and TypeError/RangeError/SyntaxError): the
+      // `new Error(msg?)` and its standard subclasses: the
       // runtime-provided classes construct through one libCall — the result
       // TYPE names which builtin, and the message completes to "" exactly
       // like Node's message property default.
@@ -5011,11 +5146,11 @@ export function lowerNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
         };
       }
       if (errInfo) {
-        const msg = lowerer.errorMessageArg(expr.arguments ?? [], loc, expr);
+        const args = lowerer.errorConstructorArgs(expr.arguments ?? [], loc, expr);
         return {
           kind: "libCall",
-          fn: "error.new",
-          args: [msg],
+          fn: "error.newOptions",
+          args,
           type: { kind: "object", className: errInfo.def.name },
           loc,
         };
@@ -5165,19 +5300,8 @@ export function lowerNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
           loc,
         };
       }
-      // Encoder objects likewise never exist: lowerTextCodecCall claims
-      // composed calls before the receiver lowers, while the same-scope
-      // const store-then-call declaration is erased before reaching here.
       if (symbol && (symbol.name === "TextDecoder" || symbol.name === "TextEncoder") && lowerer.isStdlibSymbol(symbol)) {
-        lowerer.noLowering(
-          `new ${symbol.name}`,
-          expr,
-          `${symbol.name} values have no representation — a same-scope const store-then-call or the composed form compiles: ` +
-            (symbol.name === "TextDecoder"
-              ? "new TextDecoder().decode(bytes)"
-              : "new TextEncoder().encode(s)"),
-          symbol,
-        );
+        return lowerTextCodecNew(lowerer, expr, symbol.name);
       }
       // `new Uint8Array(...)` / `new Uint32Array(...)` / `new
       // Float32Array(...)` / `new Float64Array(...)`: the typed-array
@@ -5244,13 +5368,23 @@ export function lowerNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
         let mapped = lowerer.mapTypeOf(tsType);
         const fieldType = assignedThisFieldType(lowerer, expr);
         if (mapped?.kind !== "map" && fieldType?.kind === "map") mapped = fieldType;
+        // A fresh map built from pair literals can use its destination's
+        // layout directly. Inference may otherwise split record values
+        // into incompatible shapes (for example a nullable field), even
+        // though every seed fits the declared value type. Existing map or
+        // tuple-array values retain their own representation.
+        let parent = expr.parent;
+        while (ts.isParenthesizedExpression(parent)) parent = parent.parent;
+        // `satisfies` checks a view but retains the expression's own type.
+        const contextualSeed = !ts.isSatisfiesExpression(parent) && (expr.typeArguments?.length ?? 0) === 0 &&
+          (entriesLit !== null || (expr.arguments?.length ?? 0) === 0);
         // JavaScript's `new Map()` has no type-argument syntax: the no-arg
         // constructor overload pins Map<any, any> whatever the JSDoc says
         // (`@type` on the declaration types the VARIABLE, not this
         // expression). The CONTEXTUAL type carries the annotation — adopt
         // it when it is a supported map. TS type arguments keep winning:
         // their expression type already maps.
-        if (mapped?.kind !== "map") {
+        if (mapped?.kind !== "map" || contextualSeed) {
           const ctx = lowerer.checker.getContextualType(expr);
           const ctxMapped = ctx ? lowerer.mapTypeOf(ctx) : null;
           if (ctx && ctxMapped?.kind === "map") {
@@ -5274,8 +5408,10 @@ export function lowerNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
         if (mapped?.kind === "map") {
           if (!entriesLit) return { kind: "mapNew", type: mapped, loc };
           const seed = entriesLit.map((pair) => ({
-            key: lowerer.lowerExprExpecting(pair.elements[0]!, mapped.key),
-            value: lowerer.lowerExprExpecting(pair.elements[1]!, mapped.value),
+            key: lowerer.lowerCollectionKey(pair.elements[0]!, mapped.key),
+            value: mapped.value.kind === "dyn"
+              ? lowerer.lowerCollectionKey(pair.elements[1]!, mapped.value)
+              : lowerer.lowerExprExpecting(pair.elements[1]!, mapped.value),
           }));
           return { kind: "mapNew", seed, type: mapped, loc };
         }
@@ -5297,12 +5433,12 @@ export function lowerNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
           return { kind: "dynObjLit", type: DYN, loc };
         }
         const keyIr = targs[0] ? lowerer.mapTypeOf(targs[0]) : null;
-        if (targs[0] && (!keyIr || !isSupportedMapKey(keyIr))) {
+        if (targs[0] && (!keyIr || !isSupportedMapKey(keyIr, keyIr.kind === "union" ? lowerer.unions.get(keyIr.unionId)?.arms : undefined))) {
           lowerer.unsupported(
             "SC1090",
             expr,
             `Map keys of type '${lowerer.checker.typeToString(targs[0])}' ` +
-              `(Map keys must be string or number)`,
+              `(Map keys must be numbers, strings, identity references, or unions of identity references)`,
           );
         }
         if (targs[1]) {
@@ -5317,7 +5453,7 @@ export function lowerNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
         lowerer.badType(expr, tsType);
       }
       // `new Set<T>()`: Map's sibling. The SEEDED form lowers for arrays
-      // and fixed tuples of legal elements — literal or variable — as
+      // and fixed tuples of legal elements, or strings by code point, as
       // construct + bulk add (duplicates collapse, insertion order
       // preserved, exactly JS). Other iterables keep the fence.
       // Unsupported element types are named specifically.
@@ -5347,14 +5483,25 @@ export function lowerNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
           // union — unmappable, so the generic literal path can't type it);
           // an array-typed VALUE seed lowers as itself.
           if (ts.isArrayLiteralExpression(argNode) && !argNode.elements.some(ts.isSpreadElement)) {
-            const elems = argNode.elements.map((el) => lowerer.lowerExprExpecting(el, mapped.elem));
+            const elems = argNode.elements.map((el) => lowerer.lowerCollectionKey(el, mapped.elem));
             const seed: IrExpr = { kind: "arrayLit", elems, type: arrayOf(mapped.elem), loc };
             return { kind: "setNew", seed, type: mapped, loc };
           }
           if (!ts.isSpreadElement(argNode)) {
             const argIr = lowerer.mapTypeOf(lowerer.typeOf(argNode));
+            // String iteration is by Unicode code point, not UTF-16 code
+            // unit. Share Array.from's iterator snapshot; evaluation of
+            // the source occurs once and insertion preserves first order.
+            if (argIr?.kind === "string" && mapped.elem.kind === "string") {
+              const source = lowerer.lowerExprExpecting(argNode, STRING);
+              return { kind: "setNew", seed: strCharsCall(lowerer, source, loc), type: mapped, loc };
+            }
             if (argIr?.kind === "array" && typeEquals(argIr.elem, mapped.elem)) {
-              let seed = lowerer.lowerExpr(argNode);
+              // Copying scalar elements is unobservable, but a checked
+              // dynamic exit would mint different record/array identities.
+              let seed = mapped.elem.kind === "f64" || mapped.elem.kind === "string"
+                ? lowerer.lowerExpr(argNode)
+                : lowerer.lowerCollectionKey(argNode, argIr);
               // A T[]-DECLARED seed whose value is an island handle (a
               // package's exported array — the binding never held a
               // static array): the VALIDATED exit copies the engine
@@ -5381,7 +5528,9 @@ export function lowerNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
                 const seedType = { kind: "array" as const, elem: mapped.elem };
                 const helper = lowerer.tupleArrayWidthHelper(argIr.shapeId, seedType, loc);
                 if (helper) {
-                  const tuple = lowerer.lowerExpr(argNode);
+                  const tuple = mapped.elem.kind === "f64" || mapped.elem.kind === "string"
+                    ? lowerer.lowerExpr(argNode)
+                    : lowerer.lowerCollectionKey(argNode, argIr);
                   if (typeEquals(tuple.type, argIr)) {
                     const seed: IrExpr = { kind: "call", callee: helper, args: [tuple], type: seedType, loc };
                     return { kind: "setNew", seed, type: mapped, loc };
@@ -5420,8 +5569,8 @@ export function lowerNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
           lowerer.noLowering(
             "new Set(values)",
             expr,
-            "construct the Set empty and add() each value — only an array or fixed tuple of " +
-              "already-legal elements (string or number) seeds a Set",
+            "construct the Set empty and add() each value — only a string, array, or fixed tuple of " +
+              "already-legal elements (numbers, strings, or identity references) seeds a Set",
           );
         }
         if (mapped?.kind === "set") return { kind: "setNew", type: mapped, loc };
@@ -5431,7 +5580,7 @@ export function lowerNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
             "SC1090",
             expr,
             `Set elements of type '${lowerer.checker.typeToString(targs[0])}' ` +
-              `(Set elements must be string or number — Map's key kinds — or a server handle, which stores under reference identity)`,
+              `(Set elements must be numbers, strings, identity references, or unions of identity references)`,
           );
         }
         lowerer.badType(expr, tsType);

@@ -6925,6 +6925,18 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/3001-caught-typeof-object.js": {
+   "order": [
+    "<repo>/tests/corpus/3001-caught-typeof-object.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3002-promise-then-two.ts": {
+   "order": [
+    "<repo>/tests/corpus/3002-promise-then-two.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/301-while.ts": {
    "order": [
     "<repo>/tests/corpus/301-while.ts"
@@ -7201,6 +7213,18 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/3060-dynamic-host-global.ts": {
+   "order": [
+    "<repo>/tests/corpus/3060-dynamic-host-global.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3061-concurrent-fiber-stacks.ts": {
+   "order": [
+    "<repo>/tests/corpus/3061-concurrent-fiber-stacks.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/3062-runtime-optional-record-guards.ts": {
    "order": [
     "<repo>/tests/corpus/3062-runtime-optional-record-guards.ts"
@@ -7227,6 +7251,377 @@
     "<repo>/tests/corpus/3065-installed-entry-js/value.js",
     "<repo>/tests/corpus/3065-installed-entry-js/lib/index.js",
     "<repo>/tests/corpus/3065-installed-entry-js/main.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3066-source-debugging/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/3066-source-debugging/helper.ts",
+    "<repo>/tests/corpus/3066-source-debugging/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3067-cjs-function-export-require/main.cjs": {
+   "order": [
+    "<repo>/tests/corpus/3067-cjs-function-export-require/dependency.cjs",
+    "<repo>/tests/corpus/3067-cjs-function-export-require/member.cjs",
+    "<repo>/tests/corpus/3067-cjs-function-export-require/single.cjs",
+    "<repo>/tests/corpus/3067-cjs-function-export-require/main.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3068-debug-variables/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/3068-debug-variables/other.ts",
+    "<repo>/tests/corpus/3068-debug-variables/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3069-tuple-spread.ts": {
+   "order": [
+    "<repo>/tests/corpus/3069-tuple-spread.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3070-collection-views.ts": {
+   "order": [
+    "<repo>/tests/corpus/3070-collection-views.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3071-map-contextual-record-seeds.ts": {
+   "order": [
+    "<repo>/tests/corpus/3071-map-contextual-record-seeds.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3072-optional-union-receivers.ts": {
+   "order": [
+    "<repo>/tests/corpus/3072-optional-union-receivers.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3073-union-keyed-reads.ts": {
+   "order": [
+    "<repo>/tests/corpus/3073-union-keyed-reads.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3074-discriminated-intersections.ts": {
+   "order": [
+    "<repo>/tests/corpus/3074-discriminated-intersections.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3075-recursive-contextual-literals.ts": {
+   "order": [
+    "<repo>/tests/corpus/3075-recursive-contextual-literals.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3076-nullish-record-defaults.ts": {
+   "order": [
+    "<repo>/tests/corpus/3076-nullish-record-defaults.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3077-optional-union-array-reads.ts": {
+   "order": [
+    "<repo>/tests/corpus/3077-optional-union-array-reads.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3078-forward-mutable-captures.ts": {
+   "order": [
+    "<repo>/tests/corpus/3078-forward-mutable-captures.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3079-forward-mutable-tdz.ts": {
+   "order": [
+    "<repo>/tests/corpus/3079-forward-mutable-tdz.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3080-exhaustive-never-bindings.ts": {
+   "order": [
+    "<repo>/tests/corpus/3080-exhaustive-never-bindings.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3081-recursive-array-destinations.ts": {
+   "order": [
+    "<repo>/tests/corpus/3081-recursive-array-destinations.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3082-forward-write-unwind.ts": {
+   "order": [
+    "<repo>/tests/corpus/3082-forward-write-unwind.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3083-set-string-seed.ts": {
+   "order": [
+    "<repo>/tests/corpus/3083-set-string-seed.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3084-record-own-membership.ts": {
+   "order": [
+    "<repo>/tests/corpus/3084-record-own-membership.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3085-conditional-record-construction.ts": {
+   "order": [
+    "<repo>/tests/corpus/3085-conditional-record-construction.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3086-error-constructor-options.ts": {
+   "order": [
+    "<repo>/tests/corpus/3086-error-constructor-options.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3087-error-options-lifetime.ts": {
+   "order": [
+    "<repo>/tests/corpus/3087-error-options-lifetime.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3088-array-wide-callbacks.ts": {
+   "order": [
+    "<repo>/tests/corpus/3088-array-wide-callbacks.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3089-array-find-narrowing.ts": {
+   "order": [
+    "<repo>/tests/corpus/3089-array-find-narrowing.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3090-json-discriminated-records.ts": {
+   "order": [
+    "<repo>/tests/corpus/3090-json-discriminated-records.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3091-json-recursive-discriminants.ts": {
+   "order": [
+    "<repo>/tests/corpus/3091-json-recursive-discriminants.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3092-number-union-predicates.ts": {
+   "order": [
+    "<repo>/tests/corpus/3092-number-union-predicates.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3093-error-option-data.ts": {
+   "order": [
+    "<repo>/tests/corpus/3093-error-option-data.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3094-json-replacer-traversal.ts": {
+   "order": [
+    "<repo>/tests/corpus/3094-json-replacer-traversal.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3095-json-reviver-traversal.ts": {
+   "order": [
+    "<repo>/tests/corpus/3095-json-reviver-traversal.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3096-json-callback-nonfinite.ts": {
+   "order": [
+    "<repo>/tests/corpus/3096-json-callback-nonfinite.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3097-json-callback-reentrancy.ts": {
+   "order": [
+    "<repo>/tests/corpus/3097-json-callback-reentrancy.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3098-json-callback-space.ts": {
+   "order": [
+    "<repo>/tests/corpus/3098-json-callback-space.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3099-json-callback-functions.ts": {
+   "order": [
+    "<repo>/tests/corpus/3099-json-callback-functions.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3100-json-callback-holder.js": {
+   "order": [
+    "<repo>/tests/corpus/3100-json-callback-holder.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3101-json-callback-bytes.ts": {
+   "order": [
+    "<repo>/tests/corpus/3101-json-callback-bytes.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3102-json-unknown-fields.ts": {
+   "order": [
+    "<repo>/tests/corpus/3102-json-unknown-fields.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3103-scalar-record-nested-control-flow.ts": {
+   "order": [
+    "<repo>/tests/corpus/3103-scalar-record-nested-control-flow.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3104-native-analysis-tables-loops.ts": {
+   "order": [
+    "<repo>/tests/corpus/3104-native-analysis-tables-loops.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3105-nullable-collections.ts": {
+   "order": [
+    "<repo>/tests/corpus/3105-nullable-collections.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3106-mixed-insertion-spreads.ts": {
+   "order": [
+    "<repo>/tests/corpus/3106-mixed-insertion-spreads.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3107-nullable-collection-lifetimes.ts": {
+   "order": [
+    "<repo>/tests/corpus/3107-nullable-collection-lifetimes.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3108-for-await-sync-arrays.js": {
+   "order": [
+    "<repo>/tests/corpus/3108-for-await-sync-arrays.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3108-identity-map-keys.ts": {
+   "order": [
+    "<repo>/tests/corpus/3108-identity-map-keys.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3109-destructuring-unknown-defaults.js": {
+   "order": [
+    "<repo>/tests/corpus/3109-destructuring-unknown-defaults.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3109-identity-union-collections.ts": {
+   "order": [
+    "<repo>/tests/corpus/3109-identity-union-collections.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3110-builtin-error-families.ts": {
+   "order": [
+    "<repo>/tests/corpus/3110-builtin-error-families.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3110-identity-collection-mutation.ts": {
+   "order": [
+    "<repo>/tests/corpus/3110-identity-collection-mutation.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3111-identity-collection-cycles.ts": {
+   "order": [
+    "<repo>/tests/corpus/3111-identity-collection-cycles.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3112-union-switch-control-flow.ts": {
+   "order": [
+    "<repo>/tests/corpus/3112-union-switch-control-flow.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3113-union-array-removal.ts": {
+   "order": [
+    "<repo>/tests/corpus/3113-union-array-removal.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3114-union-record-field-write.ts": {
+   "order": [
+    "<repo>/tests/corpus/3114-union-record-field-write.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3115-zlib-static-compression-levels.ts": {
+   "order": [
+    "<repo>/tests/corpus/3115-zlib-static-compression-levels.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3116-sequence-expression-lifetimes.ts": {
+   "order": [
+    "<repo>/tests/corpus/3116-sequence-expression-lifetimes.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3117-unknown-switch-control-flow.ts": {
+   "order": [
+    "<repo>/tests/corpus/3117-unknown-switch-control-flow.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3118-recursive-union-spread.ts": {
+   "order": [
+    "<repo>/tests/corpus/3118-recursive-union-spread.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3119-runtime-optional-spread.ts": {
+   "order": [
+    "<repo>/tests/corpus/3119-runtime-optional-spread.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3120-generator-method-loop-bindings.ts": {
+   "order": [
+    "<repo>/tests/corpus/3120-generator-method-loop-bindings.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3120-ir-nonfinite-numbers.ts": {
+   "order": [
+    "<repo>/tests/corpus/3120-ir-nonfinite-numbers.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3121-compound-assignment-values.js": {
+   "order": [
+    "<repo>/tests/corpus/3121-compound-assignment-values.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/3122-js-async-class-methods.js": {
+   "order": [
+    "<repo>/tests/corpus/3122-js-async-class-methods.js"
    ],
    "diags": []
   },
@@ -8183,6 +8578,96 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/bigint-union-conversion.ts": {
+   "order": [
+    "<repo>/tests/corpus/bigint-union-conversion.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/console-imports.cjs": {
+   "order": [
+    "<repo>/tests/corpus/console-imports.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/generic-visitor-void.ts": {
+   "order": [
+    "<repo>/tests/corpus/generic-visitor-void.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/instanceof-class-record-union.ts": {
+   "order": [
+    "<repo>/tests/corpus/instanceof-class-record-union.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/js-arrow-bind.cjs": {
+   "order": [
+    "<repo>/tests/corpus/js-arrow-bind.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/js-declared-fields.cjs": {
+   "order": [
+    "<repo>/tests/corpus/js-declared-fields.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/js-default-options/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/js-default-options/options.js",
+    "<repo>/tests/corpus/js-default-options/index.js",
+    "<repo>/tests/corpus/js-default-options/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/js-static-registries.cjs": {
+   "order": [
+    "<repo>/tests/corpus/js-static-registries.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/optional-node-list-iteration.ts": {
+   "order": [
+    "<repo>/tests/corpus/optional-node-list-iteration.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/static-field-updates/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/static-field-updates/counter.ts",
+    "<repo>/tests/corpus/static-field-updates/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/symbol-class-fields.ts": {
+   "order": [
+    "<repo>/tests/corpus/symbol-class-fields.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/symbol-class-fields/main.cjs": {
+   "order": [
+    "<repo>/tests/corpus/symbol-class-fields/counter.cjs",
+    "<repo>/tests/corpus/symbol-class-fields/main.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/text-codec-values/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/text-codec-values/shared.ts",
+    "<repo>/tests/corpus/text-codec-values/user.ts",
+    "<repo>/tests/corpus/text-codec-values/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/unknown-collections.ts": {
+   "order": [
+    "<repo>/tests/corpus/unknown-collections.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/diagnostics/accessors.ts": {
    "order": [
     "<repo>/tests/diagnostics/accessors.ts"
@@ -8198,6 +8683,12 @@
   "<repo>/tests/diagnostics/any.ts": {
    "order": [
     "<repo>/tests/diagnostics/any.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/diagnostics/arrow-bind.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/arrow-bind.ts"
    ],
    "diags": []
   },
@@ -8349,6 +8840,12 @@
   "<repo>/tests/diagnostics/class-values.ts": {
    "order": [
     "<repo>/tests/diagnostics/class-values.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/diagnostics/collection-views.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/collection-views.ts"
    ],
    "diags": []
   },
@@ -8650,6 +9147,12 @@
    ],
    "diags": []
   },
+  "<repo>/tests/diagnostics/generator-method-overrides.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/generator-method-overrides.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/diagnostics/generic-methods.ts": {
    "order": [
     "<repo>/tests/diagnostics/generic-methods.ts"
@@ -8683,6 +9186,12 @@
   "<repo>/tests/diagnostics/http2-response-trailers.ts": {
    "order": [
     "<repo>/tests/diagnostics/http2-response-trailers.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/diagnostics/identity-collection-keys.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/identity-collection-keys.ts"
    ],
    "diags": []
   },
@@ -8877,7 +9386,7 @@
       "end": 41
      },
      "milestone": "M4",
-     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, module, and console modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
     }
    ]
   },
@@ -9136,7 +9645,7 @@
       "end": 391
      },
      "milestone": "M4",
-     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, module, and console modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
     },
     {
      "code": "SC1010",
@@ -9147,7 +9656,7 @@
       "end": 424
      },
      "milestone": "M4",
-     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, module, and console modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
     },
     {
      "code": "SC1010",
@@ -9158,7 +9667,7 @@
       "end": 468
      },
      "milestone": "M4",
-     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, module, and console modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
     },
     {
      "code": "SC1010",
@@ -9169,7 +9678,7 @@
       "end": 511
      },
      "milestone": "M4",
-     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, module, and console modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
     },
     {
      "code": "SC1010",
@@ -9180,7 +9689,7 @@
       "end": 550
      },
      "milestone": "M4",
-     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, module, and console modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
     },
     {
      "code": "SC1010",
@@ -9191,7 +9700,7 @@
       "end": 600
      },
      "milestone": "M4",
-     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, module, and console modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
     }
    ]
   },
@@ -9307,7 +9816,7 @@
       "end": 476
      },
      "milestone": "M4",
-     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, module, and console modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
     },
     {
      "code": "SC1010",
@@ -9318,7 +9827,7 @@
       "end": 415
      },
      "milestone": "M4",
-     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, module, and console modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
     },
     {
      "code": "SC1010",
@@ -9329,7 +9838,7 @@
       "end": 448
      },
      "milestone": "M4",
-     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, module, and console modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
     }
    ]
   },
@@ -9402,6 +9911,12 @@
   "<repo>/tests/diagnostics/spread-fences.ts": {
    "order": [
     "<repo>/tests/diagnostics/spread-fences.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/diagnostics/spread-runtime-optional.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/spread-runtime-optional.ts"
    ],
    "diags": []
   },
@@ -10040,7 +10555,7 @@
       "end": 461
      },
      "milestone": "M4",
-     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, module, and console modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
     }
    ]
   },

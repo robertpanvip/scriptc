@@ -26,6 +26,7 @@ import { isGenericCallableMemberType } from "../../type-mapper.js";
 import { numLit, varRef } from "../../../ir/build.js";
 import { isSafeToRepeat } from "./evaluation-safety.js";
 import { tryLowerExpression } from "./try-lower-expression.js";
+import { fenceSymbolFieldCopy } from "../symbol-fields.js";
 
 /** `{ a: 1, b: "x" }` → recordLit. The record type comes from the
  * contextual type when tsc has one (annotated declarations, arguments,
@@ -211,6 +212,7 @@ export function lowerDynObjectLiteral(
     if (ts.isSpreadAssignment(prop)) {
       flushFields();
       const raw = lowerer.lowerExpr(prop.expression);
+      fenceSymbolFieldCopy(lowerer, prop.expression, raw.type);
       const source = boxValue
         ? boxValue(prop.expression, raw)
         : lowerer.coerceToExpected(raw, DYN);
@@ -342,6 +344,15 @@ if (srcShape && shapeHasAccessorSlots(srcShape)) {
   );
 }
 }
+
+/** Only definitely present later records replace earlier defaults. A
+ * callback binding may store undefined despite its checker annotation. */
+function laterSpreadType(lowerer: Lowerer, expr: ts.Expression): IrType | null {
+  let source = expr;
+  while (ts.isParenthesizedExpression(source)) source = source.expression;
+  if (ts.isIdentifier(source)) return lowerer.lowerExpr(source).type;
+  return lowerer.mapTypeOf(lowerer.typeOf(source));
+}
 /** The JS trap-closure fallback for FUNCTION-VALUED object properties: a
  * lambda whose body fails to lower inside a JS object literal becomes a
  * closure of the field's exact func type whose body is the runtime fence —
@@ -403,12 +414,15 @@ try {
  * (excess-property freshness — tsc already enforced it), every arm field
  * missing from the literal must be optional-flavored (an undefined-armed
  * union, or a dyn slot — the absent-completion rule), and each present
- * field's LITERAL type must fit the member's field type — literal against
- * literal decides by VALUE (the discriminant), everything else by the
- * widened IR pair under the width-lift relation. Exactly ONE fitting arm
+ * field's TypeScript type must fit the member's field type — literal against
+ * literal decides by VALUE (the discriminant), everything else through the
+ * checker. The chosen arm then directs construction of nested literals;
+ * probing their inferred IR layout too early can reject the right arm and
+ * select a smaller unrelated record that drops fields. Exactly ONE fitting arm
  * answers it; zero or several answer null and the caller keeps its
- * fences. Plain property-assignment/shorthand literals only — spreads,
- * accessors, methods, and unfoldable computed keys keep their own paths. */
+ * fences. A spread uses the checker's resulting properties so overridden
+ * discriminants and narrowed recursive source arms keep their identity.
+ * Accessors, methods, and unfoldable computed keys keep their own paths. */
 function literalUnionArmOf(
 lowerer: Lowerer,
 expr: ts.ObjectLiteralExpression,
@@ -416,21 +430,32 @@ tsType: ts.Type,
 recordArms: (IrType & { kind: "record" })[],
 ): (IrType & { kind: "record" }) | null {
 if (!tsType.isUnionType()) return null;
-const props: { name: string; node: ts.Expression }[] = [];
+const props: { name: string; type: ts.Type }[] = [];
+let hasSpread = false;
 for (const p of expr.properties) {
   if (ts.isPropertyAssignment(p) && !ts.isComputedPropertyName(p.name)) {
-    props.push({ name: propNameText(lowerer, p.name), node: p.initializer });
+    props.push({ name: propNameText(lowerer, p.name), type: lowerer.typeOf(p.initializer) });
   } else if (ts.isShorthandPropertyAssignment(p) && ts.isIdentifier(p.name)) {
-    props.push({ name: p.name.text, node: p.name });
+    props.push({ name: p.name.text, type: lowerer.typeOf(p.name) });
+  } else if (ts.isSpreadAssignment(p)) {
+    hasSpread = true;
   } else {
     return null;
   }
 }
-/** litT fits ftT: unions per arm; literal-vs-literal by value; unit
- * types only into their own unit; otherwise the widened IR pair must be
- * equal or width-liftable. */
+if (hasSpread) {
+  const own = lowerer.typeOf(expr);
+  // Conditional/union spreads need runtime selection, not one guessed arm.
+  if (own.isUnionType()) return null;
+  props.length = 0;
+  for (const property of lowerer.checker.getPropertiesOfType(own)) {
+    props.push({ name: property.name, type: lowerer.checker.getTypeOfSymbol(property) });
+  }
+}
+/** Cheap literal discriminants avoid checker traffic for unrelated arms.
+ * Compound types need the checker's semantic assignability, including
+ * recursive unions, never intersections, and contextual empty arrays. */
 const fits = (litT: ts.Type, ftT: ts.Type): boolean => {
-  if (ftT.isUnionType()) return ts.constituentTypes(ftT).some((a) => fits(litT, a));
   if (ftT.isStringLiteralType()) return litT.isStringLiteralType() && litT.value === ftT.value;
   if (ftT.isNumberLiteralType()) return litT.isNumberLiteralType() && litT.value === ftT.value;
   if (ftT.flags & ts.TypeFlags.BooleanLiteral) {
@@ -438,11 +463,7 @@ const fits = (litT: ts.Type, ftT: ts.Type): boolean => {
   }
   if (ftT.flags & ts.TypeFlags.Null) return (litT.flags & ts.TypeFlags.Null) !== 0;
   if (ftT.flags & ts.TypeFlags.Undefined) return (litT.flags & ts.TypeFlags.Undefined) !== 0;
-  if (litT.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)) return false;
-  const li = lowerer.mapTypeOf(lowerer.checker.getBaseTypeOfLiteralType(litT));
-  const fi = lowerer.mapTypeOf(ftT);
-  if (!li || !fi) return false;
-  return typeEquals(li, fi) || lowerer.widthLiftPlan(li, fi) !== null;
+  return lowerer.checker.isTypeAssignableTo(litT, ftT);
 };
 const armShapeIds = new Set(recordArms.map((a) => a.shapeId));
 const candidates = new Set<string>();
@@ -467,7 +488,7 @@ for (const member of ts.constituentTypes(tsType)) {
   const fieldsFit = props.every((p) => {
     const sym = lowerer.checker.getPropertyOfType(member, p.name);
     if (!sym) return false;
-    return fits(lowerer.typeOf(p.node), lowerer.checker.getTypeOfSymbol(sym));
+    return fits(p.type, lowerer.checker.getTypeOfSymbol(sym));
   });
   if (fieldsFit) candidates.add(mMapped.shapeId);
 }
@@ -507,7 +528,8 @@ const selected: IrExpr = {
 return prefix.length === 0 ? selected : { kind: "seqExpr", stmts: prefix, result: selected, type: recordType, loc };
 }
 
-export function lowerObjectLiteral(lowerer: Lowerer, expr: ts.ObjectLiteralExpression): IrExpr {
+export function lowerObjectLiteral(lowerer: Lowerer, expr: ts.ObjectLiteralExpression,
+  expected?: IrType & { kind: "record" },): IrExpr {
   const loc = locOf(expr);
   // The RUNTIME-KEYED literal (JS): a computed key that doesn't fold to a
   // compile-time string means the literal's shape is not a compile-time
@@ -598,6 +620,9 @@ export function lowerObjectLiteral(lowerer: Lowerer, expr: ts.ObjectLiteralExpre
   }
 
   let tsType = lowerer.checker.getContextualType(expr) ?? lowerer.typeOf(expr);
+  // `as never` supplies no construction layout. Keep the literal's own
+  // fields so an exhaustiveness witness cannot erase a reachable value.
+  if (lowerer.checker.isNeverType(tsType)) tsType = lowerer.typeOf(expr);
   // `lit satisfies T` is TYPE-LEVEL only: the expression's checker type —
   // and therefore the shape every downstream consumer sees — is the
   // literal's OWN type (T still contextually types members, so inferred
@@ -711,7 +736,10 @@ export function lowerObjectLiteral(lowerer: Lowerer, expr: ts.ObjectLiteralExpre
         const armShape = lowerer.shapes.get(recordArms[0]!.shapeId);
         if (
           (mapped?.kind !== "record" || mapped.shapeId !== recordArms[0]!.shapeId) &&
-          !armShape?.tuple
+          !armShape?.tuple &&
+          // `{} | undefined` supplies no layout for a populated options
+          // literal, just as a bare empty-record context supplies none.
+          (expr.properties.length === 0 || (armShape && (armShape.fields.length > 0 || armShape.indexValue)))
         ) {
           mapped = recordArms[0]!;
         }
@@ -729,7 +757,11 @@ export function lowerObjectLiteral(lowerer: Lowerer, expr: ts.ObjectLiteralExpre
         // exactly ONE member fits, build AS that arm — its field types
         // drive every property's coercion, exactly the single-record-arm
         // rule above. Ambiguous literals keep the SC2003 fence.
-        if (ownShapeId === null || !recordArms.some((a) => a.shapeId === ownShapeId)) {
+        // Recursive arms can have identical stored field layouts while
+        // retaining distinct nominal knots. An inferred spread shape can
+        // match the wrong knot, so consult discriminants even if that shape
+        // already appears in the union.
+        if (ownShapeId === null || !recordArms.some((a) => a.shapeId === ownShapeId) || expr.properties.some(ts.isSpreadAssignment)) {
           const arm = literalUnionArmOf(lowerer, expr, tsType, recordArms);
           if (arm) mapped = arm;
         }
@@ -782,6 +814,22 @@ export function lowerObjectLiteral(lowerer: Lowerer, expr: ts.ObjectLiteralExpre
   }
   if (!mapped || mapped.kind !== "record") lowerer.badType(expr, tsType);
   let type: IrType = mapped;
+  // A fresh, plain literal can construct its fields directly for a known
+  // destination with the same field set. This matters for inferred
+  // conditional records: an empty array in one arm has no element layout
+  // until the join supplies it. Existing values still use width coercion;
+  // extra fields, spreads, accessors, and keyed shapes retain their paths.
+  if (expected && !isJsSourceFile(expr.getSourceFile()) &&
+      expr.properties.every((p) => ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p))) {
+    const own = lowerer.shapes.get(type.shapeId)!;
+    const target = lowerer.shapes.get(expected.shapeId)!;
+    if (!own.tuple && !target.tuple && !own.indexValue && !target.indexValue &&
+        !shapeHasAccessorSlots(own) && !shapeHasAccessorSlots(target) &&
+        own.fields.length === target.fields.length &&
+        own.fields.every((field) => target.fields.some((candidate) => candidate.name === field.name))) {
+      type = { kind: "record", shapeId: expected.shapeId };
+    }
+  }
   let shape = lowerer.shapes.get(type.shapeId)!;
   // ACCESSOR properties, JS literals only (TS accessors fill the shape's
   // %get:/%set: closure slots below): no record storage exists for them,
@@ -1154,8 +1202,7 @@ export function lowerObjectLiteral(lowerer: Lowerer, expr: ts.ObjectLiteralExpre
       // equal type (a wider source would silently DROP fields JS keeps —
       // the width fence, same as literals). Later contributors override
       // earlier ones (JS last-write-wins; the reads are side-effect-free,
-      // so dropping the earlier read is exact). Identifier sources
-      // re-read per field (historic path); any OTHER source must be a
+      // so dropping the earlier read is exact). Sources must be a
       // re-emittable pure read, sharing one lowered node per field.
       // The desugar's one-entry-per-name list reads spread fields
       // EAGERLY at the spread's position, so an explicit property
@@ -1177,10 +1224,14 @@ export function lowerObjectLiteral(lowerer: Lowerer, expr: ts.ObjectLiteralExpre
       const srcLowered =
         prop === expr.properties[0] && leadingSpreadLowered !== null
           ? leadingSpreadLowered
-          : ts.isIdentifier(srcNode)
-            ? null
-            : lowerer.lowerExpr(srcNode);
-      const srcType = srcLowered ? srcLowered.type : lowerer.mapTypeOf(lowerer.typeOf(srcNode));
+          : lowerer.lowerExpr(srcNode);
+      // Array callbacks can receive a record-or-undefined ABI even when
+      // TypeScript describes a required record. Select the copy strategy
+      // from that stored representation so absent sources copy nothing.
+      // Checked-dynamic bindings still use the checker's field contract.
+      const srcType = srcLowered.type.kind === "dyn"
+        ? lowerer.mapTypeOf(lowerer.typeOf(srcNode))
+        : srcLowered.type;
       // `...options.installConfig` — a spread of `Partial<X> | undefined`
       // (the optional-options merge idiom `{ ...DEFAULTS, ...overrides }`):
       // JS spreads nothing for the unit arm and copies present keys
@@ -1238,7 +1289,7 @@ export function lowerObjectLiteral(lowerer: Lowerer, expr: ts.ObjectLiteralExpre
         for (const later of expr.properties.slice(expr.properties.indexOf(prop) + 1)) {
           if (ts.isSpreadAssignment(later)) {
             if (conditionalSpreadOf(later.expression)) continue;
-            const lt = lowerer.mapTypeOf(lowerer.typeOf(later.expression));
+            const lt = laterSpreadType(lowerer, later.expression);
             if (lt?.kind === "record") {
               for (const lf of lowerer.shapes.get(lt.shapeId)?.fields ?? []) laterNames.add(lf.name);
             }
@@ -1376,7 +1427,7 @@ export function lowerObjectLiteral(lowerer: Lowerer, expr: ts.ObjectLiteralExpre
       for (const later of expr.properties.slice(expr.properties.indexOf(prop) + 1)) {
         if (ts.isSpreadAssignment(later)) {
           if (conditionalSpreadOf(later.expression)) continue;
-          const lt = lowerer.mapTypeOf(lowerer.typeOf(later.expression));
+          const lt = laterSpreadType(lowerer, later.expression);
           if (lt?.kind === "record") {
             for (const lf of lowerer.shapes.get(lt.shapeId)?.fields ?? []) laterNames.add(lf.name);
           }

@@ -1,7 +1,7 @@
 /* Focused LLVM expression emission extracted from emitter.ts. */
 import { InternalCompilerError } from "../../errors.js";
 import { isStableReceiverOperand, undefinedArmTag } from "../../ir/analysis.js";
-import { IrExpr, IrType, isRefCounted, typeEquals, typeKey } from "../../ir/ir.js";
+import { type IrExpr, type IrType, isRefCounted, typeEquals, typeKey } from "../../ir/ir.js";
 import { mangleResolveThunk } from "../mangle.js";
 import { elemAccess, FN_ATTRS, mapKeyAccess, mapKeyKindNum, mapValKindNum, traceArg, vAdapters } from "./shapes.js";
 import type { LlvmEmitterContext, LlValue } from "./expr-context.js";
@@ -13,12 +13,12 @@ export function resolveThunkFor(host: LlvmEmitterContext, inner: IrType): string
     if (!sym) {
       sym = mangleResolveThunk(host.resolveThunks.size);
       host.resolveThunks.set(key, sym);
-      const v = vAdapters(host, inner);
+      const v = vAdapters(host.shapeHost, inner);
       host.declare(`declare void @scr_resolve_ref_impl(ptr, ptr, ptr, ptr, ptr)`);
       host.resolveThunkDefs.push(
         `define internal void @${sym}(ptr %self, ptr %v) ${FN_ATTRS} { ; resolve<${key}>`,
         `entry:`,
-        `  call void @scr_resolve_ref_impl(ptr %self, ptr %v, ptr ${v.retain}, ptr ${v.release}, ptr ${traceArg(host, inner)})`,
+        `  call void @scr_resolve_ref_impl(ptr %self, ptr %v, ptr ${v.retain}, ptr ${v.release}, ptr ${traceArg(host.shapeHost, inner)})`,
         `  ret void`,
         `}`,
         ``,
@@ -506,16 +506,20 @@ export function emitMapNew(host: LlvmEmitterContext, e: IrExpr & { kind: "mapNew
     if (e.type.kind !== "map") throw new InternalCompilerError("llvm emitter bug: mapNew of non-map type");
     const B = host.B;
     const value = e.type.value;
-    const rc = isRefCounted(value) ? vAdapters(host, value) : { retain: "null", release: "null" };
-    host.declare(`declare ptr @scr_map_new(i32, i32, ptr, ptr, ptr)`);
+    const rc = isRefCounted(value) ? vAdapters(host.shapeHost, value) : { retain: "null", release: "null" };
     const m = B.tmp();
-    B.line(
-      `${m} = call ptr @scr_map_new(i32 ${mapKeyKindNum(e.type.key)}, i32 ${mapValKindNum(value)}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${isRefCounted(value) ? traceArg(host, value) : "null"})`,
-    );
+    const kAcc = mapKeyAccess(e.type.key);
+    if (kAcc === "ref") {
+      const keyRc = vAdapters(host.shapeHost, e.type.key);
+      host.declare(`declare ptr @scr_map_new_typed(i32, i32, ptr, ptr, ptr, ptr, ptr, ptr)`);
+      B.line(`${m} = call ptr @scr_map_new_typed(i32 ${mapKeyKindNum(e.type.key)}, i32 ${mapValKindNum(value)}, ptr ${keyRc.retain}, ptr ${keyRc.release}, ptr ${traceArg(host.shapeHost, e.type.key)}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${traceArg(host.shapeHost, value)})`);
+    } else {
+      host.declare(`declare ptr @scr_map_new(i32, i32, ptr, ptr, ptr)`);
+      B.line(`${m} = call ptr @scr_map_new(i32 ${mapKeyKindNum(e.type.key)}, i32 ${mapValKindNum(value)}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${traceArg(host.shapeHost, value)})`);
+    }
     const out = host.own({ name: m, type: e.type });
     // Seeded construction: set() each pair in source order — a repeated
     // key overwrites (the runtime releases the old value).
-    const kAcc = mapKeyAccess(e.type.key);
     const vAcc = elemAccess(value);
     for (const pair of e.seed ?? []) {
       const k = host.emitExpr(pair.key);
@@ -563,6 +567,19 @@ export function emitMapLikeIntrinsic(host: LlvmEmitterContext,
         // instance. When V is itself a union, the stored box IS the
         // result (`undefined` sorts last in canonical arm order).
         const k = host.emitExpr(e.args[0]!);
+        if (value.kind === "dyn") {
+          host.declare(`declare ptr @scr_map_get_${kAcc}_ref(ptr, ${kTy})`);
+          host.declare(`declare ptr @scr_dyn_undefined()`);
+          const raw = B.tmp();
+          const absent = B.tmp();
+          const isnull = B.tmp();
+          const result = B.tmp();
+          B.line(`${raw} = call ptr @scr_map_get_${kAcc}_ref(ptr ${r.name}, ${kTy} ${k.name})`);
+          B.line(`${absent} = call ptr @scr_dyn_undefined()`);
+          B.line(`${isnull} = icmp eq ptr ${raw}, null`);
+          B.line(`${result} = select i1 ${isnull}, ptr ${absent}, ptr ${raw}`);
+          return host.own({ name: result, type: e.type });
+        }
         if (e.type.kind !== "union") throw new InternalCompilerError("llvm emitter bug: map get result is not a union");
         const def = host.unionsById.get(e.type.unionId);
         const undefTag = undefinedArmTag(e.type, host.unionsById);
@@ -725,9 +742,9 @@ export function emitSetNew(host: LlvmEmitterContext, e: IrExpr & { kind: "setNew
     const kAcc = mapKeyAccess(e.type.elem);
     const s = B.tmp();
     if (kAcc === "ref") {
-      const rc = vAdapters(host, e.type.elem);
-      host.declare(`declare ptr @scr_set_new_ref(ptr, ptr)`);
-      B.line(`${s} = call ptr @scr_set_new_ref(ptr ${rc.retain}, ptr ${rc.release})`);
+      const rc = vAdapters(host.shapeHost, e.type.elem);
+      host.declare(`declare ptr @scr_map_new_typed(i32, i32, ptr, ptr, ptr, ptr, ptr, ptr)`);
+      B.line(`${s} = call ptr @scr_map_new_typed(i32 ${mapKeyKindNum(e.type.elem)}, i32 0, ptr ${rc.retain}, ptr ${rc.release}, ptr ${traceArg(host.shapeHost, e.type.elem)}, ptr null, ptr null, ptr null)`);
     } else {
       host.declare(`declare ptr @scr_map_new(i32, i32, ptr, ptr, ptr)`);
       B.line(`${s} = call ptr @scr_map_new(i32 ${mapKeyKindNum(e.type.elem)}, i32 0, ptr null, ptr null, ptr null)`);

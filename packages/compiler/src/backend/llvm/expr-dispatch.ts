@@ -1,6 +1,6 @@
 /* Focused LLVM expression emission extracted from emitter.ts. */
 import { InternalCompilerError } from "../../errors.js";
-import { IrExpr } from "../../ir/ir.js";
+import { type IrExpr } from "../../ir/ir.js";
 import type { LlvmEmitterContext, ExprOf, LlValue } from "./expr-context.js";
 
 export function emitJsInteropExpr(host: LlvmEmitterContext, e: ExprOf<"jsMarshal" | "jsOp" | "jsExit" | "jsBridgePromise">): LlValue {
@@ -107,6 +107,7 @@ export function emitExpr(host: LlvmEmitterContext, e: IrExpr): LlValue {
       case "recordClone":
       case "recordKeyGet":
       case "recordOvfKeys":
+      case "recordOvfHas":
         return host.emitRecordExpr(e);
       case "dynFrom":
       case "dynFromJsval":

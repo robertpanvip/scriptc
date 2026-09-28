@@ -62,7 +62,7 @@ void scr_init(void);
 /* Program objects emitted by the bundled LLVM helper reference this symbol.
  * Its versioned spelling makes a mismatched manual runtime link fail before
  * the program can start. */
-void scr_runtime_abi_v1(void);
+void scr_runtime_abi_v3(void);
 
 /* ── the trap funnel (scr_console.c; scr_library.c under -DSCR_LIB) ──────
  * Every unrecoverable runtime trap — OOM, semantic range traps, internal-
@@ -490,14 +490,14 @@ ScrStr *scr_classobj_name(ScrClassObj *c);
 void scr_record_key_miss(ScrStr *k);
 
 /* ── error objects (scr_error.c) ──────────────────────────────────────
- * `Error` and its lib subclasses (TypeError/RangeError/SyntaxError) are a
+ * `Error` and its standard subclasses are a
  * RUNTIME-PROVIDED hierarchy: ScrError lays out exactly like a compiler-
  * emitted hierarchy class (rc, vt, then the fields), so `class MyError
  * extends Error` compiles as an ordinary derived class whose struct embeds
  * this prefix, and every vtable mechanism (base-typed release, preorder-
  * interval instanceof) applies unchanged.
  *
- * The four builtin classes' vtables live HERE as mutable globals because
+ * The builtin classes' vtables live HERE as mutable globals because
  * the runtime itself creates error instances (JSON/dynCheck/regex failures,
  * the island bridge) — but their preorder intervals depend on the whole
  * program's class forest, which only the compiler knows. Every emitted
@@ -519,6 +519,7 @@ typedef struct ScrError {
                     * the layout prefix: the compiler's %Error class defs
                     * carry a matching third field, so user subclasses
                     * embed the slot and release it NULL-guarded. */
+  struct ScrDyn *error_cause; /* NULL = absent; dyn undefined = present */
 } ScrError;
 
 enum {
@@ -527,9 +528,13 @@ enum {
   SCR_ERR_RANGE = 2,
   SCR_ERR_SYNTAX = 3,
   SCR_ERR_DOMEX = 4, /* DOMException — ScrDomException, the wider layout */
+  SCR_ERR_REFERENCE = 5,
+  SCR_ERR_EVAL = 6,
+  SCR_ERR_URI = 7,
+  SCR_ERR_COUNT = 8,
 };
 
-extern SCR_TL ScrVt scr_error_vts[5]; /* indexed by SCR_ERR_*; main() stamps pre/post */
+extern SCR_TL ScrVt scr_error_vts[SCR_ERR_COUNT]; /* indexed by SCR_ERR_*; main() stamps pre/post */
 
 struct ScrDyn; /* full declaration below (the checked-dynamic tree section) */
 
@@ -544,6 +549,7 @@ typedef struct ScrDomException {
   ScrStr *name;    /* "Error" default, or the resolved WebIDL name */
   ScrStr *message; /* "" when constructed without one */
   ScrStr *code;    /* the Node string-code slot (stays NULL here) */
+  struct ScrDyn *error_cause; /* shared ScrError prefix; unused by DOMException */
   double dom_code; /* the WebIDL legacy code (0 when the name is off-table) */
   bool has_cause;  /* the options form carried a `cause` member */
   struct ScrDyn *cause; /* owned; NULL when has_cause is false */
@@ -586,6 +592,15 @@ ScrError *scr_error_new(int kind, ScrStr *message);
  * the super(message) call of a compiled `extends Error` constructor. Both
  * arguments are borrowed. */
 void scr_error_init(void *obj, int kind, ScrStr *message);
+/* ECMAScript constructor arguments: dyn undefined defaults the message
+ * to ""; an options object's present cause is retained. All args borrowed.
+ * Message conversion can throw; new returns NULL with an exception pending.
+ * Kept separate so runtime-only throw sites need not link scr_json.c. */
+ScrError *scr_error_new_options(int kind, const struct ScrDyn *message, const struct ScrDyn *options);
+void scr_error_init_options(void *obj, int kind, const struct ScrDyn *message, const struct ScrDyn *options);
+void scr_error_install_cause_drop(void (*fn)(void *obj));
+bool scr_error_has_cause(ScrError *e);
+struct ScrDyn *scr_error_cause(ScrError *e); /* +1, undefined when absent */
 /* ECMA Error.prototype.toString: "", name, message, or "name: message".
  * Borrows e, returns +1. */
 ScrStr *scr_error_to_string(ScrError *e);
@@ -1202,39 +1217,37 @@ ScrArr *scr_regex_match_all_into(ScrStr *s, ScrRegex *re, ScrArr *indices);
  * are visited (they append), deleted entries are skipped (tombstones), and
  * a delete + re-add moves the key to the end (Node-verified).
  *
- * Keys are string (content) or number with SameValueZero: NaN equals NaN
+ * Keys are identity references, string (content), or number with SameValueZero: NaN equals NaN
  * (canonicalized before hashing) and -0 is normalized to +0 at insertion,
  * exactly like JS (a stored -0 key reads back as +0). Hash is FNV-1a over
- * the string bytes / the canonicalized f64 bit pattern.
+ * the reference address, string bytes, or canonicalized f64 bit pattern.
  *
  * Values are one uniform kind per map (like ScrArr elements): f64, bool, or
  * a refcounted pointer whose RC entry points arrive as function pointers at
  * construction (the SCR_BOX_OBJ technique — the runtime cannot know
- * per-class/per-record layouts). val_trace is non-NULL exactly when the
- * value type carries a cycle header: such maps are CYCLE-CAPABLE (a record/
- * object value can point back at the map holding it) and allocate with the
- * hidden collector header — their trace visits every live value, and the
- * collector teardown releases the complement (keys). Scalar-, string- and
- * array-valued maps keep the lean 1-word header (none of those can point
- * back at an owner).
+ * per-class/per-record layouts). key_trace and val_trace are non-NULL when
+ * their respective types carry cycle headers. Either side can point back
+ * at its map, so either adapter requires a hidden collector header. Trace
+ * visits each live edge on the traced sides; collector teardown releases
+ * the untraced complement. Maps with neither adapter use a lean RC header.
  *
- * Ownership: set BORROWS the key (the map retains string keys it stores)
+ * Ownership: set BORROWS the key (the map retains string/reference keys it stores)
  * and OWNS the value (+1 moves in; replacing releases the old value).
  * get/has/delete borrow the key; get returns +1 on ref values (NULL = not
  * found) or fills an out-param and returns a found flag for scalars.
- * delete releases the entry's key and value. iter_key_str and iter_val_ref
+ * delete releases the entry's key and value. iter_key_str/ref and iter_val_ref
  * return +1. iter_enter/iter_exit bracket a forEach loop: while the depth
  * is nonzero, growth keeps tombstones (indices stay stable) and clear only
  * tombstones entries — live-iteration semantics stay exact.
  */
 
-/* SCR_MAP_KEY_REF: refcounted-pointer keys hashed and compared by IDENTITY
- * (the pointer bits) — SameValueZero for JS objects IS reference identity,
- * so a Set of handle values (Set<http.Server>, the portless auxiliary-
- * server registry) is honest hashed storage. REF keys carry their own
- * retain/release adapters (scr_set_new_ref); only SETS use the kind so
- * far — the Map-key surface stays f64/string. */
-typedef enum { SCR_MAP_KEY_F64, SCR_MAP_KEY_STR, SCR_MAP_KEY_REF } ScrMapKeyKind;
+/* REF keys hash/compare pointer identity and carry their own RC adapters.
+ * UNION_REF owns the union wrapper but hashes/compares its reference payload;
+ * the frontend permits only unions of reference-identity arms for this kind.
+ * DYN owns a checked-value box and compares its JavaScript value using
+ * SameValueZero, including reference identity for object payloads.
+ * These key kinds serve both Maps and Sets. */
+typedef enum { SCR_MAP_KEY_F64, SCR_MAP_KEY_STR, SCR_MAP_KEY_REF, SCR_MAP_KEY_UNION_REF, SCR_MAP_KEY_DYN } ScrMapKeyKind;
 typedef enum { SCR_MAP_VAL_F64, SCR_MAP_VAL_BOOL, SCR_MAP_VAL_REF } ScrMapValKind;
 
 typedef struct {
@@ -1248,13 +1261,14 @@ typedef struct ScrMap {
   ScrMapKeyKind key_kind;
   ScrMapValKind val_kind;
   /* SCR_MAP_VAL_REF only; val_trace non-NULL iff the value type carries a
-   * cycle header (which is also the map's own headered-allocation flag). */
+   * cycle header. The map has a header when either trace is non-NULL. */
   void *(*val_retain)(void *);
   void (*val_release)(void *);
   ScrTraceFn val_trace;
-  /* SCR_MAP_KEY_REF only (scr_set_new_ref); NULL otherwise. */
+  /* SCR_MAP_KEY_REF, SCR_MAP_KEY_UNION_REF and SCR_MAP_KEY_DYN only. */
   void *(*key_retain)(void *);
   void (*key_release)(void *);
+  ScrTraceFn key_trace;
   size_t nentries; /* dense entries used, tombstones included */
   size_t nlive;    /* live entries (Map.size) */
   size_t ecap;     /* entries capacity */
@@ -1270,6 +1284,15 @@ typedef struct ScrMap {
 ScrMap *scr_map_new(ScrMapKeyKind key_kind, ScrMapValKind val_kind,
                      void *(*val_retain)(void *), void (*val_release)(void *),
                      ScrTraceFn val_trace); /* returns +1 */
+/* Typed identity keys retain their original representation for iteration.
+ * UNION_REF compares the wrapped reference, so reboxing cannot change key
+ * identity. The compiler admits only unions of identity-bearing arms.
+ * Either trace adapter requires a collector header on the map itself. */
+ScrMap *scr_map_new_typed(ScrMapKeyKind key_kind, ScrMapValKind val_kind,
+                         void *(*key_retain)(void *), void (*key_release)(void *),
+                         ScrTraceFn key_trace,
+                         void *(*val_retain)(void *), void (*val_release)(void *),
+                         ScrTraceFn val_trace);
 ScrMap *scr_map_retain(ScrMap *m);
 void scr_map_release(ScrMap *m); /* NULL-tolerant */
 void *scr_map_retain_v(void *m);
@@ -1286,7 +1309,7 @@ bool scr_map_delete_f64(ScrMap *m, double key);
 bool scr_map_delete_str(ScrMap *m, const ScrStr *key);
 bool scr_map_delete_ref(ScrMap *m, const void *key);
 
-/* set: key borrowed (string keys are retained when stored), value moves in
+/* set: key borrowed (string/reference keys are retained when stored), value moves in
  * for _ref (replacing releases the old value; the stored key is kept, like
  * JS — only the value changes on overwrite). */
 void scr_map_set_f64_f64(ScrMap *m, double key, double v);
@@ -1295,7 +1318,9 @@ void scr_map_set_f64_ref(ScrMap *m, double key, void *v);
 void scr_map_set_str_f64(ScrMap *m, ScrStr *key, double v);
 void scr_map_set_str_bool(ScrMap *m, ScrStr *key, bool v);
 void scr_map_set_str_ref(ScrMap *m, ScrStr *key, void *v);
-void scr_map_set_ref_f64(ScrMap *m, void *key, double v); /* REF-key sets */
+void scr_map_set_ref_f64(ScrMap *m, void *key, double v);
+void scr_map_set_ref_bool(ScrMap *m, void *key, bool v);
+void scr_map_set_ref_ref(ScrMap *m, void *key, void *v);
 
 /* get: scalar variants fill *out and return the found flag; ref variants
  * return +1 or NULL (values are never NULL, so NULL means "absent"). The
@@ -1307,6 +1332,9 @@ void *scr_map_get_f64_ref(const ScrMap *m, double key);
 bool scr_map_get_str_f64(const ScrMap *m, const ScrStr *key, double *out);
 bool scr_map_get_str_bool(const ScrMap *m, const ScrStr *key, bool *out);
 void *scr_map_get_str_ref(const ScrMap *m, const ScrStr *key);
+bool scr_map_get_ref_f64(const ScrMap *m, const void *key, double *out);
+bool scr_map_get_ref_bool(const ScrMap *m, const void *key, bool *out);
+void *scr_map_get_ref_ref(const ScrMap *m, const void *key);
 
 /* Iteration primitives behind the compiler's forEach desugar: an index loop
  * over the dense entries array, re-reading iter_count every pass (appends
@@ -2089,6 +2117,10 @@ typedef enum {
    * Carries NO payload (the value rides the generator's ret slot), so
    * scr_exc_clear/reset need no arm. Never escapes a generator fiber. */
   SCR_EXC_GENRET,
+  /* Refcounted values whose JS typeof is not object (Symbol, BigInt,
+   * functions, and checked-dynamic primitives). The payload uses the
+   * same ownership as REF. */
+  SCR_EXC_PRIMITIVE_REF,
 } ScrExcKind;
 
 /* One cell per fiber (JS has one exception in flight per execution
@@ -2119,7 +2151,12 @@ void scr_throw_str(ScrStr *v); /* takes ownership */
  * passes the payload type's `_v` adapters, like scr_union_new_ref); trace
  * is non-NULL iff the payload type carries a cycle header. */
 void scr_throw_ref(void *v, void *(*retain)(void *), void (*release)(void *),
-                    ScrTraceFn trace);
+                   ScrTraceFn trace);
+/* Store a reference whose JS typeof was checked at the throw site. */
+void scr_throw_ref_classified(void *v, void *(*retain)(void *), void (*release)(void *),
+                              ScrTraceFn trace, bool object);
+void scr_throw_primitive_ref(void *v, void *(*retain)(void *), void (*release)(void *),
+                             ScrTraceFn trace);
 /* Same ownership contract as scr_throw_ref; the payload must be a
  * hierarchy-class instance (vtable word present) — see SCR_EXC_OBJ. */
 void scr_throw_obj(void *v, void *(*retain)(void *), void (*release)(void *),
@@ -2162,6 +2199,9 @@ void scr_rethrow(const ScrCaught *c);
 /* `e instanceof C` on a catch binding: an OBJ payload whose vtable preorder
  * lies inside C's interval. False for every other payload kind. */
 bool scr_caught_instanceof(const ScrCaught *c, size_t pre, size_t post);
+/* `typeof e === "object"` on a catch binding. Throw sites choose REF or
+ * PRIMITIVE_REF from the value's JS typeof before storing the payload. */
+bool scr_caught_is_object(const ScrCaught *c);
 /* `String(e)` / `${e}` on a catch binding: JS's String() over the snapshot
  * — numbers/booleans/strings by value, Error payloads via
  * scr_error_to_string ("name: message" — String(e) carries no stack in
@@ -3448,8 +3488,20 @@ void scr_dyn_release(ScrDyn *d); /* releases the tree recursively; NULL-tolerant
  * compiler-emitted pending checks — json.parse is in the may-throw seed). */
 ScrDyn *scr_json_parse(ScrStr *text);
 
+/* Native JSON callbacks. All inputs borrowed, result owned (+1), NULL on
+ * pending exception. Stringify returns a dyn string OR actual undefined
+ * when the replacer omits the root. gap has already applied space rules. */
+ScrDyn *scr_json_parse_reviver(ScrStr *text, const ScrDyn *reviver);
+ScrDyn *scr_json_stringify_replacer(const ScrDyn *value, const ScrDyn *replacer, const ScrStr *gap);
+
+
 /* BORROWED member lookup on a SCR_DYN_OBJ; NULL when the key is absent. */
 ScrDyn *scr_dyn_obj_get(const ScrDyn *d, const char *key, size_t key_len);
+/* Literal discriminator tests used before selecting a typed record layout.
+ * Missing fields and different primitive kinds never match. Borrowed args. */
+bool scr_dyn_field_eq_str(const ScrDyn *d, const ScrStr *key, const ScrStr *value);
+bool scr_dyn_field_eq_num(const ScrDyn *d, const ScrStr *key, double value);
+bool scr_dyn_field_eq_bool(const ScrDyn *d, const ScrStr *key, bool value);
 
 /* Object.keys/values/entries over the checked-dynamic tree: JS own-key order (array-index
  * keys ascending first), dyn-array results (+1); values/entries RETAIN
@@ -3597,6 +3649,12 @@ double scr_dyn_number_coerce(const ScrDyn *d);
  * back to its runtime error and the class's stamped preorder interval
  * answers. A dyn value that never came from an error answers false. */
 bool scr_dyn_err_instanceof(const ScrDyn *d, double kind);
+/* Property read on a checked-dynamic object. Own fields take precedence;
+ * runtime Error instances inherit their exact builtin constructor token.
+ * The result is owned. */
+ScrDyn *scr_dyn_obj_read(const ScrDyn *d, const char *key, size_t key_len);
+/* JS typeof comparison, including null's "object" result. */
+bool scr_dyn_is_object(const ScrDyn *d);
 
 /* structuredClone over the checked-dynamic tree: JSON-safe data + bytes deep-copy;
  * functions/handles throw the spec's catchable DataCloneError; cycles
@@ -4821,6 +4879,7 @@ ScrJsval *scr_jsval_iter_new(ScrJsval *a);
 ScrJsval *scr_jsval_plus(ScrJsval *a); /* unary + (ToNumber) */
 int scr_jsval_truthy(ScrJsval *a);
 ScrStr *scr_jsval_typeof(ScrJsval *a);
+bool scr_jsval_is_object(ScrJsval *a);
 ScrStr *scr_jsval_to_str(ScrJsval *a); /* String(v); NULL = bridged */
 
 /* Property/element access and calls. Names are NUL-terminated ScrStr

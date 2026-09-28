@@ -37,10 +37,11 @@ import { InternalCompilerError } from "../../errors.js";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFile } from "../program.js";
-import { BOOL, DYN, F64, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, canConvertToDyn, canDynCheckTo, shapeHasAccessorSlots, typeKey } from "../../ir/ir.js";
+import { BOOL, DYN, F64, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, canConvertToDyn, canDynCheckTo, recordTextCodecClass, shapeHasAccessorSlots, typeKey } from "../../ir/ir.js";
 import type { ClassInfo } from "./lower-classes.js";
 import { isSafeToRepeat } from "./expressions/evaluation-safety.js";
 import { boolLit, numLit, strLit, varRef } from "../../ir/build.js";
+import { symbolFieldDisplayName } from "./symbol-fields.js";
 
 /* ── IR construction shorthand ───────────────────────────────────────── */
 function concatAll(parts: IrExpr[], loc: SrcLoc): IrExpr {
@@ -143,6 +144,8 @@ function inspectSupport(lowerer: Lowerer, t: IrType, visiting: Set<string>, out:
       visiting.add(t.shapeId);
       const shape = lowerer.shapes.get(t.shapeId);
       if (!shape) return "this record shape has no inspect lowering";
+      const codec = recordTextCodecClass(shape);
+      if (codec !== null) return `${codec} instances have no inspect lowering yet`;
       // Accessor-carrying shapes: Node prints the accessor names as
       // `x: [Getter]` / `[Setter]` / `[Getter/Setter]` in insertion order
       // — a position the static field walk does not track (accessor slots
@@ -709,15 +712,15 @@ function inspectHelper(lowerer: Lowerer, t: IrType, loc: SrcLoc): string {
       // assigns in declaration order (SEMANTICS.md 36's stance). SYMBOL-
       // keyed fields render LAST ([[OwnPropertyKeys]] lists all string
       // keys before all symbol keys — Node's inspect order) and their
-      // layout name IS Node's key spelling (`Symbol(limit)`), printed
-      // verbatim, never quoted.
+      // reserved layout names carry Node's key spelling (`Symbol(limit)`),
+      // printed verbatim after removing the internal slot prefix.
       const symNames = new Set(info.symbolFields?.values() ?? []);
       const ordered = [
         ...visible.filter((f) => !symNames.has(f.name)),
         ...visible.filter((f) => symNames.has(f.name)),
       ];
       for (const f of ordered) {
-        const key = symNames.has(f.name) ? f.name : inspectKey(f.name);
+        const key = symNames.has(f.name) ? symbolFieldDisplayName(f.name) : inspectKey(f.name);
         body.push(
           entry(concatAll([strLit(`${key}: `, loc), child(f.type, get(f.name, f.type))], loc), boolLit(false, loc)),
         );

@@ -3,11 +3,12 @@ import { InternalCompilerError } from "../../errors.js";
  * expression lands in a fresh C temp, with RC ownership tracked on the
  * emitter's frames (see the discipline comment in emitter core). */
 import type { CEmitter, Temp } from "./c-emitter.js";
-import { arrayOf, BOOL, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM_T, CHILDWRITER_T, DYN, F64, IrExpr, IrLibFn, IrRecordShape, IrType, islandPromisePayloadTag, isClassOwnEnumerableFieldName, isDynTypedRefType, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, NETSOCKET_T, RUNTIME_ERROR_CLASSES, STRING, typeEquals, typeKey } from "../../ir/ir.js";
-import { boxAccess, BYTES_NUM_KIND_C, BYTES_NUM_VAR_C, bytesElemKindC, cDecl, cFnPtrCast, cNumberLiteral, cStringLiteral, cType, DV_GET_KIND_C, DV_SET_KIND_C, elemAccess, mapKeyAccess, mapKeyKindC, mapValKindC, releaseCallC, retainCallC, vAdapters } from "./types.js";
+import { arrayOf, BOOL, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM_T, CHILDWRITER_T, DYN, F64, type IrExpr, type IrLibFn, type IrRecordShape, type IrType, islandPromisePayloadTag, isClassOwnEnumerableFieldName, isDynTypedRefType, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, NETSOCKET_T, RUNTIME_ERROR_CLASSES, STRING, typeEquals, typeKey } from "../../ir/ir.js";
+import { BYTES_NUM_KIND_C, BYTES_NUM_VAR_C, bytesElemKindC, cDecl, cFnPtrCast, cNumberLiteral, cStringLiteral, cType, DV_GET_KIND_C, DV_SET_KIND_C, elemAccess, mapKeyAccess, mapKeyKindC, mapValKindC, releaseCallC, retainCallC, vAdapters } from "./types.js";
 import { mangleClassNew, mangleClassRetain, mangleClassStruct, mangleField, mangleFnClosure, mangleFunction, mangleGlobal, mangleLocal, mangleRecordClone, mangleRecordNew, mangleRecordStruct, mangleVtStruct } from "../mangle.js";
 import { OVERFLOW_MEMBER } from "./shapes.js";
-import { dynDestrCheckHelper, dynIterNHelper, dynKeyGetHelper } from "./walkers.js";
+import { checkGlobalTdz, readBox, writeBox } from "./bindings.js";
+import { dynDestrCheckHelper, dynIterNHelper, dynKeyGetHelper, unionWidenHelper } from "./walkers.js";
 import { collectFfiRetainedOps, parseFfiCallbackKey } from "../ffi-callbacks.js";
 import { genResultThunkFor } from "./async.js";
 import { isStableReceiverOperand, matchStringSelfConcat, newValueMayThrow, streamTypedRefEligible, undefinedArmTag } from "../../ir/analysis.js";
@@ -176,7 +177,8 @@ function nestedTypedRefUnionAdapter(
   ctx: StreamTypedRefContext,
 ): string {
   const key = typeKey(t);
-  const unions = (ctx.unions ??= new Map());
+  if (ctx.unions === undefined) ctx.unions = new Map<string, string>();
+  const unions = ctx.unions;
   const existing = unions.get(key);
   if (existing) return existing;
   const def = emitter.unionsById.get(t.unionId);
@@ -625,6 +627,7 @@ export function emitStableReceiver(emitter: CEmitter, receiver: IrExpr, followin
       return emitter.newBorrowedTemp(receiver.type, mangleLocal(receiver.localId));
     }
     if (!local && emitter.globalsById.has(receiver.localId)) {
+      checkGlobalTdz(emitter, emitter.globalsById.get(receiver.localId)!);
       return emitter.newBorrowedTemp(receiver.type, mangleGlobal(receiver.localId));
     }
   }
@@ -663,6 +666,11 @@ function emitMapLikeIntrinsic(
       // in canonical arm order, so V's tags coincide with the result
       // union's and no re-tag exists (validated).
       const k = emitter.emitExpr(e.args[0]!);
+      if (value.kind === "dyn") {
+        const t = emitter.newTemp(e.type, `(ScrDyn *)scr_map_get_${kAcc}_ref(${r.name}, ${k.name})`);
+        emitter.line(`if (!${t.name}) ${t.name} = scr_dyn_undefined();`);
+        return t;
+      }
       if (e.type.kind !== "union") throw new InternalCompilerError("emitter bug: map get result is not a union");
       const def = emitter.unionsById.get(e.type.unionId);
       const undefTag = undefinedArmTag(e.type, emitter.unionsById);
@@ -793,40 +801,13 @@ function emitLiteralExpr(
         if (integerLoopIndex !== null) return emitter.newTemp(e.type, `(double)${integerLoopIndex}`);
         const local = emitter.currentLocals.get(e.localId);
         if (!local && emitter.globalsById.has(e.localId)) {
+          checkGlobalTdz(emitter, emitter.globalsById.get(e.localId)!);
           const gname = mangleGlobal(e.localId);
           return emitter.newTemp(e.type, isRefCounted(e.type) ? retainCallC(e.type, gname) : gname);
         }
         const name = mangleLocal(e.localId);
         if (local?.boxed) {
-          // Reads go through the shared binding; ref kinds come out +1.
-          const acc = boxAccess(e.type);
-          // A scalar TDZ box stores its value in a one-element ARRAY cell
-          // (the raw scalar slot has no spare sentinel state): reads peek
-          // the cell through the slot — the box keeps the array alive, so
-          // no retain/release pair is needed for the copied-out scalar.
-          const read =
-            acc === "ref"
-              ? `(${cType(e.type).trim()})scr_box_get_ref(${name})`
-              : local?.tdz
-                ? `scr_arr_get_${acc}((ScrArr *)(uintptr_t)${name}->slot, 0)`
-                : `scr_box_get_${acc}(${name})`;
-          if (local.tdz) {
-            // Forward-captured const: an empty box is the temporal dead
-            // zone — throw Node's exact catchable ReferenceError. The test
-            // peeks the payload slot BEFORE the retaining read (get_ref on
-            // an empty box would dereference NULL; the scalar cell peek
-            // would too). Interned literals are immortal (rc SIZE_MAX), so
-            // handing them to the ownership-taking thrower is safe.
-            const errName = emitter.internLiteral("ReferenceError");
-            const msg = emitter.internLiteral(`Cannot access '${local.name}' before initialization`);
-            emitter.line(`if (${name}->slot == 0) { /* TDZ: read before initialization */`);
-            emitter.indent++;
-            emitter.line(`scr_throw_error_named((ScrStr *)&${errName}, (ScrStr *)&${msg});`);
-            emitter.emitUnwind();
-            emitter.indent--;
-            emitter.line(`}`);
-          }
-          return emitter.newTemp(e.type, read);
+          return emitter.newTemp(e.type, readBox(emitter, local));
         }
         return emitter.newTemp(e.type, isRefCounted(e.type) ? retainCallC(e.type, name) : name);
       }
@@ -912,14 +893,13 @@ function emitOperatorExpr(
         const local = emitter.currentLocals.get(e.localId);
         const one = e.op === "+" ? "+ 1" : "- 1";
         if (local?.boxed) {
-          const box = mangleLocal(e.localId);
-          const old = emitter.newTemp(e.type, `scr_box_get_${boxAccess(e.type)}(${box})`);
+          const old = emitter.newTemp(e.type, readBox(emitter, local));
           if (e.prefix) {
             const t = emitter.newTemp(e.type, `${old.name} ${one}`);
-            emitter.line(`scr_box_set_${boxAccess(e.type)}(${box}, ${t.name});`);
+            writeBox(emitter, local, t.name);
             return t;
           }
-          emitter.line(`scr_box_set_${boxAccess(e.type)}(${box}, ${old.name} ${one});`);
+          writeBox(emitter, local, `${old.name} ${one}`);
           return old;
         }
         if (!local && !emitter.globalsById.has(e.localId)) {
@@ -1003,12 +983,13 @@ function emitOperatorExpr(
           // box_set takes ownership of the passed reference, so hand it a
           // retained copy and keep the temp's own reference for the yield.
           const stored = isRefCounted(v.type) ? retainCallC(v.type, v.name) : v.name;
-          emitter.line(`scr_box_set_${boxAccess(local.type)}(${mangleLocal(e.localId)}, ${stored});`);
+          writeBox(emitter, local, stored);
           return v;
         }
         if (!local && !emitter.globalsById.has(e.localId)) {
           throw new InternalCompilerError(`emitter bug: assignExpr to unknown binding ${e.localId}`);
         }
+        if (!local) checkGlobalTdz(emitter, emitter.globalsById.get(e.localId)!);
         const target = local ? mangleLocal(e.localId) : mangleGlobal(e.localId);
         if (isRefCounted(v.type)) {
           // Old-value release is NULL-tolerant for globals (statics start
@@ -1021,13 +1002,15 @@ function emitOperatorExpr(
         return v;
       }
       case "seqExpr": {
-        // Statements mid-expression: C emission is linear, so each
-        // statement emits in place (its own frame, exactly statement
-        // position) and the result is an ordinary temp of the current
-        // frame. The validator restricted stmts to straight-line writes —
-        // no jump can leave the region.
+        // Keep saved operands alive through the enclosing expression:
+        // tuple spreads and JS arguments reuse them in later call slots.
+        // The current frame still cleans up on the path that created them,
+        // including a lazy branch that is skipped on later loop iterations.
+        emitter.scopes.push([]);
         for (const s of e.stmts) emitter.emitStmt(s);
-        return emitter.emitExpr(e.result);
+        const result = emitter.emitExpr(e.result);
+        emitter.currentFrame().push(...emitter.scopes.pop()!);
+        return result;
       }
     default: {
       const _exhaustive: never = e;
@@ -1197,17 +1180,19 @@ function emitControlExpr(
         if (e.receiver.type.kind !== "union") throw new InternalCompilerError("emitter bug: optChain receiver is not a union");
         const def = emitter.unionsById.get(e.receiver.type.unionId);
         if (!def) throw new InternalCompilerError(`emitter bug: optChain of unknown union ${e.receiver.type.unionId}`);
-        const unitTags = def.arms.flatMap((a, i) => (isUnitType(a) ? [i] : []));
+        const unitTags: number[] = def.arms.flatMap((a, i): number[] => (isUnitType(a) ? [i] : []));
         const narrowIdx = def.arms.findIndex((a) => !isUnitType(a));
         if (unitTags.length === 0 || narrowIdx < 0) throw new InternalCompilerError("emitter bug: optChain union arms");
-        const narrowed = def.arms[narrowIdx]!;
+        const multiple = def.arms.length - unitTags.length > 1;
+        const narrowed = multiple ? e.receiver.type : def.arms[narrowIdx]!;
         const r = emitter.emitExpr(e.receiver);
         const bind = `sc_t${emitter.tempCounter++}`;
         emitter.line(`${cDecl(narrowed, bind)} = ${isRefCounted(narrowed) ? "NULL" : "0"};`);
         if (isRefCounted(narrowed)) emitter.currentFrame().push({ name: bind, type: narrowed });
         const test = unitTags.map((t) => `${r.name}->tag == ${t}`).join(" || ");
-        const extract =
-          narrowed.kind === "f64"
+        const extract = multiple
+          ? retainCallC(narrowed, r.name)
+          : narrowed.kind === "f64"
             ? `scr_union_get_f64(${r.name})`
             : narrowed.kind === "bool"
               ? `scr_union_get_bool(${r.name})`
@@ -1366,7 +1351,7 @@ function emitControlExpr(
         if (e.left.type.kind !== "union") throw new InternalCompilerError("emitter bug: nullish left is not a union");
         const def = emitter.unionsById.get(e.left.type.unionId);
         if (!def) throw new InternalCompilerError(`emitter bug: nullish of unknown union ${e.left.type.unionId}`);
-        const unitTags = def.arms.flatMap((a, i) => (isUnitType(a) ? [i] : []));
+        const unitTags: number[] = def.arms.flatMap((a, i): number[] => (isUnitType(a) ? [i] : []));
         if (unitTags.length === 0) throw new InternalCompilerError("emitter bug: nullish union lacks unit arms");
         const l = emitter.emitExpr(e.left);
         emitter.moveTemp(l);
@@ -2076,7 +2061,7 @@ function emitContainerExpr(
             // nargs = the PRESENT index args (omitted ones skip Node's
             // validation); the 0 placeholders are never read past nargs.
             const n = e.args.length - 1;
-            const idx = [1, 2, 3, 4].map((i) => args[i]?.name ?? "0");
+            const idx = [1, 2, 3, 4].map((i: number) => args[i]?.name ?? "0");
             const t = emitter.newTemp(
               e.type,
               `scr_bytes_compare(${r.name}, ${args[0]!.name}, ${n}, ${idx.join(", ")})`,
@@ -2220,19 +2205,20 @@ function emitContainerExpr(
         }
       }
       case "mapNew": {
-        // Empty map: the runtime stores the value kind's RC entry points as
-        // function pointers (scalar values pass NULLs). The trace argument
-        // doubles as the cycle-capability flag: non-NULL exactly when the
-        // value type carries a collector header (record/object/union values
-        // can point back at the map) — such maps allocate with the header,
-        // scalar/string/array-valued maps stay lean (docs/memory.md).
+        // Each reference side supplies its own RC adapters. Either trace
+        // adapter requires a collector header: keys as well as values can
+        // hold a path back to the map.
         if (e.type.kind !== "map") throw new InternalCompilerError("emitter bug: mapNew of non-map type");
         const value = e.type.value;
         const rc = isRefCounted(value) ? vAdapters(value) : null;
+        const keyRc = mapKeyAccess(e.type.key) === "ref" ? vAdapters(e.type.key) : null;
+        const args = `${mapKeyKindC(e.type.key)}, ${mapValKindC(value)}, `;
+        const valueArgs = `${rc ? `&${rc.retain}` : "NULL"}, ${rc ? `&${rc.release}` : "NULL"}, ${emitter.traceArgC(value)}`;
         const m = emitter.newTemp(
           e.type,
-          `scr_map_new(${mapKeyKindC(e.type.key)}, ${mapValKindC(value)}, ` +
-            `${rc ? `&${rc.retain}` : "NULL"}, ${rc ? `&${rc.release}` : "NULL"}, ${emitter.traceArgC(value)})`,
+          keyRc
+            ? `scr_map_new_typed(${args}&${keyRc.retain}, &${keyRc.release}, ${emitter.traceArgC(e.type.key)}, ${valueArgs})`
+            : `scr_map_new(${args}${valueArgs})`,
         );
         // Seeded construction: set() each pair in source order — exactly
         // the statements the user would write on an empty map, so a
@@ -2253,18 +2239,17 @@ function emitContainerExpr(
       case "setNew": {
         // Empty set: the map runtime with the element as the KEY and the
         // value slot pinned to the scalar kind (every stored value is 0.0,
-        // never read back). No RC entry points, no trace: f64/string
-        // elements cannot point back, so sets are never cycle-capable and
-        // always allocate lean.
+        // never read back). Identity elements supply key RC/trace adapters;
+        // scalar and string elements use the lean constructor.
         if (e.type.kind !== "set") throw new InternalCompilerError("emitter bug: setNew of non-set type");
-        // Handle-kind elements (identity hashing) carry their RC adapters
+        // Reference elements (identity hashing) carry their RC adapters
         // at construction — the scr_arr_new_ref technique.
         const elemAcc = mapKeyAccess(e.type.elem);
         const rcAdapters = elemAcc === "ref" ? vAdapters(e.type.elem) : null;
         const s = emitter.newTemp(
           e.type,
           rcAdapters
-            ? `scr_set_new_ref(&${rcAdapters.retain}, &${rcAdapters.release})`
+            ? `scr_map_new_typed(${mapKeyKindC(e.type.elem)}, SCR_MAP_VAL_F64, &${rcAdapters.retain}, &${rcAdapters.release}, ${emitter.traceArgC(e.type.elem)}, NULL, NULL, NULL)`
             : `scr_map_new(${mapKeyKindC(e.type.elem)}, SCR_MAP_VAL_F64, NULL, NULL, NULL)`,
         );
         // Seeded construction (`new Set(values)`): one borrowed T[] whose
@@ -2497,8 +2482,25 @@ function emitCallExpr(
           }
           const arg = sourceArgs.get(i)!;
           switch (param) {
+            case "mutable-bytes":
+              nativeArgs.push(`(uint8_t *)${arg.name}->data`, `${arg.name}->len`);
+              break;
             case "f64":
               nativeArgs.push(arg.name);
+              break;
+            case "f32":
+              nativeArgs.push(`(float)${arg.name}`);
+              break;
+            case "i8":
+            case "i16": {
+              const bits = param === "i8" ? 8 : 16;
+              const coerced = `sc_t${emitter.tempCounter++}`;
+              emitter.line(`uint32_t ${coerced} = (uint32_t)scr_bit_ushr(${arg.name}, 0.0) & ${(2 ** bits) - 1}u;`);
+              nativeArgs.push(`(int${bits}_t)(${coerced} < ${2 ** (bits - 1)}u ? (int32_t)${coerced} : (int32_t)${coerced} - ${2 ** bits})`);
+              break;
+            }
+            case "u16":
+              nativeArgs.push(`(uint16_t)(uint32_t)scr_bit_ushr(${arg.name}, 0.0)`);
               break;
             case "bool":
               nativeArgs.push(`(uint8_t)(${arg.name} ? 1 : 0)`);
@@ -2563,6 +2565,10 @@ function emitCallExpr(
             return result;
           }
           case "u8":
+          case "f32":
+          case "i8":
+          case "u16":
+          case "i16":
           case "u32":
           case "i32": {
             const result = emitter.newTemp(e.type, `(double)${call}`);
@@ -2655,7 +2661,7 @@ function emitCallExpr(
         const cast = `(void *(*)(${paramTypes.join(", ") || "void"}))`;
         const call = `(${cast}${callee.name}->ctor)(${args.map((a) => a.name).join(", ")})`;
         const t = emitter.newTemp(e.type, `(${cType(e.type).trim()})${call}`);
-        if (newValueMayThrow(cls, emitter.classMeta, emitter.mayThrow)) emitter.emitPendingCheck();
+        if (newValueMayThrow(cls, emitter.classMeta.get(cls), emitter.mayThrow)) emitter.emitPendingCheck();
         return t;
       }
       case "instanceOfValue": {
@@ -2737,7 +2743,7 @@ function emitCallExpr(
 
 function emitRecordExpr(
   emitter: CEmitter,
-  e: ExprOf<"fieldGet" | "recordGet" | "recordLit" | "recordClone" | "recordKeyGet" | "recordOvfKeys">,
+  e: ExprOf<"fieldGet" | "recordGet" | "recordLit" | "recordClone" | "recordKeyGet" | "recordOvfKeys" | "recordOvfHas">,
 ): Temp {
   switch (e.kind) {
       case "fieldGet":
@@ -2816,6 +2822,11 @@ function emitRecordExpr(
         const key = emitter.emitExpr(e.key);
         const helper = emitter.recordKeyGetHelper(e.shapeId, e.type, e.overflowOnly === true);
         return emitter.newTemp(e.type, `${helper}(${obj.name}, ${key.name})`);
+      }
+      case "recordOvfHas": {
+        const obj = emitter.emitExpr(e.obj);
+        const key = emitter.emitExpr(e.key);
+        return emitter.newTemp(e.type, `scr_map_has_str(${obj.name}->${OVERFLOW_MEMBER}, ${key.name})`);
       }
       case "recordOvfKeys": {
         // The overflow map's live keys in JS own-key order — a fresh
@@ -3089,6 +3100,11 @@ function emitDynamicExpr(
               emitter.line(`case ${i}: ${name} = ${read}; break;`);
               return;
             }
+            if (arm.elem.kind === "union" && e.type.kind === "union") {
+              const helper = unionWidenHelper(emitter, arm.elem.unionId, e.type.unionId);
+              emitter.line(`case ${i}: { ScrUnion *hit = ${read}; ${name} = ${helper}(hit); scr_union_release(hit); break; }`);
+              return;
+            }
             const tag = resultDef?.arms.findIndex((a) => typeEquals(a, arm.elem)) ?? -1;
             if (tag < 0 || e.type.kind !== "union" || isUnitType(arm.elem)) {
               throw new InternalCompilerError(`emitter bug: unionKeyGet element ${arm.elem.kind} outside the join`);
@@ -3116,6 +3132,11 @@ function emitDynamicExpr(
             const read = `((${cType(arm).trim()})scr_union_peek(${u.name}))->${mangleField(declared.name)}`;
             if (typeEquals(ft, e.type)) {
               emitter.line(`case ${i}: ${name} = ${isRefCounted(ft) ? retainCallC(ft, read) : read}; break;`);
+              return;
+            }
+            if (ft.kind === "union" && e.type.kind === "union") {
+              const helper = unionWidenHelper(emitter, ft.unionId, e.type.unionId);
+              emitter.line(`case ${i}: ${name} = ${helper}(${read}); break;`);
               return;
             }
             const tag = resultDef?.arms.findIndex((a) => typeEquals(a, ft)) ?? -1;
@@ -3266,6 +3287,10 @@ function emitDynamicExpr(
           const test = `scr_caught_instanceof(${c.name}, ${target.pre}, ${target.post})`;
           return emitter.newTemp(e.type, e.negated ? `!${test}` : test);
         }
+        if (e.test === "object") {
+          const test = `scr_caught_is_object(${c.name})`;
+          return emitter.newTemp(e.type, e.negated ? `!${test}` : test);
+        }
         const tag = { string: "SCR_EXC_STR", number: "SCR_EXC_F64", boolean: "SCR_EXC_BOOL" }[e.test];
         return emitter.newTemp(e.type, `${c.name}->kind ${e.negated ? "!=" : "=="} ${tag}`);
       }
@@ -3383,7 +3408,7 @@ function emitIntrinsicExpr(
             // bindings and the unhandled dispatch see the dyn value
             // itself — identity preserved.
             emitter.line(
-              `scr_throw_ref(${reason.name}, &${rc.retain}, &${rc.release}, NULL);${emitter.srcComment(e.loc)}`,
+              `scr_throw_ref_classified(${reason.name}, &${rc.retain}, &${rc.release}, NULL, scr_dyn_is_object(${reason.name}));${emitter.srcComment(e.loc)}`,
             );
           } else {
             emitter.line(
@@ -3643,6 +3668,13 @@ function emitAsyncExpr(
             } else if (t.kind === "object" && emitter.classMeta.get(t.className)?.hierarchy) {
               const rc = vAdapters(t);
               emitter.line(`scr_throw_obj(${a.name}, &${rc.retain}, &${rc.release}, ${emitter.traceArgC(t)});${emitter.srcComment(e.loc)}`);
+            } else if (t.kind === "symbol" || t.kind === "bigint" || t.kind === "func" || t.kind === "classval") {
+              const rc = vAdapters(t);
+              emitter.line(`scr_throw_primitive_ref(${a.name}, &${rc.retain}, &${rc.release}, NULL);${emitter.srcComment(e.loc)}`);
+            } else if (t.kind === "dyn" || t.kind === "jsval") {
+              const rc = vAdapters(t);
+              const test = t.kind === "dyn" ? "scr_dyn_is_object" : "scr_jsval_is_object";
+              emitter.line(`scr_throw_ref_classified(${a.name}, &${rc.retain}, &${rc.release}, ${emitter.traceArgC(t)}, ${test}(${a.name}));${emitter.srcComment(e.loc)}`);
             } else {
               const rc = vAdapters(t);
               emitter.line(`scr_throw_ref(${a.name}, &${rc.retain}, &${rc.release}, ${emitter.traceArgC(t)});${emitter.srcComment(e.loc)}`);
@@ -3699,6 +3731,13 @@ function emitAsyncExpr(
           } else if (t.kind === "object" && emitter.classMeta.get(t.className)?.hierarchy) {
             const rc = vAdapters(t);
             emitter.line(`scr_throw_obj(${a.name}, &${rc.retain}, &${rc.release}, ${emitter.traceArgC(t)});${emitter.srcComment(e.loc)}`);
+          } else if (t.kind === "symbol" || t.kind === "bigint" || t.kind === "func" || t.kind === "classval") {
+            const rc = vAdapters(t);
+            emitter.line(`scr_throw_primitive_ref(${a.name}, &${rc.retain}, &${rc.release}, NULL);${emitter.srcComment(e.loc)}`);
+          } else if (t.kind === "dyn" || t.kind === "jsval") {
+            const rc = vAdapters(t);
+            const test = t.kind === "dyn" ? "scr_dyn_is_object" : "scr_jsval_is_object";
+            emitter.line(`scr_throw_ref_classified(${a.name}, &${rc.retain}, &${rc.release}, ${emitter.traceArgC(t)}, ${test}(${a.name}));${emitter.srcComment(e.loc)}`);
           } else {
             const rc = vAdapters(t);
             emitter.line(`scr_throw_ref(${a.name}, &${rc.retain}, &${rc.release}, ${emitter.traceArgC(t)});${emitter.srcComment(e.loc)}`);
@@ -3807,7 +3846,7 @@ function emitAsyncExpr(
         emitter.line(`} else {`);
         emitter.indent++;
         emitter.line(`scr_await_hop();`);
-        const unitTags = def.arms.flatMap((a, i) => (isUnitType(a) ? [i] : []));
+        const unitTags: number[] = def.arms.flatMap((a, i): number[] => (isUnitType(a) ? [i] : []));
         if (unitTags.length === 1) {
           emitter.line(`${name} = ${emitter.unitInstanceRef(e.type.unionId, resTagOf(def.arms[unitTags[0]!]!))};`);
         } else {
@@ -4359,6 +4398,10 @@ function emitWebLibCall(state: LibCallState): Temp {
             // and the typed dummy is a NULL promise the pending check
             // abandons (releases are NULL-tolerant).
             return finish(`(scr_jsval_cast_fail(${arg(0)}, ${arg(1)}), NULL)`);
+          case "json.parseReviver":
+            return finish(`scr_json_parse_reviver(${arg(0)}, ${arg(1)})`);
+          case "json.stringifyReplacer":
+            return finish(`scr_json_stringify_replacer(${arg(0)}, ${arg(1)}, ${arg(2)})`);
           case "json.parse":
             // Borrows the text; returns +1 on a fresh dyn, or throws a
             // catchable SyntaxError-shaped string (may-throw seed set).
@@ -4693,6 +4736,8 @@ function emitFilesystemLibCall(state: LibCallState): Temp {
             return finish(`scr_zlib_inflate(${arg(0)})`);
           case "zlib.deflateRawSync":
             return finish(`scr_zlib_deflate_mode(${arg(0)}, 1.0, -1.0)`);
+          case "zlib.deflateLevelSync":
+            return finish(`scr_zlib_deflate_mode(${arg(0)}, ${arg(1)}, ${arg(2)})`);
           case "zlib.inflateRawSync":
             return finish(`scr_zlib_inflate_mode(${arg(0)}, 1.0)`);
           case "zlib.gzipSync":
@@ -8150,15 +8195,18 @@ function emitErrorsEventsLibCall(state: LibCallState): Temp {
             return finish(
               `(scr_throw_prop_type(${arg(0)}, ${arg(1)}, ${arg(2)}), ${isRefCounted(e.type) ? `(${cType(e.type).trim()})NULL` : "0"})`,
             );
+          case "error.newOptions":
           case "error.new": {
             // Which builtin the runtime constructs is named by the RESULT
-            // type; the message is borrowed (the runtime retains its copy).
-            // Never throws.
+            // type. Arguments are borrowed; raw message conversion may throw.
             if (e.type.kind !== "object") throw new InternalCompilerError("emitter bug: error.new result is not a class");
             const rec = RUNTIME_ERROR_CLASSES.get(e.type.className);
             if (!rec) throw new InternalCompilerError(`emitter bug: error.new of ${e.type.className}`);
-            return finish(`scr_error_new(${rec.kind}, ${arg(0)})`);
+            return finish(fn === "error.newOptions"
+              ? `scr_error_new_options(${rec.kind}, ${arg(0)}, ${arg(1)})`
+              : `scr_error_new(${rec.kind}, ${arg(0)})`);
           }
+          case "error.ctorOptions":
           case "error.ctor": {
             // super(message) into the builtin base: stamps name/message on
             // the receiver (borrowed, like the message). The RECEIVER'S
@@ -8167,11 +8215,17 @@ function emitErrorsEventsLibCall(state: LibCallState): Temp {
             if (recvT.kind !== "object") throw new InternalCompilerError("emitter bug: error.ctor receiver is not a class");
             const rec = RUNTIME_ERROR_CLASSES.get(recvT.className);
             if (!rec) throw new InternalCompilerError(`emitter bug: error.ctor on ${recvT.className}`);
-            return finish(`scr_error_init(${arg(0)}, ${rec.kind}, ${arg(1)})`);
+            return finish(fn === "error.ctorOptions"
+              ? `scr_error_init_options(${arg(0)}, ${rec.kind}, ${arg(1)}, ${arg(2)})`
+              : `scr_error_init(${arg(0)}, ${rec.kind}, ${arg(1)})`);
           }
+          case "error.cause":
+            return finish(`scr_error_cause((ScrError *)${arg(0)})`);
+          case "error.hasCause":
+            return finish(`scr_error_has_cause((ScrError *)${arg(0)})`);
           case "error.toString":
             // Borrowed receiver; +1 "name: message" (Node's toString rules).
-            return finish(`scr_error_to_string(${arg(0)})`);
+            return finish(`scr_error_to_string((ScrError *)${arg(0)})`);
           case "error.newDom":
             // new DOMException(message?, nameOrOptions?) — both dyn args
             // borrowed (WebIDL resolution runs in the runtime); +1
@@ -9176,6 +9230,7 @@ export function emitExpr(emitter: CEmitter, e: IrExpr): Temp {
     case "recordClone":
     case "recordKeyGet":
     case "recordOvfKeys":
+    case "recordOvfHas":
       return emitRecordExpr(emitter, e);
     case "dynFrom":
     case "dynFromJsval":

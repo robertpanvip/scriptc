@@ -155,6 +155,13 @@ export function emitFilesystemLibCall(host: LlvmEmitterContext, e: LibCallExpr):
       B.line(`call void @scr_zlib_codec_async(ptr ${args[0]!.name}, double ${f64Lit(mode)}, i1 ${compressing}, ptr ${args[1]!.name}, ptr @${adapter})`);
       return { name: "", type: e.type };
     }
+    if (e.fn === "zlib.deflateLevelSync") {
+      const args = e.args.map((arg) => host.emitExpr(arg));
+      host.declare("declare ptr @scr_zlib_deflate_mode(ptr, double, double)");
+      const raw = B.tmp();
+      B.line(`${raw} = call ptr @scr_zlib_deflate_mode(ptr ${args[0]!.name}, double ${args[1]!.name}, double ${args[2]!.name})`);
+      return host.own({ name: raw, type: e.type });
+    }
     if (
       e.fn === "zlib.deflateRawSync" || e.fn === "zlib.inflateRawSync" ||
       e.fn === "zlib.gzipSync" || e.fn === "zlib.gunzipSync" ||
@@ -221,11 +228,11 @@ export function emitFilesystemLibCall(host: LlvmEmitterContext, e: LibCallExpr):
       host.storeField(host.recordFieldPtr(rec, inner.shapeId, countField).ptr, F64, count);
       const payload = host.retainValue(args[1]!.name, e.args[1]!.type);
       B.line(`store ptr ${payload}, ptr ${host.recordFieldPtr(rec, inner.shapeId, "buffer").ptr}`);
-      const rc = vAdapters(host, inner);
+      const rc = vAdapters(host.shapeHost, inner);
       host.declare(`declare ptr @scr_promise_settled_ref(ptr, ptr, ptr, ptr)`);
       const result = B.tmp();
       B.line(
-        `${result} = call ptr @scr_promise_settled_ref(ptr ${rec}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${traceArg(host, inner)})`,
+        `${result} = call ptr @scr_promise_settled_ref(ptr ${rec}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${traceArg(host.shapeHost, inner)})`,
       );
       return host.own({ name: result, type: e.type });
     }
@@ -320,7 +327,7 @@ export function emitFilesystemLibCall(host: LlvmEmitterContext, e: LibCallExpr):
       const cnt = B.tmp();
       B.line(`${cnt} = call ${host.sizeType} @scr_fs_scandir_count(ptr ${snap})`);
       const arr = B.tmp();
-      B.line(`${arr} = ${arrNewCall(host, recT, cnt)}`);
+      B.line(`${arr} = ${arrNewCall(host.shapeHost, recT, cnt)}`);
       const arrayOut = host.own({ name: arr, type: arrayT });
       const iSlot = B.slot();
       B.entryAllocas.push(`${iSlot} = alloca ${host.sizeType}`);
@@ -353,12 +360,12 @@ export function emitFilesystemLibCall(host: LlvmEmitterContext, e: LibCallExpr):
       B.startBlock(le);
       B.line(`call void @scr_fs_scandir_free(ptr ${snap})`);
       if (!promiseForm) return arrayOut;
-      const rc = vAdapters(host, arrayT);
+      const rc = vAdapters(host.shapeHost, arrayT);
       host.declare(`declare ptr @scr_promise_settled_ref(ptr, ptr, ptr, ptr)`);
       host.moveTemp(arrayOut); // promise fulfillment owns the result array
       const promise = B.tmp();
       B.line(
-        `${promise} = call ptr @scr_promise_settled_ref(ptr ${arr}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${traceArg(host, arrayT)})`,
+        `${promise} = call ptr @scr_promise_settled_ref(ptr ${arr}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${traceArg(host.shapeHost, arrayT)})`,
       );
       return host.own({ name: promise, type: e.type });
     }
@@ -492,12 +499,13 @@ export function emitPathUrlLibCall(host: LlvmEmitterContext, e: LibCallExpr): Ll
         const cidrNullTag = cidrDef.arms.findIndex((a) => a.kind === "nullT");
         const r = B.tmp();
         B.line(`${r} = call ptr @${mangleRecordNew(t.shapeId)}()`);
-        for (const [field, sym] of [
+        const fields: [string, string][] = [
           ["address", "scr_os_ifaddrs_address"],
           ["netmask", "scr_os_ifaddrs_netmask"],
           ["family", "scr_os_ifaddrs_family"],
           ["mac", "scr_os_ifaddrs_mac"],
-        ] as const) {
+        ];
+        for (const [field, sym] of fields) {
           const v = B.tmp();
           B.line(`${v} = call ptr @${sym}(ptr ${snap}, ${host.sizeType} ${i}) ; +1`);
           B.line(`store ptr ${v}, ptr ${host.recordFieldPtr(r, t.shapeId, field).ptr}`);
@@ -541,9 +549,9 @@ export function emitPathUrlLibCall(host: LlvmEmitterContext, e: LibCallExpr): Ll
           B.line(`${su} = call ptr @scr_union_retain_v(ptr ${host.unitInstanceRef(st.unionId, undefTag)})`);
           B.line(`store ptr ${su}, ptr ${host.recordFieldPtr(r, t.shapeId, "scopeid").ptr}`);
         }
-        const rc = vAdapters(host, t);
+        const rc = vAdapters(host.shapeHost, t);
         const rowU = B.tmp();
-        B.line(`${rowU} = call ptr @scr_union_new_ref(i32 ${tag}, ptr ${r}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${traceArg(host, t)})`);
+        B.line(`${rowU} = call ptr @scr_union_new_ref(i32 ${tag}, ptr ${r}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${traceArg(host.shapeHost, t)})`);
         B.line(`store ptr ${rowU}, ptr ${rowSlot}`);
         B.br(lRow);
       };
@@ -575,12 +583,12 @@ export function emitPathUrlLibCall(host: LlvmEmitterContext, e: LibCallExpr): Ll
       B.br(lj);
       B.startBlock(lm);
       const fresh = B.tmp();
-      B.line(`${fresh} = ${arrNewCall(host, infoT, "1")}`);
-      const arrRc = vAdapters(host, arrT);
+      B.line(`${fresh} = ${arrNewCall(host.shapeHost, infoT, "1")}`);
+      const arrRc = vAdapters(host.shapeHost, arrT);
       const freshRet = B.tmp();
       B.line(`${freshRet} = call ptr @scr_arr_retain_v(ptr ${fresh})`);
       const bucketU = B.tmp();
-      B.line(`${bucketU} = call ptr @scr_union_new_ref(i32 ${arrTag}, ptr ${freshRet}, ptr ${arrRc.retain}, ptr ${arrRc.release}, ptr ${traceArg(host, arrT)})`);
+      B.line(`${bucketU} = call ptr @scr_union_new_ref(i32 ${arrTag}, ptr ${freshRet}, ptr ${arrRc.retain}, ptr ${arrRc.release}, ptr ${traceArg(host.shapeHost, arrT)})`);
       B.line(`call void @scr_map_set_str_ref(ptr ${ovf}, ptr ${nm}, ptr ${bucketU})`);
       B.line(`store ptr ${fresh}, ptr ${rowsSlot}`);
       B.br(lj);

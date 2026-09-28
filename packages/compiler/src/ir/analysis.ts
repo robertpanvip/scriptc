@@ -2,6 +2,7 @@ import { InternalCompilerError } from "../errors.js";
 import {
   DYN_HANDLE_KINDS,
   RUNTIME_STREAM_CLASSES,
+  typeEquals,
   type IrExpr,
   type IrLibFn,
   type IrRecordShape,
@@ -9,6 +10,19 @@ import {
   type IrType,
   type IrUnionDef,
 } from "./ir.js";
+
+/** Destination tags for a union widening that preserves every payload's
+ * representation. A missing arm is not a widening; callers must never
+ * reinterpret its tag under a different union definition. */
+export function unionWideningTags(from: readonly IrType[], to: readonly IrType[]): number[] | null {
+  const tags: number[] = [];
+  for (const arm of from) {
+    const tag = to.findIndex((candidate) => typeEquals(arm, candidate));
+    if (tag < 0) return null;
+    tags.push(tag);
+  }
+  return tags;
+}
 
 /**
  * Recognize the one concat shape whose destination binding can temporarily
@@ -35,10 +49,10 @@ export function matchStringSelfConcat(targetLocalId: string, value: IrExpr): IrE
   return value.right;
 }
 
-/** The class-graph surface needed by backend-independent hierarchy queries. */
+/** Descendant tree needed by constructor queries. Parent links deliberately
+ * stay out of this structural view: projecting them would revisit cycles. */
 export interface IrClassGraphNode {
   readonly def: { readonly name: string };
-  readonly base: IrClassGraphNode | null;
   readonly children: readonly IrClassGraphNode[];
 }
 
@@ -144,10 +158,9 @@ export function endsWithJump(stmts: readonly IrStmt[]): boolean {
  * the static class's descendant subtree. */
 export function newValueMayThrow(
   className: string,
-  classes: ReadonlyMap<string, IrClassGraphNode>,
+  meta: IrClassGraphNode | undefined,
   mayThrow: ReadonlySet<string>,
 ): boolean {
-  const meta = classes.get(className);
   if (!meta) throw new InternalCompilerError(`IR analysis bug: newValue on unknown class ${className}`);
   const any = (node: IrClassGraphNode): boolean =>
     mayThrow.has(`%${node.def.name}.constructor`) || node.children.some(any);
@@ -159,8 +172,15 @@ export function streamTypedRefEligible(t: IrType): boolean {
   return t.kind === "record" || t.kind === "array" || t.kind === "bytes";
 }
 
+/** Only ancestry is needed here. Descendant links would turn a native
+ * structural projection into a copy of the entire cyclic class graph. */
+export interface IrClassAncestry {
+  def: { name: string };
+  base: IrClassAncestry | null;
+}
+
 /** True when a class descends from a runtime stream class. */
-export function streamRooted(meta: IrClassGraphNode): boolean {
+export function streamRooted(meta: IrClassAncestry): boolean {
   for (let current = meta.base; current; current = current.base) {
     if (RUNTIME_STREAM_CLASSES.has(current.def.name)) return true;
   }
