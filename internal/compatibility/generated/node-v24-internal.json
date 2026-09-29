@@ -507,9 +507,9 @@
       "apiEntries": 276,
       "static": {
         "supported": 0,
-        "partial": 48,
+        "partial": 49,
         "refused": 0,
-        "not-implemented": 228,
+        "not-implemented": 227,
         "by-design": 0,
         "unreviewed": 0,
         "not-applicable": 0
@@ -915,9 +915,9 @@
       "apiEntries": 119,
       "static": {
         "supported": 0,
-        "partial": 25,
+        "partial": 30,
         "refused": 0,
-        "not-implemented": 94,
+        "not-implemented": 89,
         "by-design": 0,
         "unreviewed": 0,
         "not-applicable": 0
@@ -1299,9 +1299,9 @@
       "apiEntries": 62,
       "static": {
         "supported": 0,
-        "partial": 5,
+        "partial": 6,
         "refused": 0,
-        "not-implemented": 57,
+        "not-implemented": 56,
         "by-design": 0,
         "unreviewed": 0,
         "not-applicable": 0
@@ -50632,7 +50632,8 @@
           "tests/corpus/2940-fsp-realpath.ts",
           "tests/corpus/2941-fsp-lstat-identity.ts",
           "tests/corpus/2942-fsp-readdir-dirent.ts",
-          "tests/corpus/2950-fs-descriptor-publication.ts"
+          "tests/corpus/2950-fs-descriptor-publication.ts",
+          "tests/corpus/fs-native-realpath.ts"
         ]
       },
       "dynamic": {
@@ -55354,8 +55355,11 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:fs"
+        "status": "partial",
+        "evidence": "surface-manifest:node-builtin.fs.realpathSync.native",
+        "tests": [
+          "tests/corpus/fs-native-realpath.ts"
+        ]
       },
       "dynamic": {
         "status": "not-implemented",
@@ -86843,13 +86847,20 @@
         "status": "partial",
         "evidence": "derived:descendants",
         "tests": [
+          "packages/compiler/test/process-builtin-values.test.ts",
           "tests/corpus/2314-process-introspection.ts",
           "tests/corpus/2941-process-exit-code.ts",
           "tests/corpus/2942-process-exit-code-override.ts",
           "tests/corpus/2943-process-exit-code-invalid.ts",
           "tests/corpus/2944-process-exit-code-wrap.ts",
           "tests/corpus/2946-child-fork-ipc/main.ts",
-          "tests/corpus/990-process-basics.ts"
+          "tests/corpus/990-process-basics.ts",
+          "tests/corpus/process-builtin-values.js",
+          "tests/corpus/process-versions-storage.ts",
+          "tests/corpus/stdio-values.mjs",
+          "tests/corpus/stdio-write-errors.mjs",
+          "tests/corpus/stdio-write-overrides.mjs",
+          "tests/harness/event-loop.test.ts"
         ]
       },
       "dynamic": {
@@ -87714,8 +87725,12 @@
       "anchor": "processgetbuiltinmoduleid",
       "nodeStability": null,
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:process"
+        "status": "partial",
+        "evidence": "compiler-feature:process.process.getBuiltinModule",
+        "tests": [
+          "tests/corpus/process-builtin-values.js",
+          "packages/compiler/test/process-builtin-values.test.ts"
+        ]
       },
       "dynamic": {
         "status": "not-implemented",
@@ -89597,8 +89612,14 @@
       "anchor": "",
       "nodeStability": null,
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:process"
+        "status": "partial",
+        "evidence": "compiler-feature:process.stderr",
+        "tests": [
+          "tests/corpus/stdio-values.mjs",
+          "tests/corpus/stdio-write-overrides.mjs",
+          "tests/corpus/stdio-write-errors.mjs",
+          "tests/harness/event-loop.test.ts"
+        ]
       },
       "dynamic": {
         "status": "partial",
@@ -89644,8 +89665,14 @@
       "anchor": "",
       "nodeStability": null,
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:process"
+        "status": "partial",
+        "evidence": "compiler-feature:process.stdin",
+        "tests": [
+          "tests/corpus/stdio-values.mjs",
+          "tests/corpus/stdio-write-overrides.mjs",
+          "tests/corpus/stdio-write-errors.mjs",
+          "tests/harness/event-loop.test.ts"
+        ]
       },
       "dynamic": {
         "status": "partial",
@@ -89691,8 +89718,14 @@
       "anchor": "",
       "nodeStability": null,
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:process"
+        "status": "partial",
+        "evidence": "compiler-feature:process.stdout",
+        "tests": [
+          "tests/corpus/stdio-values.mjs",
+          "tests/corpus/stdio-write-overrides.mjs",
+          "tests/corpus/stdio-write-errors.mjs",
+          "tests/harness/event-loop.test.ts"
+        ]
       },
       "dynamic": {
         "status": "partial",
@@ -89876,8 +89909,11 @@
       "anchor": "",
       "nodeStability": null,
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:process"
+        "status": "partial",
+        "evidence": "compiler-feature:process.versions",
+        "tests": [
+          "tests/corpus/process-versions-storage.ts"
+        ]
       },
       "dynamic": {
         "status": "partial",
@@ -108306,8 +108342,10 @@
         "status": "partial",
         "evidence": "derived:descendants",
         "tests": [
-          "tests/corpus/1794-searchparams-url-live.ts",
-          "tests/corpus/2946-url-port-hash.ts"
+          "tests/corpus/2946-url-port-hash.ts",
+          "tests/corpus/file-url-percent-decoding.ts",
+          "tests/corpus/path-to-file-url-options.ts",
+          "tests/corpus/url-runtime-base.ts"
         ]
       },
       "dynamic": {
@@ -108419,8 +108457,11 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "evidence": "compiler-unmatched:url"
+        "status": "partial",
+        "evidence": "compiler-feature:url.URL",
+        "tests": [
+          "tests/corpus/url-runtime-base.ts"
+        ]
       },
       "dynamic": {
         "status": "partial",
@@ -109592,7 +109633,7 @@
         "status": "partial",
         "evidence": "surface-manifest:node-builtin.url.fileURLToPath",
         "tests": [
-          "tests/corpus/1794-searchparams-url-live.ts"
+          "tests/corpus/file-url-percent-decoding.ts"
         ]
       },
       "dynamic": {
@@ -109684,7 +109725,7 @@
         "status": "partial",
         "evidence": "surface-manifest:node-builtin.url.pathToFileURL",
         "tests": [
-          "tests/corpus/1794-searchparams-url-live.ts"
+          "tests/corpus/path-to-file-url-options.ts"
         ]
       },
       "dynamic": {

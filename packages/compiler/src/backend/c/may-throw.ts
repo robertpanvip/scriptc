@@ -101,10 +101,11 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
           f.throws = true;
           break;
         case "dynKeyGet":
+        case "dynHasKey":
           // The keyed read throws JS's TypeError on an undefined/null
           // receiver (the `?.` form answers undefined instead), and
           // HANDLE receivers can throw the loud unmodeled-property
-          // ladder on either form — seed both.
+          // ladder; Proxy get/has traps can throw too.
           f.throws = true;
           break;
         case "dynDestrCheck":
@@ -160,6 +161,9 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
           if (vt === "dyn" || vt === "record" || vt === "array" || vt === "union") f.throws = true;
           break;
         }
+        case "toString":
+          if (rec.operand.type.kind === "dyn" || rec.operand.type.kind === "union" || rec.operand.type.kind === "caught") f.throws = true;
+          break;
         case "jsOp":
         case "jsExit":
         case "jsMarshal":
@@ -185,10 +189,10 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
           break;
         case "bytesNew": {
           // The size form (`new Uint8Array(n)`) throws Node's "Invalid
-          // typed array length" RangeError on a bad length; copy/array
-          // sources never throw.
+          // typed array length" RangeError on a bad length. Checked
+          // inputs can also throw during element conversion.
           const source = rec.source;
-          if (source && source.type?.kind === "f64") f.throws = true;
+          if (source && (source.type?.kind === "f64" || source.type?.kind === "dyn")) f.throws = true;
           break;
         }
         case "bytesIntrinsic":
@@ -208,8 +212,8 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
           f.throws = true;
           break;
         case "regexIntrinsic":
-          // replaceAll and matchAll without /g throw Node's TypeError;
-          // split throws on a pattern with capture groups — all catchable.
+          // Keep the conservative exception check for these operations;
+          // replaceAll and matchAll without /g throw Node's TypeError.
           if (rec.method === "replaceAll" || rec.method === "split" || rec.method === "matchAll" || rec.method === "matchAllInto") {
             f.throws = true;
           }

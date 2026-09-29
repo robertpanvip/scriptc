@@ -1,5 +1,6 @@
+import { BUF_NUM_METHODS } from "./buffer-numeric-methods.js";
 import * as ts from "../../ts7/adapter.js";
-import { BIGINT_T, BOOL, BYTES_U8, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrType, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, typeEquals } from "../../../ir/ir.js";
+import { BYTES_ELEMENT_SIZE, BIGINT_T, BOOL, BYTES_U8, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrType, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, typeEquals } from "../../../ir/ir.js";
 import { locOf } from "../../program.js";
 import type { Lowerer } from "../lowerer.js";
 import { dynUndefinedExpr, own } from "../lowerer.js";
@@ -96,28 +97,41 @@ function lowerBytesToSortedCall(
 /* ── typed arrays / Buffer ─────────────────────────────────────────────── */
 
 /** The typed-array constructors with a runtime representation, by lib
- * interface name. Other flavors (Int8Array, Float16Array, ...) fall through
+ * interface name. Other flavors (Float16Array, BigInt64Array, ...) fall through
  * to the generic stdlib-constructor fence. DataView is handled separately. */
 const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
   Uint8Array: "u8",
+  Uint8ClampedArray: "u8c",
+  Int8Array: "i8",
+  Uint16Array: "u16",
+  Int16Array: "i16",
   Uint32Array: "u32",
   Int32Array: "i32",
   Float32Array: "f32",
   Float64Array: "f64",
 };
 
-/** `new Uint8Array(...)` / `new Uint32Array(...)` / `new Float32Array(...)` / `new Float64Array(...)`
+/** Numeric typed-array constructors
    * (stdlib provenance — a user's own class with the name resolves through
    * classBySymbol). Lowered argument shapes: none (empty), a length
    * (zero-filled; ToIndex at runtime — invalid lengths throw Node's
-   * RangeError), a same-kind typed array or Buffer (an independent COPY —
+   * RangeError), a numeric typed array or Buffer (an independent COPY —
    * the readFile chain's `new Uint8Array(await readFile(p))`), a number[]
    * literal (element-coerced; its contextual type is the lib's
    * ArrayLike/Iterable union, which cannot map — the Set-seed pattern), or
-   * a number[]-typed value. ArrayBuffer/view forms are fenced: scriptc
-   * typed arrays own their storage. Null when this isn't a stdlib
+   * a number[]-typed value, or checked native input with runtime length /
+   * array-like dispatch. ArrayBuffer inputs create shared views.
+   * Null when this isn't a stdlib
    * typed-array construction. */
 export function lowerBytesNew(lowerer: Lowerer, expr: ts.NewExpression, symbol: ts.Symbol | null | undefined): IrExpr | null {
+  if (symbol?.name === "ArrayBuffer" && lowerer.isStdlibSymbol(symbol)) {
+    const args = expr.arguments ?? [];
+    if (args.length > 1 || args.some(ts.isSpreadElement)) {
+      lowerer.noLowering("resizable ArrayBuffer construction", expr, "fixed-length ArrayBuffers accept a byte length; resizable storage is not supported yet");
+    }
+    const length = args[0] ? lowerer.coerceInto(args[0], lowerer.lowerExpr(args[0]), DYN) : dynUndefinedExpr(locOf(expr));
+    return { kind: "libCall", fn: "arrayBuffer.new", args: [length], type: DYN, loc: locOf(expr) };
+  }
   if (symbol && symbol.name === "DataView" && lowerer.isStdlibSymbol(symbol)) {
     return lowerDataViewNew(lowerer, expr);
   }
@@ -128,6 +142,9 @@ export function lowerBytesNew(lowerer: Lowerer, expr: ts.NewExpression, symbol: 
   const loc = locOf(expr);
   const args = expr.arguments ?? [];
   if (args.length === 0) return { kind: "bytesNew", source: null, type, loc };
+  if (args.length >= 2 && args.length <= 3 && !args.some(ts.isSpreadElement)) {
+    return lowerArrayBufferView(lowerer, args, elem, loc);
+  }
   if (args.length === 1 && !ts.isSpreadElement(args[0]!)) {
     const argNode = args[0]!;
     if (ts.isArrayLiteralExpression(argNode) && !argNode.elements.some(ts.isSpreadElement)) {
@@ -135,8 +152,7 @@ export function lowerBytesNew(lowerer: Lowerer, expr: ts.NewExpression, symbol: 
       const seed: IrExpr = { kind: "arrayLit", elems, type: arrayOf(F64), loc };
       return { kind: "bytesNew", source: seed, type, loc };
     }
-    // The SYNTACTIC `new T(new ArrayBuffer(n))` and `new T(new
-    // SharedArrayBuffer(n))` forms — fresh-buffer construction (the
+    // The SYNTACTIC `new T(new SharedArrayBuffer(n))` form — fresh-buffer construction (the
     // shared spelling is the Atomics.wait sleep idiom's). The buffer
     // never exists as a value: n must be a byte-length LITERAL divisible
     // by the element size (tsc would admit any number; a bad one is
@@ -146,12 +162,11 @@ export function lowerBytesNew(lowerer: Lowerer, expr: ts.NewExpression, symbol: 
     // else can ever reference it, so neither sharing (scriptc has no
     // threads) nor aliasing is observable — SEMANTICS.md documents the
     // stance. The RESIZABLE form (a maxByteLength options bag) fences by
-    // name: resize needs the buffer to exist as a value, and none does.
+    // name: this erasure has no shared or growable buffer representation.
     if (
       ts.isNewExpression(argNode) &&
       ts.isIdentifier(argNode.expression) &&
-      (argNode.expression.text === "ArrayBuffer" ||
-        argNode.expression.text === "SharedArrayBuffer") &&
+      argNode.expression.text === "SharedArrayBuffer" &&
       lowerer.isStdlibSymbol(lowerer.resolveValueSymbol(argNode.expression) ?? undefined)
     ) {
       const bufCtor = argNode.expression.text;
@@ -159,12 +174,11 @@ export function lowerBytesNew(lowerer: Lowerer, expr: ts.NewExpression, symbol: 
         lowerer.noLowering(
           `new ${name} over a resizable ${bufCtor}`,
           argNode,
-          "a maxByteLength options bag makes the buffer resizable, and resizing needs the buffer " +
-            "to exist as a runtime value — no free-standing ArrayBuffer value exists (the buffer here " +
-            "erases into the view): drop the options bag",
+          "a maxByteLength options bag needs growable shared storage; the fixed-length " +
+            "SharedArrayBuffer here erases into the view: drop the options bag",
         );
       }
-      const elemSize = elem === "u8" ? 1 : elem === "f64" ? 8 : 4;
+      const elemSize = BYTES_ELEMENT_SIZE[elem];
       const lenArg = argNode.arguments?.length === 1 ? argNode.arguments[0] : undefined;
       const lenT = lenArg ? lowerer.typeOf(lenArg) : null;
       const byteLen = lenT?.isNumberLiteralType() ? lenT.value : null;
@@ -200,23 +214,16 @@ export function lowerBytesNew(lowerer: Lowerer, expr: ts.NewExpression, symbol: 
     }
     if (
       src.type.kind === "f64" ||
-      typeEquals(src.type, type) ||
+      src.type.kind === "bytes" || src.type.kind === "dyn" ||
       (src.type.kind === "array" && src.type.elem.kind === "f64")
     ) {
       return { kind: "bytesNew", source: src, type, loc };
-    }
-    if (src.type.kind === "bytes") {
-      lowerer.noLowering(
-        `new ${name} over a '${lowerer.fmt(src.type)}'`,
-        argNode,
-        "cross-kind typed-array conversion has no lowering — copy element by element",
-      );
     }
     lowerer.noLowering(
       `new ${name} over '${lowerer.fmt(src.type)}' values`,
       argNode,
       `supported: new ${name}(), (length), (typedArray) — always a copy — or (number[]); ` +
-        "ArrayBuffers and views do not exist here (narrow unions first)",
+        "or (ArrayBuffer, byteOffset?, length?) for shared storage (narrow unions first)",
     );
   }
   lowerer.noLowering(
@@ -226,85 +233,49 @@ export function lowerBytesNew(lowerer: Lowerer, expr: ts.NewExpression, symbol: 
   );
 }
 
-/** `new DataView(x.buffer, byteOffset?, byteLength?)` (stdlib provenance).
-   * The first argument must be the SYNTACTIC `.buffer` of a typed-array/
-   * Buffer value — `x.buffer` names x's own storage (scriptc typed arrays
-   * always own it whole, byteOffset 0), so the view construction takes x
-   * itself as the receiver and no ArrayBuffer value ever exists.
-   * byteOffset/byteLength are optional f64s (omitted args OMITTED, like
-   * slice); bad indices THROW Node's RangeErrors catchably. The result is
-   * a true borrowed view: reads and writes through it alias x. */
-function lowerDataViewNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
-  const loc = locOf(expr);
-  const args = expr.arguments ?? [];
-  const bufNode = args[0];
-  if (!bufNode || args.length > 3 || args.some(ts.isSpreadElement)) {
-    lowerer.noLowering(
-      `new DataView with ${args.length} arguments`,
-      expr,
-      "supported: new DataView(x.buffer), (x.buffer, byteOffset), or (x.buffer, byteOffset, byteLength)",
-    );
+/** TypedArray.from without a mapping callback. Preserve its iterable /
+ * array-like semantics separately from constructor length coercion. */
+export function lowerBytesStaticCall(lowerer: Lowerer, call: ts.CallExpression,
+  access: ts.PropertyAccessExpression): IrExpr | null {
+  if (lowerer.chainBlocked(call, access)) return null;
+  if (lowerer.isStdlibGlobal(access.expression, "ArrayBuffer") && access.name.text === "isView") {
+    if (call.arguments.length !== 1 || call.arguments.some(ts.isSpreadElement)) lowerer.noLowering("ArrayBuffer.isView argument count", call);
+    const arg = call.arguments[0]!;
+    return { kind: "libCall", fn: "arrayBuffer.isView", args: [lowerer.coerceInto(arg, lowerer.lowerExpr(arg), DYN)], type: BOOL, loc: locOf(call) };
   }
-  // The FRESH-BUFFER form: `new DataView(new ArrayBuffer(n), ...)` — the
-  // buffer erases into the view (nothing else can ever reference it, so
-  // the aliasing a shared buffer would exhibit is unobservable): the
-  // view's storage is a fresh zero-filled n-byte allocation. n must be a
-  // non-negative integer LITERAL (tsc admits any number; a fractional
-  // one is ToIndex truncation nothing here implements). byteOffset and
-  // byteLength keep their runtime Node-RangeError story. The RESIZABLE
-  // form (a maxByteLength options bag) fences by name.
-  if (
-    ts.isNewExpression(bufNode) &&
-    ts.isIdentifier(bufNode.expression) &&
-    bufNode.expression.text === "ArrayBuffer" &&
-    lowerer.isStdlibSymbol(lowerer.resolveValueSymbol(bufNode.expression) ?? undefined)
-  ) {
-    if ((bufNode.arguments?.length ?? 0) > 1) {
-      lowerer.noLowering(
-        "new DataView over a resizable ArrayBuffer",
-        bufNode,
-        "a maxByteLength options bag makes the buffer resizable, and resizing needs the buffer " +
-          "to exist as a runtime value — no free-standing ArrayBuffer value exists (the buffer here " +
-          "erases into the view): drop the options bag",
-      );
-    }
-    const lenArg = bufNode.arguments?.length === 1 ? bufNode.arguments[0] : undefined;
-    const lenT = lenArg ? lowerer.typeOf(lenArg) : null;
-    const byteLen = lenT?.isNumberLiteralType() ? lenT.value : null;
-    if (byteLen === null || !Number.isInteger(byteLen) || byteLen < 0) {
-      lowerer.noLowering(
-        "new DataView over this ArrayBuffer",
-        bufNode,
-        "the byte length must be a non-negative integer literal — new DataView(new ArrayBuffer(8))",
-      );
-    }
-    const count: IrExpr = { kind: "numLit", value: byteLen, type: F64, loc };
-    const receiver: IrExpr = { kind: "bytesNew", source: count, type: BYTES_U8, loc };
-    const idxArgs = args.slice(1).map((a) => lowerer.lowerExprExpecting(a, F64));
-    return { kind: "bytesIntrinsic", method: "dataViewNew", receiver, args: idxArgs, type: BYTES_U8, loc };
+  if (access.name.text !== "from" || !ts.isIdentifier(access.expression)) return null;
+  const symbol = lowerer.resolveValueSymbol(access.expression);
+  const elem = symbol ? own(BYTES_CTORS, symbol.name) : undefined;
+  if (!elem || !lowerer.isStdlibSymbol(symbol ?? undefined)) return null;
+  if (call.arguments.length !== 1 || call.arguments.some(ts.isSpreadElement)) {
+    lowerer.noLowering("TypedArray.from with a mapping callback or this argument count", call);
   }
-  const hint =
-    "views compile over a typed array's own storage — new DataView(x.buffer, byteOffset?, byteLength?) " +
-    "where x is a Uint8Array/Uint32Array/Float32Array/Float64Array/Buffer value — or a fresh buffer erased into " +
-    "the view: new DataView(new ArrayBuffer(n), ...); free-standing ArrayBuffers have no representation";
-  if (!ts.isPropertyAccessExpression(bufNode) || bufNode.name.text !== "buffer" || bufNode.questionDotToken) {
-    lowerer.noLowering("new DataView over this buffer expression", bufNode, hint);
+  const node = call.arguments[0]!;
+  const source = lowerer.lowerExpr(node);
+  if (source.type.kind === "bytes" || (source.type.kind === "array" && source.type.elem.kind === "f64")) {
+    return { kind: "bytesNew", source, type: bytesOf(elem), loc: locOf(call) };
   }
-  const srcIr = lowerer.mapTypeOf(lowerer.typeOf(bufNode.expression));
-  if (srcIr?.kind !== "bytes" || !lowerer.isStdlibMember(bufNode)) {
-    lowerer.noLowering(
-      `new DataView over '.buffer' of a '${lowerer.checker.typeToString(lowerer.typeOf(bufNode.expression))}'`,
-      bufNode,
-      hint,
-    );
-  }
-  const receiver = lowerer.lowerExpr(bufNode.expression);
-  const idxArgs = args.slice(1).map((a) => lowerer.lowerExprExpecting(a, F64));
-  return { kind: "bytesIntrinsic", method: "dataViewNew", receiver, args: idxArgs, type: BYTES_U8, loc };
+  return { kind: "bytesNew", source: lowerer.coerceInto(node, source, DYN), from: true, type: bytesOf(elem), loc: locOf(call) };
 }
 
-/** Method calls on typed-array/Buffer receivers: slice and subarray (BOTH
-   * copy — subarray's sharing is the documented divergence), set(src,
+/** Construct a view over the complete branded backing allocation. */
+function lowerArrayBufferView(lowerer: Lowerer, args: readonly ts.Expression[], elem: IrBytesElem | "dv", loc: SrcLoc): IrExpr {
+  const values = [0, 1, 2].map((index) => {
+    const node = args[index];
+    return node ? lowerer.coerceInto(node, lowerer.lowerExpr(node), DYN) : dynUndefinedExpr(loc);
+  });
+  const fn = { u8c: "arrayBuffer.viewU8C", i8: "arrayBuffer.viewI8", u16: "arrayBuffer.viewU16", i16: "arrayBuffer.viewI16", u8: "arrayBuffer.viewU8", u32: "arrayBuffer.viewU32", i32: "arrayBuffer.viewI32", f32: "arrayBuffer.viewF32", f64: "arrayBuffer.viewF64", dv: "arrayBuffer.viewDV" } as const;
+  return { kind: "libCall", fn: fn[elem], args: values, type: elem === "dv" ? BYTES_U8 : bytesOf(elem), loc };
+}
+
+function lowerDataViewNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr {
+  const args = expr.arguments ?? [];
+  if (!args.length || args.length > 3 || args.some(ts.isSpreadElement)) lowerer.noLowering("DataView constructor argument count", expr);
+  return lowerArrayBufferView(lowerer, args, "dv", locOf(expr));
+}
+
+/** Method calls on typed-array/Buffer receivers: slice (copy), subarray
+   * (shared view), copyWithin, set(src,
    * offset?), and the u8-only Buffer surface: toString(enc?) plus the
    * whole numeric read/write family (fixed widths BE/LE and the
    * variable-width read/writeUIntLE quartet — BUF_NUM_METHODS). Everything
@@ -351,9 +322,9 @@ export function lowerBytesMethodCall(lowerer: Lowerer, call: ts.CallExpression,
       loc,
     };
   }
-  if (receiverIr.elem === "u8" && name === "join") {
+  if (name === "join") {
     if (nArgs > 1 || call.arguments.some(ts.isSpreadElement)) {
-      lowerer.noLowering(`.join with ${nArgs} arguments on Uint8Array`, call);
+      lowerer.noLowering(`.join with ${nArgs} arguments on typed arrays`, call);
     }
     const separatorDefault: IrExpr = {
       kind: "strLit",
@@ -399,6 +370,18 @@ export function lowerBytesMethodCall(lowerer: Lowerer, call: ts.CallExpression,
     const method = name === "subarray" || declaredOnBuffer ? "subarray" : "slice";
     return { kind: "bytesIntrinsic", method, receiver, args, type: receiverIr, loc };
   }
+  if (name === "copyWithin") {
+    if (nArgs > 3 || call.arguments.some(ts.isSpreadElement)) {
+      lowerer.noLowering(`.copyWithin with ${nArgs} arguments on typed arrays`, call);
+    }
+    const receiver = lowerer.lowerExpr(access.expression);
+    const args = [0, 0, Infinity].map((value, i) => {
+      const fallback: IrExpr = { kind: "numLit", value, type: F64, loc };
+      const node = call.arguments[i];
+      return node ? lowerOptionalArgument(lowerer, node, F64, fallback) : fallback;
+    });
+    return { kind: "bytesIntrinsic", method: "copyWithin", receiver, args, type: receiverIr, loc };
+  }
   if (name === "fill" && receiverIr.elem !== "u8") {
     // TypedArray.prototype.fill on the non-u8 kinds: per-element value
     // coercion, slice-clamped relative indices, never throws. u8
@@ -418,16 +401,10 @@ export function lowerBytesMethodCall(lowerer: Lowerer, call: ts.CallExpression,
     }
     const receiver = lowerer.lowerExpr(access.expression);
     const src = lowerer.lowerExpr(call.arguments[0]!);
-    if (!typeEquals(src.type, receiverIr)) {
-      lowerer.noLowering(
-        `.set from '${lowerer.fmt(src.type)}' values`,
-        call.arguments[0]!,
-        "only a same-kind typed array copies in (number[] sources have no lowering — narrow unions first)",
-      );
-    }
-    const args = [src];
-    if (nArgs === 2) args.push(lowerer.lowerExprExpecting(call.arguments[1]!, F64));
-    return { kind: "bytesIntrinsic", method: "setFrom", receiver, args, type: VOID, loc };
+    const method = src.type.kind === "bytes" ? "setFrom" : "setFromDyn";
+    const args = [src.type.kind === "bytes" ? src : lowerer.coerceInto(call.arguments[0]!, src, DYN)];
+    if (nArgs === 2) args.push(lowerOptionalArgument(lowerer, call.arguments[1]!, F64, { kind: "numLit", value: 0, type: F64, loc }));
+    return { kind: "bytesIntrinsic", method, receiver, args, type: VOID, loc };
   }
   if (name === "toString") {
     // Buffer's toString(encoding?) — utf8 by default. A 0-arg toString
@@ -664,32 +641,6 @@ export function bufEncoding(lowerer: Lowerer, what: string, encNode: ts.Expressi
   }
   return v;
 }
-
-/** The fixed-width Buffer numeric methods by source name → the readNum/
- * writeNum kind token. Node declares BOTH capitalizations ("UInt" is the
- * original, "Uint" the aliased spelling) — the tables carry both. */
-const BUF_NUM_METHODS: Record<string, string | undefined> = (() => {
-  const out: Record<string, string> = {};
-  for (const rw of ["read", "write"]) {
-    for (const u of ["UInt", "Uint"]) {
-      out[`${rw}${u}8`] = "u8";
-      out[`${rw}${u}16BE`] = "u16be";
-      out[`${rw}${u}16LE`] = "u16le";
-      out[`${rw}${u}32BE`] = "u32be";
-      out[`${rw}${u}32LE`] = "u32le";
-    }
-    out[`${rw}Int8`] = "i8";
-    out[`${rw}Int16BE`] = "i16be";
-    out[`${rw}Int16LE`] = "i16le";
-    out[`${rw}Int32BE`] = "i32be";
-    out[`${rw}Int32LE`] = "i32le";
-    out[`${rw}FloatBE`] = "f32be";
-    out[`${rw}FloatLE`] = "f32le";
-    out[`${rw}DoubleBE`] = "f64be";
-    out[`${rw}DoubleLE`] = "f64le";
-  }
-  return out;
-})();
 
 const BUF_BIGINT_METHODS: Record<string, { sign: boolean; le: boolean } | undefined> = {
   readBigInt64BE: { sign: true, le: false },
@@ -975,12 +926,26 @@ function knownBufferProducer(lowerer: Lowerer, source: ts.Expression, seen = new
 
 export function lowerBufferStaticCall(lowerer: Lowerer, call: ts.CallExpression,
   access: ts.PropertyAccessExpression,): IrExpr | null {
+  const value = lowerBufferStaticValue(lowerer, call, access);
+  // Every byte-valued Buffer factory creates a distinct view. Preserve its
+  // brand even when stored as Uint8Array or passed through checked values.
+  return value?.type.kind === "bytes"
+    ? { kind: "libCall", fn: "buffer.brand", args: [value], type: value.type, loc: value.loc }
+    : value;
+}
+
+function lowerBufferStaticValue(lowerer: Lowerer, call: ts.CallExpression,
+  access: ts.PropertyAccessExpression,): IrExpr | null {
   if (call.questionDotToken || access.questionDotToken) return null;
   if (!lowerer.isStdlibGlobal(access.expression, "Buffer")) return null;
   const member = access.name.text;
   const loc = locOf(call);
   const args = call.arguments;
   if (member === "from") {
+    if (args.length >= 1 && args.length <= 3 && !args.some(ts.isSpreadElement) &&
+        lowerer.typeOf(args[0]!).getSymbol()?.name === "ArrayBuffer") {
+      return lowerArrayBufferView(lowerer, args, "u8", loc);
+    }
     // Buffer.from(x.buffer[, byteOffset[, length]]): a u8 VIEW sharing
     // x's storage (Node shares the ArrayBuffer; length is in BYTES).
     // The first argument must be the SYNTACTIC `.buffer` of a typed
@@ -999,7 +964,7 @@ export function lowerBufferStaticCall(lowerer: Lowerer, call: ts.CallExpression,
         return { kind: "bytesIntrinsic", method: "dataViewNew", receiver, args: idxArgs, type: BYTES_U8, loc };
       }
     }
-    if (args.length >= 1 && args.length <= 2 && !ts.isSpreadElement(args[0]!)) {
+    if (args.length >= 1 && args.length <= 2 && !args.some(ts.isSpreadElement)) {
       const argNode = args[0]!;
       if (ts.isArrayLiteralExpression(argNode) && !argNode.elements.some(ts.isSpreadElement)) {
         // A number[] literal (contextually typed by the lib's readonly
@@ -1011,18 +976,26 @@ export function lowerBufferStaticCall(lowerer: Lowerer, call: ts.CallExpression,
         }
       } else {
         const srcIr = lowerer.mapTypeOf(lowerer.typeOf(argNode));
+        const value = lowerer.lowerExpr(argNode);
+        // JS callback storage can be native DYN even when the checker
+        // reports any (or a narrowed Buffer). Dispatch on its actual ABI.
+        if (value.type.kind === "dyn") {
+          const encName = args[1] ? bufEncoding(lowerer, "Buffer.from", args[1]) : "utf8";
+          const enc: IrExpr = { kind: "strLit", value: encName, type: STRING, loc };
+          return { kind: "libCall", fn: "buffer.fromDyn", args: [value, enc], type: BYTES_U8, loc };
+        }
         if (srcIr?.kind === "string") {
           const encNode = args[1];
           const encName = encNode ? bufEncoding(lowerer, "Buffer.from", encNode) : "utf8";
-          const s = lowerer.lowerExprExpecting(argNode, STRING);
+          const s = lowerer.coerceInto(argNode, value, STRING);
           const enc: IrExpr = { kind: "strLit", value: encName, type: STRING, loc };
           return { kind: "libCall", fn: "buffer.fromStr", args: [s, enc], type: BYTES_U8, loc };
         }
         if (args.length === 1 && srcIr?.kind === "bytes" && srcIr.elem === "u8") {
-          return { kind: "bytesNew", source: lowerer.lowerExpr(argNode), type: BYTES_U8, loc };
+          return { kind: "bytesNew", source: value, type: BYTES_U8, loc };
         }
         if (args.length === 1 && srcIr?.kind === "array" && srcIr.elem.kind === "f64") {
-          return { kind: "bytesNew", source: lowerer.lowerExpr(argNode), type: BYTES_U8, loc };
+          return { kind: "bytesNew", source: value, type: BYTES_U8, loc };
         }
       }
     }
@@ -1030,8 +1003,8 @@ export function lowerBufferStaticCall(lowerer: Lowerer, call: ts.CallExpression,
       "Buffer.from with this argument shape",
       call,
       "supported: Buffer.from(string, encoding?) with a literal encoding, Buffer.from(u8Array) — a copy — " +
-        "Buffer.from(number[]), or Buffer.from(x.buffer, byteOffset?, length?) — a view sharing x's " +
-        "storage (no free-standing ArrayBuffer value exists; narrow unions first)",
+        "Buffer.from(number[]), or Buffer.from(arrayBuffer, byteOffset?, length?) — a view sharing " +
+        "the buffer's storage; narrow unions first",
     );
   }
   if (member === "alloc" || member === "allocUnsafe") {
@@ -1111,10 +1084,10 @@ export function lowerBufferStaticCall(lowerer: Lowerer, call: ts.CallExpression,
     // A side that is not statically bytes (the invalid-input probes,
     // untyped JS helpers): Node's "buf1"/"buf2" argument ladder runs
     // at runtime — a well-typed dyn still compares.
-    const dyns = sides.map((v, i) => {
+    const dyns = sides.map((v, i): IrExpr => {
       if (v.type.kind === "dyn") return v;
       if (v.kind === "unitLit" || lowerer.dynConvertible(v.type)) {
-        return { kind: "dynFrom", value: v, type: DYN, loc: v.loc } as IrExpr;
+        return { kind: "dynFrom", value: v, type: DYN, loc: v.loc };
       }
       lowerer.noLowering(
         `Buffer.compare of '${lowerer.fmt(v.type)}' values`,
@@ -1145,6 +1118,22 @@ export function lowerBufferStaticCall(lowerer: Lowerer, call: ts.CallExpression,
           result: { kind: "boolLit", value: true, type: BOOL, loc },
           type: BOOL,
           loc,
+        };
+      }
+      // Untyped stream chunks retain the native checked value's Buffer
+      // flavor. Plain bytes are Uint8Arrays at this boundary; inspecting
+      // only the bytes tag would incorrectly identify them as Buffers.
+      if (v.type.kind === "dyn") {
+        return { kind: "dynTest", test: "buffer", value: v, type: BOOL, loc };
+      }
+      // Primitive storage cannot carry a Buffer. Keep argument effects
+      // even when its representation makes the answer constant.
+      if (v.type.kind === "string" || v.type.kind === "f64" || v.type.kind === "bool" ||
+          v.type.kind === "symbol" || v.type.kind === "bigint" || v.type.kind === "nullT" || v.type.kind === "undefinedT") {
+        if (isSafeToDiscard(v)) return { kind: "boolLit", value: false, type: BOOL, loc };
+        return {
+          kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: v, loc: v.loc }],
+          result: { kind: "boolLit", value: false, type: BOOL, loc }, type: BOOL, loc,
         };
       }
       if (v.type.kind === "union") {

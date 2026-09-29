@@ -1,3 +1,4 @@
+import { InternalCompilerError } from "../../errors.js";
 /* Module-graph lowering: splitting each source file into its parts, the
  * program-collection pass (signatures, classes, globals — reachability
  * seeds), npm/JSON import collection, per-file %init functions, %main, and
@@ -13,13 +14,14 @@ import { isRelativeSpecifier } from "../workspace-registry.js";
 import { canonicalBuiltinModule, cjsExportAssignmentOf, cjsExportDiscardReason, entryPackageFilePredicate, isCjsJsFile, isJsSourceFile, isRequireStatement, locOf, makeCycleAdmission, orderedImportsOf, resolveImport, resolveNpmImport } from "../program.js";
 import type { CycleEdge } from "../program.js";
 import { invalidJsonModuleDiag, npmEmbedFailedDiag, requiresDynamicImportDiag } from "../../diagnostics/diagnostic.js";
-import { BOOL, DYN, F64, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canConvertToDyn, isUnitType } from "../../ir/ir.js";
+import { BOOL, DYN, F64, IrClassDef, IrExpr, IrFunction, IrGlobal, IrRecordShape, IrStmt, IrType, IrUnionDef, JSVAL, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, isUnitType } from "../../ir/ir.js";
 import { ENTRY_NAME, PoisonError, boundIdentifiersOf, dynFallbackType, dynUndefinedExpr, importCallHandleType, newFnCtx, staticImportNamespaceType, uncheckedOverloadHandleCall } from "./lowerer.js";
-import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireProgramModuleDecl, createRequireSpecOf, isPromisifyCall, registerBuiltinCallableAlias } from "./lower-builtins.js";
-import { bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, bindingNeverReassigned, deadUnmappableBinding, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf, registerOverloadedCallableAlias } from "./lower-calls.js";
-import { isVarDeclared, numericIteratorSourceOf, provenanceElidedConstDecl } from "./lower-stmts.js";
+import { builtinMemberRequireDecl, builtinNamespaceDestructureModuleOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireProgramModuleDecl, createRequireSpecOf, isPromisifyCall, registerBuiltinCallableAlias, stripTypeCasts } from "./lower-builtins.js";
+import { bindingContextualGenericFnNodeOf, bindingGenericFnAliasInfoOf, bindingGenericFnInfoOf, bindingGenericFnNodeOf, bindingNeverReassigned, deadUnmappableBinding, funcTypeFromParamShapes, implicitLocalFnInfoOf, implicitLocalFnNodeOf, nullishGenericBindingUnitOf, registerOverloadedCallableAlias } from "./lower-calls.js";
+import { hasJsTypeAnnotation, isVarDeclared, numericIteratorSourceOf, provenanceElidedConstDecl } from "./lower-stmts.js";
 import { streamClassAliasDecl } from "./lower-stream.js";
-import { stdlibGlobalAliasDecl, stdlibGlobalAliasNameOf } from "./surfaces.js";
+import { stdlibGlobalAliasDecl, stdlibGlobalAliasNameOf, stdlibGlobalNameOf } from "./surfaces.js";
+import { isNativeBuiltinValueInitializer } from "./lower-builtin-values.js";
 import { collectNamespaceStmt, nsPathPrefix, trapDeclRootOf } from "./lower-namespaces.js";
 import { collectExpandoMembers } from "./lower-expando.js";
 import { recordTextCodecClass } from "../../ir/ir.js";
@@ -29,6 +31,7 @@ import { collectVirtualJsMethods, decoratorNodesOf, genericIfaceBindingKeepsClas
 import { isMixinFnBinding, mixinResultBindingClassOf } from "./lower-mixins.js";
 import { cjsModuleRef, cjsModuleRegistryPrelude } from "./lower-node-module.js";
 import { forkTargetPaths } from "../fork-target.js";
+import { isNativeProxyInitializer } from "./expressions/native-proxy.js";
 
 /** One file's declarations, split for collection and init-body lowering. */
 export interface FileParts {
@@ -146,7 +149,7 @@ export function appendForkModules(
     const dep = resolveImport(program, sf, spec);
     if (!dep || dep.isDeclarationFile) return null;
     if (dep.fileName.endsWith(".json") || dep.fileName.endsWith(".cts")) return null;
-    if (isCjsJsFile(dep)) return null;
+    if (isCjsJsFile(dep, program)) return null;
     return dep;
   }
 
@@ -288,7 +291,9 @@ export function appendForkModules(
    * site. Type-only imports are free either way: the .d.ts is a type
    * surface, not code. */
   export function collectNpmImports(lowerer: Lowerer, parts: FileParts[]): void {
-    const builder = lowerer.dynamic ? new NpmGraphBuilder() : null;
+    const services = lowerer.frontendServices;
+    if (lowerer.dynamic && services === undefined) throw new Error("dynamic lowering requires frontend services");
+    const builder = lowerer.dynamic && services !== undefined ? new NpmGraphBuilder(services) : null;
     const entryPackageFile = entryPackageFilePredicate(lowerer.entry.fileName);
     for (const fp of parts) {
       for (const stmt of fp.sf.statements) {
@@ -747,7 +752,8 @@ export function appendForkModules(
       classes: [...lowerer.classes.values()]
         .map((c) => c.def)
         .filter((def) => classNames.has(def.name))
-        .map((def) => {
+        .map((def): IrClassDef => {
+          if (!def) throw new InternalCompilerError("missing reachable class definition");
           // Generic-class instantiations bypass the reachability gate
           // (demand-driven — every member of a demanded instantiation
           // lowers; see lowerClassMembers), so their defs keep every
@@ -755,19 +761,18 @@ export function appendForkModules(
           // the same rule (noteVirtualEdge marks the abstract declarer, so
           // a dispatched slot keeps its declaration; an unreferenced one
           // drops and the root-most CONCRETE declaration owns the slot).
+          const className = def.name;
           const methods =
             reachable === null || def.genericOf !== undefined
               ? (def.methods ?? [])
-              : (def.methods?.filter((m) => reachable.has(`%${def.name}.${m}`)) ?? []);
+              : (def.methods?.filter((m) => reachable.has(`%${className}.${m}`)) ?? []);
           const abstractMethods = def.abstractMethods?.filter((m) => methods.includes(m)) ?? [];
           const rest = { ...def };
-          delete rest.methods;
-          delete rest.abstractMethods;
-          return {
-            ...rest,
-            ...(methods.length > 0 ? { methods } : {}),
-            ...(abstractMethods.length > 0 ? { abstractMethods } : {}),
-          };
+          if (methods.length > 0) rest.methods = methods;
+          else delete rest.methods;
+          if (abstractMethods.length > 0) rest.abstractMethods = abstractMethods;
+          else delete rest.abstractMethods;
+          return rest;
         }),
       records: lowerer.shapes.shapes.filter((r) => shapeIds.has(r.id)),
       unions: lowerer.unions.unions.filter((u) => unionIds.has(u.id)),
@@ -814,10 +819,32 @@ function cjsScalarLiteral(e: ts.Expression): boolean {
  * typed-but-unmappable initializers keep the %init-local adoption). */
 function jsDynHoldableInitializer(lowerer: Lowerer, init: ts.Expression | undefined): boolean {
   if (init === undefined) return true;
+  if (isNativeProxyInitializer(lowerer, init)) return true;
   let e: ts.Expression = init;
   while (ts.isParenthesizedExpression(e)) e = e.expression;
   if (e.kind === ts.SyntaxKind.NullKeyword) return true;
   if (ts.isIdentifier(e) && e.text === "undefined") return true;
+  if (ts.isConditionalExpression(e)) {
+    return jsDynHoldableInitializer(lowerer, e.whenTrue) && jsDynHoldableInitializer(lowerer, e.whenFalse);
+  }
+  if (ts.isBinaryExpression(e) && (e.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken ||
+      e.operatorToken.kind === ts.SyntaxKind.BarBarToken || e.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken)) {
+    return jsDynHoldableInitializer(lowerer, e.left) && jsDynHoldableInitializer(lowerer, e.right);
+  }
+  // A member of a checked module value is itself checked, including a
+  // callable whose inferred overloads cannot describe one native ABI.
+  if ((ts.isPropertyAccessExpression(e) || ts.isElementAccessExpression(e)) &&
+      ts.isIdentifier(e.expression) && lowerer.globalOf(e.expression)?.type.kind === "dyn") return true;
+  if (ts.isIdentifier(e) || ts.isArrowFunction(e) || ts.isFunctionExpression(e)) {
+    if (ts.isIdentifier(e)) {
+      if (lowerer.globalOf(e)?.type.kind === "dyn") return true;
+      const signature = lowerer.isTopLevelFnSymbol(e) ? lowerer.fnSigOf(e) : null;
+      if (signature && canBoxFuncIntoDyn(funcTypeFromParamShapes(signature.params, signature.returnType),
+        (id) => lowerer.shapes.get(id), (id) => lowerer.unions.get(id))) return true;
+    }
+    const type = lowerer.mapTypeOf(lowerer.typeOf(e)) ?? dynFallbackType(lowerer, e, lowerer.typeOf(e));
+    if (type?.kind === "func" && canBoxFuncIntoDyn(type, (id) => lowerer.shapes.get(id), (id) => lowerer.unions.get(id))) return true;
+  }
   if (
     (ts.isCallExpression(e) || ts.isPropertyAccessExpression(e) || ts.isIdentifier(e)) &&
     (lowerer.typeOf(e).flags & ts.TypeFlags.Any) !== 0
@@ -918,7 +945,8 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
             const symType = lowerer.checker.getTypeOfSymbol(symbol);
             if (!(symType.flags & ts.TypeFlags.Any)) tsType = symType;
           }
-          let type = lowerer.mapTypeOf(tsType) ?? dynFallbackType(lowerer, stmt.expression, tsType) ?? lowerer.badType(stmt.expression, tsType);
+          let type = lowerer.mapTypeOf(tsType) ?? dynFallbackType(lowerer, stmt.expression, tsType);
+          if (type === null) lowerer.badType(stmt.expression, tsType);
           // `export default undefined` — the unit-only union, like any
           // unit-only binding (`export default null` maps via mapType).
           if (type.kind === "void" && isUnitOnlyTsType(tsType)) {
@@ -1395,6 +1423,28 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
         for (const nameNode of boundIdentifiersOf(decl.name)) {
           const diagsBefore = lowerer.diags.length;
           try {
+            // Builtin declarations do not always describe the concrete native
+            // callable ABI. Preserve checked-native values in shared storage;
+            // adapting the loader to (string) would replace its validation.
+            const initializer = decl.initializer ? stripTypeCasts(decl.initializer) : undefined;
+            if (
+              isJsSourceFile(sf) && nameNode === decl.name && initializer &&
+              (isNativeBuiltinValueInitializer(lowerer, initializer) ||
+                (!lowerer.dynamic && stdlibGlobalNameOf(lowerer, initializer) === "globalThis"))
+            ) {
+              const symbol = lowerer.checker.getSymbolAtLocation(nameNode);
+              if (symbol && !lowerer.globalsBySymbol.has(symbol)) {
+                const g: IrGlobal = {
+                  id: `%g.${tag}${nsPrefix}${nameNode.text}`, name: nameNode.text,
+                  type: DYN, mutable: isLet, source: bindingSource(nameNode),
+                  ...(!isVarDeclared(decl) ? { tdz: true as const } : {}),
+                };
+                lowerer.globalsBySymbol.set(symbol, g);
+                lowerer.globalsList.push(g);
+                if (isVarDeclared(decl)) noteVarGlobalEntryInit(lowerer, sf, g);
+              }
+              continue;
+            }
             // A JS file-scope evolving ARRAY (`const mustCallChecks = [];`
             // — test/common's exit-accounting ledger): the strict type
             // (any[]) has no mapping, but the VALUE is the dyn array the
@@ -1429,13 +1479,18 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
             // dyn-representable (unmappable member types are the checked-dynamic tree
             // fallback's own case) — so shorthand aggregates (test/common's
             // export object: alias plumbing importers resolve THROUGH),
-            // spreads, accessors, and literals holding unconvertible typed
+            // accessors, and literals holding unconvertible typed
             // values (a Map member) keep their static/alias stories.
+            // Spreads from an existing checked dictionary stay checked too;
+            // copying its entries must not extract nested callable records.
             if (
               isJsSourceFile(sf) &&
               ts.isIdentifier(decl.name) && nameNode === decl.name &&
               decl.initializer !== undefined && ts.isObjectLiteralExpression(decl.initializer) &&
               decl.initializer.properties.every((p) => {
+                if (ts.isSpreadAssignment(p)) {
+                  return ts.isIdentifier(p.expression) && lowerer.globalOf(p.expression)?.type.kind === "dyn";
+                }
                 if (!ts.isPropertyAssignment(p) || ts.isComputedPropertyName(p.name)) return false;
                 const mt = lowerer.mapTypeOf(lowerer.typeOf(p.initializer));
                 return mt === null || mt.kind === "dyn" ||
@@ -1503,6 +1558,33 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
               }
               continue;
             }
+            // A function initializer can have a native calling convention
+            // even when its inferred return/parameter pieces need DYN. Keep
+            // that closure in a checked-value global so class methods and
+            // other module functions see its declaration-position assignment.
+            // A var starts undefined; lexical bindings retain the TDZ guard.
+            if (
+              isJsSourceFile(sf) && !lowerer.mapTypeOf(lowerer.typeOf(nameNode)) &&
+              ts.isIdentifier(decl.name) && nameNode === decl.name && decl.initializer &&
+              jsDynHoldableInitializer(lowerer, decl.initializer)
+            ) {
+              const fallback = dynFallbackType(lowerer, nameNode, lowerer.typeOf(nameNode));
+              const symbol = lowerer.checker.getSymbolAtLocation(nameNode);
+              if (symbol && fallback?.kind === "func" && canBoxFuncIntoDyn(fallback,
+                (id) => lowerer.shapes.get(id), (id) => lowerer.unions.get(id))) {
+                if (!lowerer.globalsBySymbol.has(symbol)) {
+                  const g: IrGlobal = {
+                    id: `%g.${tag}${nsPrefix}${nameNode.text}`, name: nameNode.text,
+                    type: DYN, mutable: isLet, source: bindingSource(nameNode),
+                    ...(!isVarDeclared(decl) ? { tdz: true as const } : {}),
+                  };
+                  lowerer.globalsBySymbol.set(symbol, g);
+                  lowerer.globalsList.push(g);
+                  if (isVarDeclared(decl)) noteVarGlobalEntryInit(lowerer, sf, g);
+                }
+                continue;
+              }
+            }
             // JS declarations whose STRICT type has no mapping register no
             // global at all: the declaration lowers as an %init-body LOCAL
             // whose type adopts the initializer's (lowerVarDecl's JS
@@ -1518,13 +1600,30 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
             // it).
             const handleT =
               ts.isIdentifier(decl.name) && nameNode === decl.name
-                ? (lowerer.dynamic ? importCallHandleType(decl.initializer) : staticImportNamespaceType(lowerer, decl.initializer)) ??
+                ? (isNativeProxyInitializer(lowerer, decl.initializer) ? DYN : null) ??
+                  (lowerer.dynamic ? importCallHandleType(decl.initializer) : staticImportNamespaceType(lowerer, decl.initializer)) ??
                   (lowerer.dynamic ?
                   // An unchecked-overload call result stores the handle,
                   // exactly the local rule (uncheckedOverloadHandleCall).
                   (uncheckedOverloadHandleCall(lowerer, decl.initializer) ? JSVAL : null) : null)
                 : null;
             let type = handleT ?? lowerer.irTypeOf(nameNode);
+            // Unannotated JavaScript aliases retain an existing native
+            // checked object instead of copying it into an inferred record.
+            if (isJsSourceFile(sf) && !decl.type && !hasJsTypeAnnotation(decl) &&
+                decl.initializer && ts.isIdentifier(decl.initializer) &&
+                (type.kind === "record" || type.kind === "func")) {
+              const source = lowerer.globalOf(decl.initializer);
+              if (source?.type.kind === "dyn") type = DYN;
+            }
+            // JavaScript bind inference can leave an artificial tuple-rest
+            // signature. Keep the returned callable's runtime arity intact.
+            if (isJsSourceFile(sf) && type.kind === "func" && decl.initializer &&
+                ts.isCallExpression(decl.initializer) && ts.isPropertyAccessExpression(decl.initializer.expression) &&
+                decl.initializer.expression.name.text === "bind" && lowerer.isStdlibMember(decl.initializer.expression) &&
+                decl.type === undefined && !hasJsTypeAnnotation(decl)) {
+              type = DYN;
+            }
             // An evolving-`any` array's DERIVED file-scope binding under
             // --dynamic (`const kept = fns.filter(...)` where `fns`
             // registered array<jsval> at its `any[]` declaration): the
@@ -1590,6 +1689,7 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
               isJsSourceFile(sf) &&
               type.kind === "func" &&
               type.ret.kind === "record" &&
+              lowerer.dynConvertible(type.ret) &&
               decl.initializer !== undefined &&
               (ts.isFunctionExpression(decl.initializer) || ts.isArrowFunction(decl.initializer)) &&
               decl.initializer.type === undefined &&
@@ -1605,13 +1705,15 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
               const shape = lowerer.shapes.get(type.shapeId);
               if (shape && shape.fields.length === 0 && !shape.indexValue && !shape.tuple) type = DYN;
             }
-            // A module var starts as undefined, even when its declared type
-            // excludes it. Do not silently treat a NULL codec as a usable
-            // receiver during a closure's pre-initialization read.
+            // Module vars hold real undefined until their declaration runs.
+            // Codec records keep that state in the ordinary optional union;
+            // lexical codec declarations retain their separate TDZ guard.
             const codec = type.kind === "record" && recordTextCodecClass(lowerer.shapes.get(type.shapeId)!) !== null;
-            if (codec && (isVarDeclared(decl) || !decl.initializer)) {
-              lowerer.noLowering("module-scope codec bindings that can hold undefined before initialization", decl,
-                "use let or const with an initializer for TextEncoder/TextDecoder instances");
+            if (codec && isVarDeclared(decl)) {
+              type = { kind: "union", unionId: lowerer.unions.intern([type, { kind: "undefinedT" }]) };
+            } else if (codec && !decl.initializer) {
+              lowerer.noLowering("uninitialized lexical codec bindings", decl,
+                "initialize let or const TextEncoder/TextDecoder bindings at their declaration");
             }
             const symbol = lowerer.checker.getSymbolAtLocation(nameNode);
             // Merged `var` redeclarations (`var y = 1; ...; var y = 2;` —
@@ -1624,7 +1726,10 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
               type,
               mutable: isLet,
               source: bindingSource(nameNode),
-              ...(codec ? { tdz: true as const } : {}),
+              // A function pointer must not be dereferenced before a lexical
+              // declaration assigns it. The shared pointer TDZ guard handles
+              // these bindings like stored codec records.
+              ...(((codec || type.kind === "func") && !isVarDeclared(decl)) ? { tdz: true as const } : {}),
             };
             lowerer.globalsBySymbol.set(symbol, g);
             lowerer.globalsList.push(g);
@@ -1744,6 +1849,9 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
             if (type.kind === "record" && isJsSourceFile(sf)) {
               const shape = lowerer.shapes.get(type.shapeId);
               if (shape && shape.fields.length === 0 && !shape.indexValue && !shape.tuple) type = DYN;
+            }
+            if (type.kind === "record" && recordTextCodecClass(lowerer.shapes.get(type.shapeId)!) !== null) {
+              type = { kind: "union", unionId: lowerer.unions.intern([type, { kind: "undefinedT" }]) };
             }
             const symbol = lowerer.checker.getSymbolAtLocation(nameNode);
             if (!symbol || lowerer.globalsBySymbol.has(symbol)) continue;
@@ -1953,7 +2061,7 @@ export function collectGlobals(lowerer: Lowerer, sf: ts.SourceFile, topStmts: ts
         const loc = asyncDeps[0]!.loc;
         const entries: IrExpr = {
           kind: "arrayLit",
-          elems: asyncDeps.map((dep) => ({
+          elems: asyncDeps.map((dep): IrExpr => ({
             kind: "varRef",
             localId: dep.completionId,
             type: promiseT,

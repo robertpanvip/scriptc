@@ -445,13 +445,15 @@ static bool scr_assert_dyn_same_value(const ScrDyn *a, const ScrDyn *b) {
       return true;
     case SCR_DYN_BOOL:
       return a->v.b == b->v.b;
+    case SCR_DYN_BIGINT:
+      return scr_bigint_eq(a->v.bigint, b->v.bigint);
     case SCR_DYN_NUM:
       return scr_assert_same_value_f64(a->v.num, b->v.num);
     case SCR_DYN_STR:
       return a->v.str->len == b->v.str->len &&
              memcmp(a->v.str->data, b->v.str->data, a->v.str->len) == 0;
     case SCR_DYN_FUNC:
-      return a == b || a->v.fn.clo == b->v.fn.clo;
+      return scr_dyn_strict_eq(a, b);
     case SCR_DYN_HANDLE:
       /* Identity is the HANDLE (the strict_eq stance). */
       return a->v.handle.tag == b->v.handle.tag && a->v.handle.ptr == b->v.handle.ptr;
@@ -480,6 +482,10 @@ static bool scr_assert_dyn_same_value(const ScrDyn *a, const ScrDyn *b) {
  * memo here where Node carries one (documented divergence). */
 static bool scr_assert_dyn_deep_eq(const ScrDyn *a, const ScrDyn *b) {
   if (a == b) return true;
+  if (a->kind == SCR_DYN_PROXY || b->kind == SCR_DYN_PROXY) {
+    scr_dyn_proxy_unsupported("deep equality");
+    return false;
+  }
   if (a->kind == SCR_DYN_TYPED_REF || b->kind == SCR_DYN_TYPED_REF) {
     ScrDyn *ma = a->kind == SCR_DYN_TYPED_REF
                      ? scr_dyn_typed_ref_materialize(a)
@@ -508,13 +514,15 @@ static bool scr_assert_dyn_deep_eq(const ScrDyn *a, const ScrDyn *b) {
       return true;
     case SCR_DYN_BOOL:
       return a->v.b == b->v.b;
+    case SCR_DYN_BIGINT:
+      return scr_bigint_eq(a->v.bigint, b->v.bigint);
     case SCR_DYN_NUM:
       return scr_assert_same_value_f64(a->v.num, b->v.num);
     case SCR_DYN_STR:
       return a->v.str->len == b->v.str->len &&
              memcmp(a->v.str->data, b->v.str->data, a->v.str->len) == 0;
     case SCR_DYN_FUNC:
-      return a->v.fn.clo == b->v.fn.clo;
+      return scr_dyn_strict_eq(a, b);
     case SCR_DYN_HANDLE:
       /* Node's deepStrictEqual over two distinct live handles walks own
        * enumerable props we do not model; same-handle is the only case a
@@ -627,6 +635,12 @@ static void scr_assert_cf_value(ScrAssertBuf *b, const ScrDyn *d, size_t indent,
     case SCR_DYN_BOOL:
       ab_cstr(b, d->v.b ? "true" : "false");
       return;
+    case SCR_DYN_BIGINT: {
+      ScrStr *text = scr_bigint_inspect(d->v.bigint);
+      ab_str(b, text);
+      scr_str_release(text);
+      return;
+    }
     case SCR_DYN_NUM: {
       char tmp[40];
       size_t n = scr_assert_inspect_f64(d->v.num, tmp);
@@ -725,6 +739,9 @@ static void scr_assert_cf_value(ScrAssertBuf *b, const ScrDyn *d, size_t indent,
       scr_dyn_release(materialized);
       return;
     }
+    case SCR_DYN_PROXY:
+      scr_assert_cf_value(b, d->v.proxy.target, indent, depth);
+      return;
     case SCR_DYN_OBJ: {
       /* The null-proto dictionary renders with Node's prefix in the
        * failure diff too (assertion_error.js inspects both sides). */
@@ -969,7 +986,7 @@ static bool scr_assert_print_myers(ScrAssertBuf *b, const ScrDiffOp *diff, size_
 static bool scr_assert_dyn_is_object(const ScrDyn *d) {
   return d->kind == SCR_DYN_ARR || d->kind == SCR_DYN_OBJ || d->kind == SCR_DYN_BYTES ||
          d->kind == SCR_DYN_HANDLE || d->kind == SCR_DYN_PROMISE ||
-         d->kind == SCR_DYN_TYPED_REF ||
+         d->kind == SCR_DYN_TYPED_REF || d->kind == SCR_DYN_PROXY ||
          scr_dyn_isl_typeof_is(d, "object"); /* engine-held: the engine's typeof */
 }
 

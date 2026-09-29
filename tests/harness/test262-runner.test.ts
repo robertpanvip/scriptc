@@ -34,7 +34,7 @@ test("metadata generates the upstream variants without rewriting execution goals
 test("unsupported execution requirements and assertion reflection remain exclusions", () => {
   for (const [head, body] of [
     ["negative: {phase: runtime, type: TypeError}", "throw new TypeError();"],
-    ["includes: [propertyHelper.js]", "verifyProperty({}, 'x', {});"],
+    ["includes: [propertyHelper.js]", "verifyWritable({}, 'x');"],
     ["description: global script", "assert.sameValue(this, globalThis);"],
     ["description: reflection", "assert.sameValue(typeof assert, 'function');"],
     ["description: mutation", "assert.sameValue = () => {};"],
@@ -54,6 +54,27 @@ test("unsupported execution requirements and assertion reflection remain exclusi
   expect(exclusion(asyncText, metadata(asyncText), "strict")).toBeUndefined();
 });
 
+test("the property helper only admits direct inline descriptor checks", () => {
+  for (const body of [
+    "verifyProperty({}, 'x', { value: 1, configurable: false });",
+    "verifyProperty({}, 'x', undefined);",
+  ]) {
+    const text = source("includes: [propertyHelper.js]", body);
+    expect(exclusion(text, metadata(text), "strict")).toBeUndefined();
+    expect(prepare(text, false, undefined, "strict", ["propertyHelper.js"])).toContain("function verifyProperty(");
+  }
+  for (const body of [
+    "verifyProperty({}, 'x', descriptor);",
+    "verifyProperty({}, 'x', { [key]: 1 });",
+    "verifyProperty({}, 'x', { extra: 1 });",
+    "const check = verifyProperty;",
+    "verifyNotWritable({}, 'x');",
+  ]) {
+    const text = source("includes: [propertyHelper.js]", body);
+    expect(exclusion(text, metadata(text), "strict")).toBe("harness:propertyHelper-surface");
+  }
+});
+
 test("receiver-bound this is admitted without adapting script-level this", () => {
   for (const [body, expected] of [
     ["class C { read() { return this.value; } }", undefined],
@@ -70,6 +91,18 @@ test("receiver-bound this is admitted without adapting script-level this", () =>
     for (const variant of ["strict", "sloppy"] as const) {
       expect(exclusion(text, metadata(text), variant), `${variant}: ${body}`).toBe(expected);
     }
+  }
+});
+
+test("arguments reads are admitted only for indexed and length access inside a function", () => {
+  for (const [body, expected] of [
+    ["function f() { return arguments.length === 1 && arguments[0] === 3; } assert(f(3));", undefined],
+    ["function f() { return arguments; }", "host:arguments"],
+    ["function f() { return Array.isArray(arguments); }", "host:arguments"],
+    ["assert.sameValue(arguments.length, 0);", "host:arguments"],
+  ]) {
+    const text = source("description: arguments", body!);
+    expect(exclusion(text, metadata(text), "strict")).toBe(expected);
   }
 });
 

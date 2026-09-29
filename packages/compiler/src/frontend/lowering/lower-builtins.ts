@@ -1,3 +1,4 @@
+import { staticTextDecoderEncoding } from "./text-decoder-encoding.js";
 import { InternalCompilerError } from "../../errors.js";
 /* Builtin-surface lowering: node builtin-module calls (fs, path, os, url,
  * crypto, child_process spawn/spawnSync and child/stats/spawn-result
@@ -38,11 +39,13 @@ import { CRYPTO_CIPHERS, CRYPTO_CONSTANTS, CRYPTO_CURVES, CRYPTO_HASHES } from "
 import { generatorMeta, timerStyleCallback, type ParamShape } from "./lower-calls.js";
 import { registerHttpClientFnBinding, voidizedCallback } from "./lower-server.js";
 import { pairsSnapshotHelper } from "./pairs-snapshot.js";
+import { isJsonStringifyDynamicType } from "../../ir/ir.js";
 import { bufEncoding } from "./containers/bytes.js";
 import { BOOL, BYTES_U8, CHILD_T, CHILDSTREAM_T, CHILDWRITER_T, CRYPTOHASH_T, CRYPTOHMAC_T, DYN, F64, FILEHANDLE_T, FSWATCHER_T, PROCSTREAM_T, IrExpr, IrFunction, IrLibFn, IrLocal, IrStmt, IrType, JSVAL, NULL_T, SEARCH_PARAMS_T, SPAWNRES_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, funcOf, isUnitType, typeEquals, typeKey } from "../../ir/ir.js";
 import { boolLit, countedFor, numLit, strLit, varRef } from "../../ir/build.js";
 import { staticForkModulePath } from "../fork-target.js";
 import { tsgoPath } from "../dts-paths.js";
+import { lowerBuiltinLoaderValue } from "./lower-builtin-values.js";
 
 function optionalStringTags(lowerer: Lowerer, type: IrType): { stringTag: number; undefinedTag: number } | null {
   if (type.kind !== "union") return null;
@@ -155,10 +158,10 @@ function lowerOptionalNumberPredicate(
   // arm runs the predicate; every other arm answers false after evaluating
   // the argument once. This includes the undefined added by array reads.
   const widened = value.type;
-  if (widened.kind !== "union") return null;
-  const numberTag = lowerer.armTag(widened.unionId, F64);
-  if (numberTag < 0) return null;
-  const key = `number.optionalPredicate:${fn}:${widened.unionId}`;
+  if (widened.kind !== "union" && widened.kind !== "dyn") return null;
+  const numberTag = widened.kind === "union" ? lowerer.armTag(widened.unionId, F64) : -1;
+  if (widened.kind === "union" && numberTag < 0) return null;
+  const key = `number.optionalPredicate:${fn}:${typeKey(widened)}`;
   let helper = lowerer.widthHelpers.get(key);
   if (!helper) {
     helper = `%number.optionalPredicate.${lowerer.widthHelpers.size}`;
@@ -172,7 +175,9 @@ function lowerOptionalNumberPredicate(
       body: [
         {
           kind: "if",
-          cond: { kind: "unionIsTag", unionId: widened.unionId, tag: numberTag, negated: true, value: input, type: BOOL, loc },
+          cond: widened.kind === "dyn"
+            ? { kind: "dynTest", test: "number", negated: true, value: input, type: BOOL, loc }
+            : { kind: "unionIsTag", unionId: widened.unionId, tag: numberTag, negated: true, value: input, type: BOOL, loc },
           then: [{ kind: "return", value: boolLit(false, loc), loc }],
           else_: null,
           loc,
@@ -182,7 +187,9 @@ function lowerOptionalNumberPredicate(
           value: {
             kind: "libCall",
             fn,
-            args: [{ kind: "unionNarrow", unionId: widened.unionId, tag: numberTag, value: input, type: F64, loc }],
+            args: [widened.kind === "dyn"
+              ? { kind: "dynCheck", value: input, type: F64, loc }
+              : { kind: "unionNarrow", unionId: widened.unionId, tag: numberTag, value: input, type: F64, loc }],
             type: BOOL,
             loc,
           },
@@ -237,14 +244,16 @@ function lowerBuiltinOptionalDefault(
    * declaration is not an import specifier. Returns the CANONICAL module
    * name and the EXPORTED member name (not the local alias). */
   export function builtinImportOf(lowerer: Lowerer, ident: ts.Identifier): { module: string; member: string } | null {
-    const symbol = lowerer.checker.getSymbolAtLocation(ident);
+    const symbol = ts.isShorthandPropertyAssignment(ident.parent) && ident.parent.name === ident
+      ? lowerer.checker.getShorthandAssignmentValueSymbol(ident.parent)
+      : lowerer.checker.getSymbolAtLocation(ident);
     const decl = symbol ? lowerer.checker.declarationsOf(symbol)[0] : undefined;
     if (!decl) return null;
     // The CommonJS twin of the named import: a destructured require
     // binding (`const { readFileSync } = require("fs")`, renames via
     // `{ readFileSync: rf }`) keys the same tables.
     if (ts.isBindingElement(decl) && decl.name !== undefined && ts.isIdentifier(decl.name)) {
-      const varDecl = decl.parent.parent;
+      const varDecl = decl.parent?.parent;
       if (
         ts.isObjectBindingPattern(decl.parent) &&
         ts.isVariableDeclaration(varDecl) &&
@@ -285,7 +294,7 @@ function lowerBuiltinOptionalDefault(
     }
     if (!ts.isImportSpecifier(decl) && !ts.isExportSpecifier(decl)) return null;
     if (ts.isImportSpecifier(decl)) {
-      const importDecl = decl.parent.parent.parent;
+      const importDecl = decl.parent?.parent?.parent;
       if (!ts.isImportDeclaration(importDecl) || !ts.isStringLiteral(importDecl.moduleSpecifier)) {
         return null;
       }
@@ -666,7 +675,7 @@ function lowerBuiltinOptionalDefault(
         // This probe marks frontend inputs unstable, but every branch
         // here refuses compilation, so successful-build caches keep their
         // existing dependency proofs.
-        const resolved = resolveRequireRuntime(cr.baseFile.fileName, spec, lowerer.targetPlatform);
+        const resolved = resolveRequireRuntime(cr.baseFile.fileName, spec, lowerer.targetPlatform, undefined, lowerer.frontendServices);
         if (resolved.ok && resolved.value.endsWith(".node")) {
           lowerer.pushDiag(nativeAddonDiag(spec, loc));
           throw new PoisonError();
@@ -794,6 +803,7 @@ function lowerBuiltinOptionalDefault(
       call.getSourceFile().fileName,
       specifier,
       lowerer.targetPlatform,
+      lowerer.frontendServices,
     );
     if (result === null) {
       lowerer.noLowering(
@@ -811,7 +821,7 @@ function lowerBuiltinOptionalDefault(
   function requireResolverBaseFile(lowerer: Lowerer, receiver: ts.Expression): ts.SourceFile | null {
     const created = createRequireCalleeFileOf(lowerer, receiver);
     if (created !== null) return created;
-    return lowerer.isStdlibGlobal(receiver, "require") && !isNodeEsmFile(receiver.getSourceFile())
+    return lowerer.isStdlibGlobal(receiver, "require") && !isNodeEsmFile(receiver.getSourceFile(), lowerer.program)
       ? receiver.getSourceFile()
       : null;
   }
@@ -878,7 +888,7 @@ function lowerBuiltinOptionalDefault(
     }
     const loc = locOf(call);
     if (pathsCall) {
-      const result = requireResolvePathsRuntime(baseFile.fileName, specifier, lowerer.targetPlatform);
+      const result = requireResolvePathsRuntime(baseFile.fileName, specifier, lowerer.targetPlatform, lowerer.frontendServices);
       if (result !== null && !Array.isArray(result)) {
         return runtimeResolveThrow(result as RuntimeResolveError, lowerer.irTypeOf(call), loc);
       }
@@ -886,7 +896,7 @@ function lowerBuiltinOptionalDefault(
         ? { kind: "unitLit", unit: "null", type: NULL_T, loc }
         : {
             kind: "arrayLit",
-            elems: result.map((value) => ({ kind: "strLit", value, type: STRING, loc })),
+            elems: (result as readonly string[]).map((value): IrExpr => ({ kind: "strLit", value, type: STRING, loc })),
             type: arrayOf(STRING),
             loc,
           };
@@ -905,6 +915,7 @@ function lowerBuiltinOptionalDefault(
       specifier,
       lowerer.targetPlatform,
       paths,
+      lowerer.frontendServices,
     );
     return result.ok
       ? { kind: "strLit", value: result.value, type: STRING, loc }
@@ -1616,8 +1627,8 @@ function lowerFsSyncBufferWindow(
         );
       }
       const path = lowerer.lowerExprExpecting(expr.arguments[0]!, STRING);
-      const defaultFlags = { kind: "strLit", value: "r", type: STRING, loc } satisfies IrExpr;
-      const defaultMode = { kind: "numLit", value: 0o666, type: F64, loc } satisfies IrExpr;
+      const defaultFlags: IrExpr = { kind: "strLit", value: "r", type: STRING, loc };
+      const defaultMode: IrExpr = { kind: "numLit", value: 0o666, type: F64, loc };
       const flags = expr.arguments[1]
         ? lowerBuiltinOptionalDefault(lowerer, expr.arguments[1]!, STRING, defaultFlags)
         : defaultFlags;
@@ -2270,19 +2281,19 @@ function lowerFsSyncBufferWindow(
         : { kind: "numLit", value: 0, type: F64, loc };
       return { kind: "libCall", fn: "fs.accessSync", args: [path, mode], type: VOID, loc };
     }
-    if (bi.module === "fs" && bi.member === "writeFileSync" && expr.arguments.length === 2) {
+    if (bi.module === "fs" && (bi.member === "writeFileSync" || bi.member === "appendFileSync") && expr.arguments.length === 2) {
       const dataIr = lowerer.mapTypeOf(lowerer.typeOf(expr.arguments[1]!));
       if (dataIr?.kind === "bytes") {
         if (dataIr.elem !== "u8") {
           lowerer.noLowering(
-            `writeFileSync of '${lowerer.fmt(dataIr)}' data`,
+            `${bi.member} of '${lowerer.fmt(dataIr)}' data`,
             expr.arguments[1]!,
             "byte writes take Uint8Array/Buffer data",
           );
         }
         const path = lowerer.lowerExprExpecting(expr.arguments[0]!, STRING);
         const data = lowerer.lowerExprExpecting(expr.arguments[1]!, BYTES_U8);
-        return { kind: "libCall", fn: "fs.writeFileSyncBytes", args: [path, data], type: VOID, loc };
+        return { kind: "libCall", fn: bi.member === "appendFileSync" ? "fs.appendFileSyncBytes" : "fs.writeFileSyncBytes", args: [path, data], type: VOID, loc };
       }
     }
     // writeFileSync(p, data, options) / fs.promises.writeFile(p, data,
@@ -2446,6 +2457,26 @@ function lowerFsSyncBufferWindow(
     }
     const required = fn.params.length - (fn.defaults?.length ?? 0);
     const hasSpread = expr.arguments.some(ts.isSpreadElement);
+    if (!hasSpread && bi.module === "url" && bi.member === "pathToFileURL" && expr.arguments.length === 2) {
+      let options = expr.arguments[1]!;
+      while (ts.isParenthesizedExpression(options) || ts.isSatisfiesExpression(options)) options = options.expression;
+      if (!ts.isObjectLiteralExpression(options) || options.properties.length > 1) {
+        lowerer.noLowering("pathToFileURL with these options", options, "use a literal { windows: boolean } options object");
+      }
+      let windowsNode: ts.Expression | null = null;
+      const property = options.properties[0];
+      if (property) {
+        if ((!ts.isPropertyAssignment(property) && !ts.isShorthandPropertyAssignment(property)) ||
+            (!ts.isIdentifier(property.name) && !ts.isStringLiteral(property.name)) || property.name.text !== "windows") {
+          lowerer.noLowering("pathToFileURL with these options", property, "use a literal { windows: boolean } options object");
+        }
+        windowsNode = ts.isPropertyAssignment(property) ? property.initializer : property.name;
+      }
+      const path = lowerer.lowerExprExpecting(expr.arguments[0]!, STRING);
+      const defaultWindows: IrExpr = { kind: "boolLit", value: lowerer.targetPlatform === "win32", type: BOOL, loc };
+      const windows = windowsNode ? lowerOptionalArgument(lowerer, windowsNode, BOOL, defaultWindows) : defaultWindows;
+      return { kind: "libCall", fn: "url.pathToFileURLPlatform", args: [path, windows], type: fn.result, loc };
+    }
     if (hasSpread && bi.module === "url" && bi.member === "fileURLToPath") {
       lowerer.noLowering(
         "fileURLToPath with spread arguments",
@@ -4368,20 +4399,20 @@ export function lowerForkCall(lowerer: Lowerer, expr: ts.CallExpression, loc: Sr
     const loc = locOf(call);
     if (name === "getStore" && call.arguments.length === 0) {
       const receiver = lowerer.lowerExprExpecting(access.expression, F64);
-      return { kind: "libCall", fn: "als.get", args: [receiver], type: DYN, loc };
+      return alsTypedResult(lowerer, call, { kind: "libCall", fn: "als.get", args: [receiver], type: DYN, loc });
     }
     if (name === "run" && call.arguments.length >= 2) {
       const receiver = lowerer.lowerExprExpecting(access.expression, F64);
       const value = dcMessageArg(lowerer, call.arguments[0]!);
       const fn = dcSubscriberArg(lowerer, call.arguments[1]!);
       const rest = dcTraceArgsArr(lowerer, call.arguments.slice(2), loc);
-      return { kind: "libCall", fn: "als.run", args: [receiver, value, fn, rest], type: DYN, loc };
+      return alsTypedResult(lowerer, call, { kind: "libCall", fn: "als.run", args: [receiver, value, fn, rest], type: DYN, loc });
     }
     if (name === "exit" && call.arguments.length >= 1) {
       const receiver = lowerer.lowerExprExpecting(access.expression, F64);
       const fn = dcSubscriberArg(lowerer, call.arguments[0]!);
       const rest = dcTraceArgsArr(lowerer, call.arguments.slice(1), loc);
-      return { kind: "libCall", fn: "als.exitRun", args: [receiver, fn, rest], type: DYN, loc };
+      return alsTypedResult(lowerer, call, { kind: "libCall", fn: "als.exitRun", args: [receiver, fn, rest], type: DYN, loc });
     }
     if (name === "enterWith" && call.arguments.length === 1) {
       const receiver = lowerer.lowerExprExpecting(access.expression, F64);
@@ -4398,6 +4429,18 @@ export function lowerForkCall(lowerer: Lowerer, expr: ts.CallExpression, loc: Sr
       "run(store, fn, ...args), exit(fn, ...args), getStore(), enterWith(store), and disable() are the supported AsyncLocalStorage members",
       lowerer.checker.getSymbolAtLocation(access.name),
     );
+  }
+
+  /** The runtime carries a tagged value, while a typed ALS call promises
+   * its generic store/callback result. Convert at that boundary so inferred
+   * locals and immediate method calls share the same checked representation.
+   * Untyped JS and unknown stores keep the original dynamic value. */
+  function alsTypedResult(lowerer: Lowerer, call: ts.CallExpression, value: IrExpr): IrExpr {
+    const expected = lowerer.mapTypeOf(lowerer.typeOf(call));
+    // Promises already use the runtime's dynamic async path; unlike class
+    // capsules, boxed typed promises do not have a checked extraction ABI.
+    if (!expected || expected.kind === "dyn" || expected.kind === "void" || expected.kind === "promise") return value;
+    return lowerer.coerceInto(call, value, expected);
   }
 
   /** Property reads on Channel receivers: `.name` (the registration
@@ -4823,6 +4866,21 @@ export function lowerForkCall(lowerer: Lowerer, expr: ts.CallExpression, loc: Sr
       }
       const argNode = call.arguments[0]!;
       let value = lowerer.lowerExpr(argNode);
+      // Optional Map/array reads and partially narrowed unions keep their
+      // storage representation when lowered as ordinary arguments. Select
+      // the JSON walker from the proven use-site type, using a checked
+      // conversion so a stale capture cannot read an impossible payload.
+      // Optional strings have a serializer that preserves a missing root;
+      // an unchecked array read can still be absent despite its checker type.
+      if (value.type.kind === "union" && optionalStringTags(lowerer, value.type) === null) {
+        const narrowed = lowerer.mapTypeOf(lowerer.typeOf(argNode));
+        if (narrowed && !isUnitType(narrowed) && narrowed.kind !== "void") {
+          const helper = narrowed.kind === "union"
+            ? lowerer.narrowedRetagHelper(argNode, value.type.unionId, narrowed.unionId, loc)
+            : lowerer.narrowedArmHelper(value.type.unionId, narrowed, loc);
+          if (helper) value = { kind: "call", callee: helper, args: [value], type: narrowed, loc };
+        }
+      }
       const replacer = call.arguments[1];
       if (replacer && !jsonNullishArgument(lowerer, replacer)) {
         const callback = lowerJsonCallback(lowerer, replacer, "replacer");
@@ -4854,6 +4912,21 @@ export function lowerForkCall(lowerer: Lowerer, expr: ts.CallExpression, loc: Sr
       }
       const optionalString = lowerOptionalStringifyRoot(lowerer, value, indent, loc);
       if (optionalString) return optionalString;
+      if (value.type.kind === "dyn" || isJsonStringifyDynamicType(value.type, (id) => lowerer.shapes.get(id), (id) => lowerer.unions.get(id))) {
+        // Keep the original containers live while the runtime visits them:
+        // a toJSON callback can mutate a later field, and shared/cyclic
+        // references must retain their identities throughout traversal.
+        const boxed: IrExpr = value.type.kind === "dyn" ? value : { kind: "dynFrom", value, liveRef: true, type: DYN, loc };
+        const raw: IrExpr = {
+          kind: "libCall", fn: "json.stringifyReplacer",
+          args: [boxed, dynUndefinedExpr(loc), { kind: "strLit", value: indent, type: STRING, loc }],
+          type: DYN, loc,
+        };
+        // Preserve the existing dyn-root string ABI, including its textual
+        // "undefined" result, while letting the runtime honor toJSON hooks.
+        return value.type.kind === "dyn" ? { kind: "toString", operand: raw, type: STRING, loc }
+          : { kind: "dynCheck", value: raw, type: lowerer.withUndefinedArm(STRING), loc };
+      }
       // An ISLAND value (`JSON.stringify(err)` on a package handle — the
       // island error-inspection idiom): the ENGINE's own JSON.stringify
       // runs, so key order, nesting, toJSON, and getters match Node by
@@ -4876,17 +4949,7 @@ export function lowerForkCall(lowerer: Lowerer, expr: ts.CallExpression, loc: Sr
         const raw: IrExpr = { kind: "jsOp", op: "callMethod", name: "stringify", args, type: JSVAL, loc };
         return { kind: "jsOp", op: "toStr", args: [raw], type: STRING, loc };
       }
-      // A dyn ROOT (`JSON.stringify(u)` over unknown / `{}` / `Object` /
-      // `object` slots, the JSON.parse round-trip) serializes with the
-      // runtime's dyn walker instead of a type-directed serializer — the
-      // dyn is JSON-representable by construction (non-JSON values fenced
-      // at their conversion INTO the slot). Two edges, both documented:
-      // a root the stringify drops (runtime undefined) produces the TEXT
-      // "undefined" where Node produces the undefined VALUE (tsc's own lib
-      // types the return `string`, so no static consumer can tell), and a
-      // runtime handle inside the tree throws (Node would walk its own
-      // enumerable props, which the handle does not model).
-      if (!lowerer.jsonStringifySafe(value.type) && value.type.kind !== "dyn") {
+      if (!lowerer.jsonStringifySafe(value.type)) {
         // Bare undefined-armed unions get their own wording: Node's
         // stringify of bare undefined is not a string at all — per-type
         // serialization cannot match that exactly, so the fence is
@@ -5048,9 +5111,9 @@ function lowerJsonCallback(lowerer: Lowerer, node: ts.Expression, role: "replace
         }
       }
     }
-    let importDecl: ts.Node;
-    if (ts.isImportSpecifier(decl)) importDecl = decl.parent.parent.parent;
-    else if (ts.isNamespaceImport(decl)) importDecl = decl.parent.parent;
+    let importDecl: ts.Node | undefined;
+    if (ts.isImportSpecifier(decl)) importDecl = decl.parent?.parent?.parent;
+    else if (ts.isNamespaceImport(decl)) importDecl = decl.parent?.parent;
     else if (ts.isImportClause(decl)) importDecl = decl.parent;
     else return null;
     if (!ts.isImportDeclaration(importDecl) || !ts.isStringLiteral(importDecl.moduleSpecifier)) {
@@ -5784,7 +5847,7 @@ function lowerOptionalStringSearchParams(lowerer: Lowerer, init: IrExpr, loc: Sr
     const receiver = (): IrExpr => lowerer.lowerExprExpecting(access.expression, FILEHANDLE_T);
     const promise = (inner: IrType): IrType => ({ kind: "promise", inner });
     const num = (node: ts.Expression | undefined, dflt: number): { value: IrExpr; defaulted: IrExpr } => {
-      const defaultValue = { kind: "numLit", value: dflt, type: F64, loc } satisfies IrExpr;
+      const defaultValue: IrExpr = { kind: "numLit", value: dflt, type: F64, loc };
       if (!node) return { value: defaultValue, defaulted: boolLit(true, loc) };
       const undefinedArg = lowerStaticallyUndefinedArgument(lowerer, node);
       if (undefinedArg) {
@@ -6737,6 +6800,13 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
     if (!lowerer.isStdlibMember(access)) return null;
     const name = access.name.text;
     const loc = locOf(call);
+    if (isJsSourceFile(call.getSourceFile())) {
+      const receiver = lowerer.lowerExpr(access.expression);
+      if (receiver.type.kind === "dyn") {
+        return { kind: "dynInvoke", recv: receiver, method: name, calleeName: call.expression.getText(),
+          args: call.arguments.map((arg) => lowerer.lowerExprExpecting(arg, DYN)), type: DYN, loc };
+      }
+    }
     if (name === "write" && call.arguments.length === 1) {
       const receiver = lowerer.lowerExpr(access.expression);
       const data = lowerer.lowerExpr(call.arguments[0]!);
@@ -6993,6 +7063,15 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
   export function lowerProcessStreamProperty(lowerer: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
     if (expr.questionDotToken) return null;
     const member = expr.name.text;
+    const direct = ts.isPropertyAccessExpression(expr.expression) ? lowerer.stdlibGlobalMember(expr.expression, "process") : null;
+    if (isJsSourceFile(expr.getSourceFile()) &&
+        (direct === "stdin" || direct === "stdout" || direct === "stderr" ||
+         lowerer.mapTypeOf(lowerer.typeOf(expr.expression))?.kind === "procStream")) {
+      const value = lowerer.lowerExpr(expr.expression);
+      if (value.type.kind === "dyn") return {
+        kind: "dynKeyGet", value, key: strLit(member, locOf(expr.name)), type: DYN, loc: locOf(expr),
+      };
+    }
     if (member !== "isTTY" && member !== "columns" && member !== "rows") return null;
     let recv: ts.Expression = expr.expression;
     while (ts.isParenthesizedExpression(recv) || ts.isAsExpression(recv) || ts.isTypeAssertion(recv)) recv = recv.expression;
@@ -7052,12 +7131,8 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
    * rejected specifically. Null for non-process receivers (the chain keeps
    * trying other property lowerings). */
   export function lowerProcessProperty(lowerer: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
-    // process.versions.node — the ONE lowered member of process.versions:
-    // there is no Node under the binary, so the honest answer is the
-    // runtime's own Node compatibility target (the version whose semantics
-    // SEMANTICS.md verifies against — divergence 60, the execPath stance).
-    // Other versions members (v8, openssl, ...) name components that do
-    // not exist here and fall through to the member fence.
+    // node and openssl name the compatibility target, not linked engines.
+    // Read the stable object so descriptor edits through aliases stay visible.
     if (
       (expr.name.text === "node" || expr.name.text === "openssl") &&
       !expr.questionDotToken &&
@@ -7069,36 +7144,32 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
       // "is crypto available" probe, and the crypto module exists here
       // (unsupported members fence per site). SEMANTICS.md documents that
       // the string names the compat target, not a linked library.
-      const fn = expr.name.text === "node" ? "process.versionsNode" : "process.versionsOpenssl";
-      return { kind: "libCall", fn, args: [], type: STRING, loc: locOf(expr) };
+      const loc = locOf(expr);
+      return lowerer.coerceToExpected({
+        kind: "dynKeyGet", key: { kind: "strLit", value: expr.name.text, type: STRING, loc },
+        value: { kind: "libCall", fn: "process.versions", args: [], type: DYN, loc }, type: DYN, loc,
+      }, STRING);
     }
-    // process.versions?.electron is the runtime-capability probe used by
-    // CLI packages to select Electron argument conventions. versions
-    // itself always exists, and a native scriptc binary is not Electron,
-    // so both the optional and ordinary property spellings read undefined.
+    // Other components begin absent. Consult the same object even for the
+    // capability probes: users can define or delete their own entries.
     if (
       ts.isPropertyAccessExpression(expr.expression) &&
-      lowerer.stdlibGlobalMember(expr.expression, "process") === "versions" &&
-      expr.name.text === "electron"
+      lowerer.stdlibGlobalMember(expr.expression, "process") === "versions"
     ) {
-      return { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc: locOf(expr) };
+      const loc = locOf(expr);
+      return {
+        kind: "dynKeyGet", key: { kind: "strLit", value: expr.name.text, type: STRING, loc },
+        value: { kind: "libCall", fn: "process.versions", args: [], type: DYN, loc }, type: DYN, loc,
+      };
     }
     // The capability-probe members that honestly DON'T EXIST in a
     // compiled binary — each reads undefined (their declared types carry
     // the undefined arm), so feature probes take their documented
-    // fallbacks: no OpenSSL/SQLite components (process.versions.openssl/
-    // .sqlite), no gyp build config (process.config.variables.* — no ICU,
+    // fallbacks: no gyp build config (process.config.variables.* — no ICU,
     // no QUIC — and process.config.target_defaults), no feature flags
     // (process.features.* — no inspector, not a debug build).
     if (!expr.questionDotToken && ts.isPropertyAccessExpression(expr.expression)) {
       const container = lowerer.stdlibGlobalMember(expr.expression, "process");
-      if (container === "versions" && (expr.name.text === "sqlite" || expr.name.text === "bun" || expr.name.text === "deno")) {
-        // versions.bun / versions.deno are the OTHER-runtime probes (a
-        // formatter's config loader picks its package.json reader by
-        // them): a compiled binary is neither, so both read undefined —
-        // exactly Node's own answer.
-        return { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc: locOf(expr) };
-      }
       if (container === "features") {
         return { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc: locOf(expr) };
       }
@@ -7122,6 +7193,15 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
     const member = lowerer.stdlibGlobalMember(expr, "process");
     if (member === null) return null;
     const loc = locOf(expr);
+    if (member === "versions") {
+      return { kind: "libCall", fn: "process.versions", args: [], type: DYN, loc };
+    }
+    if (member === "getBuiltinModule") {
+      // Keep the native loader's argument validation when the function is
+      // stored. The declaration's string signature must not insert a checked
+      // adapter before the loader gets to report Node's invalid-id error.
+      return { kind: "dynFrom", value: lowerBuiltinLoaderValue(lowerer, loc), type: DYN, loc };
+    }
     if (member === "argv") {
       return { kind: "libCall", fn: "process.argv", args: [], type: arrayOf(STRING), loc };
     }
@@ -7178,6 +7258,9 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
     // procStream scalar, minted as the stream's fd. Member reads
     // (`process.stdout.isTTY`, `.write(...)`) never reach here — their
     // OUTER expressions dispatch first.
+    if (member === "stdin" || ((member === "stdout" || member === "stderr") && isJsSourceFile(expr.getSourceFile()))) {
+      return { kind: "libCall", fn: "process.stdio", args: [numLit(member === "stdin" ? 0 : member === "stdout" ? 1 : 2, loc)], type: DYN, loc };
+    }
     if (member === "stdout" || member === "stderr") {
       return { kind: "numLit", value: member === "stdout" ? 1 : 2, type: PROCSTREAM_T, loc };
     }
@@ -7289,9 +7372,11 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
       );
     const callType = lowerer.mapTypeOf(lowerer.typeOf(call));
     if (!callType) fence();
-    const result = promiseForm
-      ? callType.kind === "promise" ? callType.inner : fence()
-      : callType;
+    let result = callType;
+    if (promiseForm) {
+      if (callType.kind !== "promise") fence();
+      result = callType.inner;
+    }
     if (result?.kind !== "array" || result.elem.kind !== "record") fence();
     const shape = lowerer.shapes.get(result.elem.shapeId);
     if (
@@ -7482,9 +7567,9 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
       else if (arm.kind !== "undefinedT" && arm.kind !== "f64") fence();
     }
     if (!sawStr || !sawArr) fence();
-    const str = call.arguments[0]
-      ? lowerer.lowerExprExpecting(call.arguments[0], STRING)
-      : lowerer.noLowering("querystring.parse without a query string", call);
+    const argument = call.arguments[0];
+    if (!argument) lowerer.noLowering("querystring.parse without a query string", call);
+    const str = lowerer.lowerExprExpecting(argument, STRING);
     const sep = qsSepEqArg(lowerer, call.arguments[1], "&", "querystring.parse", loc);
     const eq = qsSepEqArg(lowerer, call.arguments[2], "=", "querystring.parse", loc);
     // The options walk: maxKeys lowers (Node's rule — > 0 caps the pair
@@ -7686,7 +7771,26 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
   export function lowerProcessMethodCall(lowerer: Lowerer, call: ts.CallExpression,
     access: ts.PropertyAccessExpression,): IrExpr | null {
     if (call.questionDotToken) return null;
+    if (isJsSourceFile(call.getSourceFile()) && ts.isPropertyAccessExpression(access.expression)) {
+      const stream = lowerer.stdlibGlobalMember(access.expression, "process");
+      if (stream === "stdin" || stream === "stdout" || stream === "stderr") {
+        if (call.arguments.some(ts.isSpreadElement)) lowerer.noLowering("process stream spread arguments", call);
+        return { kind: "dynInvoke", recv: lowerer.lowerExpr(access.expression), method: access.name.text,
+          calleeName: access.getText(), args: call.arguments.map((arg) => lowerer.lowerExprExpecting(arg, DYN)), type: DYN, loc: locOf(call) };
+      }
+    }
     const directProcessMember = lowerer.stdlibGlobalMember(access, "process");
+    if (directProcessMember === "getBuiltinModule") {
+      if (call.arguments.some(ts.isSpreadElement)) lowerer.noLowering("process.getBuiltinModule with spread arguments", call);
+      const loc = locOf(call);
+      const id = call.arguments[0] ? lowerer.lowerExprExpecting(call.arguments[0], DYN)
+        : { kind: "dynFrom", value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc }, type: DYN, loc } satisfies IrExpr;
+      const binding = lowerer.declareHiddenLocal("%builtinId", DYN);
+      return { kind: "seqExpr", stmts: [
+        { kind: "varDecl", localId: binding.id, init: id, loc },
+        ...call.arguments.slice(1).map((arg): IrStmt => ({ kind: "exprStmt", expr: lowerer.lowerExpr(arg), loc: locOf(arg) })),
+      ], result: { kind: "callValue", callee: lowerBuiltinLoaderValue(lowerer, loc), args: [varRef(binding.id, DYN, loc)], type: DYN, loc }, type: DYN, loc };
+    }
     if (directProcessMember === "send") return lowerProcessIpcSend(lowerer, call);
     if (directProcessMember === "disconnect") {
       if (call.arguments.length !== 0) {
@@ -8616,84 +8720,6 @@ type TextCodecCtor = {
   ctor: ts.NewExpression;
 };
 
-/* WHATWG label registry → native decoder id. The first 27 ids stay in the
- * same order as scripts/gen-text-decoder-tables.mjs; the remaining ids match
- * scr_bytes.c's compact enum. ISO-8859-8-I shares ISO-8859-8's byte table,
- * and GBK/gb18030 share one decoder (their decoders are identical). */
-const TEXT_DECODER_SINGLE_BYTE_NAMES = [
-  "ibm866", "iso-8859-2", "iso-8859-3", "iso-8859-4", "iso-8859-5",
-  "iso-8859-6", "iso-8859-7", "iso-8859-8", "iso-8859-10", "iso-8859-13",
-  "iso-8859-14", "iso-8859-15", "iso-8859-16", "koi8-r", "koi8-u",
-  "macintosh", "windows-874", "windows-1250", "windows-1251", "windows-1252",
-  "windows-1253", "windows-1254", "windows-1255", "windows-1256", "windows-1257",
-  "windows-1258", "x-mac-cyrillic",
-] as const;
-
-const TEXT_DECODER_UTF8_LABELS = new Set([
-  "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "utf-8", "utf8", "x-unicode20utf8",
-]);
-
-const TEXT_DECODER_LEGACY_LABELS: Record<string, number | undefined> = (() => {
-  const labels: Record<string, number> = Object.create(null) as Record<string, number>;
-  const add = (encoding: number, names: readonly string[]): void => {
-    for (const name of names) labels[name] = encoding;
-  };
-  const single = (name: typeof TEXT_DECODER_SINGLE_BYTE_NAMES[number], aliases: readonly string[]): void => {
-    add(TEXT_DECODER_SINGLE_BYTE_NAMES.indexOf(name), aliases);
-  };
-  single("ibm866", ["866", "cp866", "csibm866", "ibm866"]);
-  single("iso-8859-2", ["csisolatin2", "iso-8859-2", "iso-ir-101", "iso8859-2", "iso88592", "iso_8859-2", "iso_8859-2:1987", "l2", "latin2"]);
-  single("iso-8859-3", ["csisolatin3", "iso-8859-3", "iso-ir-109", "iso8859-3", "iso88593", "iso_8859-3", "iso_8859-3:1988", "l3", "latin3"]);
-  single("iso-8859-4", ["csisolatin4", "iso-8859-4", "iso-ir-110", "iso8859-4", "iso88594", "iso_8859-4", "iso_8859-4:1988", "l4", "latin4"]);
-  single("iso-8859-5", ["csisolatincyrillic", "cyrillic", "iso-8859-5", "iso-ir-144", "iso8859-5", "iso88595", "iso_8859-5", "iso_8859-5:1988"]);
-  single("iso-8859-6", ["arabic", "asmo-708", "csiso88596e", "csiso88596i", "csisolatinarabic", "ecma-114", "iso-8859-6", "iso-8859-6-e", "iso-8859-6-i", "iso-ir-127", "iso8859-6", "iso88596", "iso_8859-6", "iso_8859-6:1987"]);
-  single("iso-8859-7", ["csisolatingreek", "ecma-118", "elot_928", "greek", "greek8", "iso-8859-7", "iso-ir-126", "iso8859-7", "iso88597", "iso_8859-7", "iso_8859-7:1987", "sun_eu_greek"]);
-  single("iso-8859-8", ["csiso88598e", "csiso88598i", "csisolatinhebrew", "hebrew", "iso-8859-8", "iso-8859-8-e", "iso-8859-8-i", "iso-ir-138", "iso8859-8", "iso88598", "iso_8859-8", "iso_8859-8:1988", "logical", "visual"]);
-  single("iso-8859-10", ["csisolatin6", "iso-8859-10", "iso-ir-157", "iso8859-10", "iso885910", "l6", "latin6"]);
-  single("iso-8859-13", ["iso-8859-13", "iso8859-13", "iso885913"]);
-  single("iso-8859-14", ["iso-8859-14", "iso8859-14", "iso885914"]);
-  single("iso-8859-15", ["csisolatin9", "iso-8859-15", "iso8859-15", "iso885915", "iso_8859-15", "l9"]);
-  single("iso-8859-16", ["iso-8859-16"]);
-  single("koi8-r", ["cskoi8r", "koi", "koi8", "koi8-r", "koi8_r"]);
-  single("koi8-u", ["koi8-ru", "koi8-u"]);
-  single("macintosh", ["csmacintosh", "mac", "macintosh", "x-mac-roman"]);
-  single("windows-874", ["dos-874", "iso-8859-11", "iso8859-11", "iso885911", "tis-620", "windows-874"]);
-  single("windows-1250", ["cp1250", "windows-1250", "x-cp1250"]);
-  single("windows-1251", ["cp1251", "windows-1251", "x-cp1251"]);
-  single("windows-1252", ["ansi_x3.4-1968", "ascii", "cp1252", "cp819", "csisolatin1", "ibm819", "iso-8859-1", "iso-ir-100", "iso8859-1", "iso88591", "iso_8859-1", "iso_8859-1:1987", "l1", "latin1", "us-ascii", "windows-1252", "x-cp1252"]);
-  single("windows-1253", ["cp1253", "windows-1253", "x-cp1253"]);
-  single("windows-1254", ["cp1254", "csisolatin5", "iso-8859-9", "iso-ir-148", "iso8859-9", "iso88599", "iso_8859-9", "iso_8859-9:1989", "l5", "latin5", "windows-1254", "x-cp1254"]);
-  single("windows-1255", ["cp1255", "windows-1255", "x-cp1255"]);
-  single("windows-1256", ["cp1256", "windows-1256", "x-cp1256"]);
-  single("windows-1257", ["cp1257", "windows-1257", "x-cp1257"]);
-  single("windows-1258", ["cp1258", "windows-1258", "x-cp1258"]);
-  single("x-mac-cyrillic", ["x-mac-cyrillic", "x-mac-ukrainian"]);
-
-  add(27, ["x-user-defined"]);
-  add(28, ["csunicode", "iso-10646-ucs-2", "ucs-2", "unicode", "unicodefeff", "utf-16", "utf-16le"]);
-  add(29, ["unicodefffe", "utf-16be"]);
-  add(30, ["chinese", "csgb2312", "csiso58gb231280", "gb18030", "gb2312", "gb_2312", "gb_2312-80", "gbk", "iso-ir-58", "x-gbk"]);
-  add(31, ["big5", "big5-hkscs", "cn-big5", "csbig5", "x-x-big5"]);
-  add(32, ["cseucpkdfmtjapanese", "euc-jp", "x-euc-jp"]);
-  add(33, ["csiso2022jp", "iso-2022-jp"]);
-  add(34, ["csshiftjis", "ms932", "ms_kanji", "shift-jis", "shift_jis", "sjis", "windows-31j", "x-sjis"]);
-  add(35, ["cseuckr", "csksc56011987", "euc-kr", "iso-ir-149", "korean", "ks_c_5601-1987", "ks_c_5601-1989", "ksc5601", "ksc_5601", "windows-949"]);
-  return labels;
-})();
-
-type StaticTextDecoderEncoding = { kind: "utf8" } | { kind: "legacy"; id: number };
-
-/** TextDecoder's get-an-encoding normalization: trim ASCII whitespace and
- * fold ASCII case only (Unicode case folding must not manufacture a label). */
-function staticTextDecoderEncoding(label: string): StaticTextDecoderEncoding | null {
-  const normalized = label
-    .replace(/^[\u0009\u000a\u000c\u000d\u0020]+|[\u0009\u000a\u000c\u000d\u0020]+$/g, "")
-    .replace(/[A-Z]/g, (char) => char.toLowerCase());
-  if (TEXT_DECODER_UTF8_LABELS.has(normalized)) return { kind: "utf8" };
-  const id = own(TEXT_DECODER_LEGACY_LABELS, normalized);
-  return id === undefined ? null : { kind: "legacy", id };
-}
-
 /** Box a codec's immutable encoding in an owned record. Unlike erased
  * aliases, this value can live in fields, arguments, and closure captures. */
 export function lowerTextCodecNew(lowerer: Lowerer, ctor: ts.NewExpression, cls: TextCodecCtor["cls"]): IrExpr {
@@ -8888,16 +8914,16 @@ function lowerStoredTextCodecCall(lowerer: Lowerer, call: ts.CallExpression, acc
     return { kind: "libCall", fn: "buffer.fromStr", args: [s, enc], type: BYTES_U8, loc };
   }
 
-/** `String.fromCharCode(...codes)` on THE String global: every argument
+/** `String.fromCharCode/fromCodePoint(...codes)` on THE String global: every argument
    * lowers as a number and packs into ONE f64[] array-literal argument
    * (the path.join convention) — or ONE whole-array spread forwards the
-   * array itself. Other String statics (fromCodePoint, raw) fall through
-   * to the member fence. Null for non-String receivers. */
+   * array itself. String.raw has its own template path below.
+   * Null for non-String receivers. */
   export function lowerStringStaticCall(lowerer: Lowerer, call: ts.CallExpression,
     access: ts.PropertyAccessExpression,): IrExpr | null {
     if (call.questionDotToken) return null;
     const member = lowerer.stdlibGlobalMember(access, "String");
-    if (member !== "fromCharCode" && member !== "raw") return null;
+    if (member !== "fromCharCode" && member !== "fromCodePoint" && member !== "raw") return null;
     const loc = locOf(call);
     // String.raw(template, ...substitutions): the template's `raw` member
     // is a string[] read off any record that carries one (the lib's
@@ -8951,9 +8977,9 @@ function lowerStoredTextCodecCall(lowerer: Lowerer, call: ts.CallExpression, acc
     if (spread) {
       if (call.arguments.length !== 1) {
         lowerer.noLowering(
-          "String.fromCharCode with a mixed spread call",
+          `String.${member} with a mixed spread call`,
           call,
-          "spread a whole array (String.fromCharCode(...codes)) or pass plain arguments",
+          `spread a whole array (String.${member}(...codes)) or pass plain arguments`,
         );
       }
       // A typed-array/Buffer spread (String.fromCharCode(...data.slice(4, 8))
@@ -8963,14 +8989,14 @@ function lowerStoredTextCodecCall(lowerer: Lowerer, call: ts.CallExpression, acc
       if (spreadT?.kind === "bytes") {
         const packed = lowerer.lowerExpr(spread.expression);
         if (packed.type.kind !== "bytes") lowerer.badType(spread.expression, lowerer.typeOf(spread.expression));
-        return { kind: "libCall", fn: "string.fromCharCode", args: [packed], type: STRING, loc };
+        return { kind: "libCall", fn: `string.${member}`, args: [packed], type: STRING, loc };
       }
       const packed = lowerer.lowerExprExpecting(spread.expression, arrayOf(F64));
-      return { kind: "libCall", fn: "string.fromCharCode", args: [packed], type: STRING, loc };
+      return { kind: "libCall", fn: `string.${member}`, args: [packed], type: STRING, loc };
     }
     const elems = call.arguments.map((a) => lowerer.lowerExprExpecting(a, F64));
     const packed: IrExpr = { kind: "arrayLit", elems, type: arrayOf(F64), loc };
-    return { kind: "libCall", fn: "string.fromCharCode", args: [packed], type: STRING, loc };
+    return { kind: "libCall", fn: `string.${member}`, args: [packed], type: STRING, loc };
   }
 
 /** `s.lastIndexOf(searchValue?, position?)` on string receivers, using UTF-16

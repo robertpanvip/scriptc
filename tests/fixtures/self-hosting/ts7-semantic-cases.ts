@@ -199,7 +199,18 @@ export function checkSemanticModel(snapshot: SemanticSnapshot, checker: Semantic
   const mapped = typeAt(checker, declaration(root, "Mapped").type!);
   check(mapped.isStringMappingType() && mapped.getTarget()!.isTypeParameter(), "string mapping type");
   check(checker.typeToTypeNode(intrinsicNumber, answer)!.kind === AstKind.NumberKeyword, "binary type node");
-  check(checker.signatureToSignatureDeclaration(signature, AstKind.FunctionType, identity)!.kind === AstKind.FunctionType, "binary signature node");
+  const syntheticType = checker.typeToTypeNode(boxType, box)!;
+  check(syntheticType.kind === AstKind.TypeReference, "binary class type node");
+  check(syntheticType.typeName!.text === "Box", "synthetic type child");
+  check(syntheticType.typeName!.parent === syntheticType, "synthetic type parent identity");
+  check(syntheticType.file.node(1) === syntheticType, "synthetic root identity");
+  const syntheticSignature = checker.signatureToSignatureDeclaration(signature, AstKind.FunctionType, identity)!;
+  check(syntheticSignature.kind === AstKind.FunctionType, "binary signature node");
+  check(syntheticSignature.parameters!.length === 1 && syntheticSignature.parameters![0]!.name!.text === "value", "synthetic signature children");
+  let syntheticRefusals = 0;
+  try { syntheticType.getSourceFile(); } catch { syntheticRefusals++; }
+  try { syntheticSignature.file.sourceFile; } catch { syntheticRefusals++; }
+  check(syntheticRefusals === 2, "fragments cannot claim source-file views");
   const references = checker.getReferencesToSymbolInFile(root.fileName, answerSymbol);
   check(references.length > 0 && references.every((handle) => handle.resolve() !== undefined), "reference node handles");
   check(checker.getReferencedSymbolsForNode(root, answerName.getStart()).length === 0, "empty referenced-symbol query");
@@ -210,6 +221,12 @@ export function checkSemanticModel(snapshot: SemanticSnapshot, checker: Semantic
   check(ready.symbol === symbolAt(checker, declaration(root, "Mode").members![0]!.name!), "completion symbol identity");
   check(checker.getCompletionsAtPosition(root.fileName, answerName.getStart()) === undefined, "absent completions");
   check(answerType.flags === SemanticTypeFlags.NumberLiteral, "literal flags pin");
+  check(checkSemanticRefinements(answerType) === "number:43", "native number literal refinement");
+  check(checkSemanticRefinements(typeAt(checker, declaration(root, "emptyString").name!)) === "string:", "native string literal refinement");
+  check(checkSemanticRefinements(huge) === "bigint:-123456789012345678901234567889", "native bigint literal refinement");
+  check(checkSemanticRefinements(typeAt(checker, declaration(root, "flag").name!)) === "boolean:no", "native boolean literal refinement");
+  check(checkSemanticRefinements(intrinsicString) === "intrinsic:STRING", "native intrinsic refinement");
+  check(checkSemanticRefinements(pair).startsWith("object:"), "native object flags refinement");
 
   // Disposed object graphs must not fetch a replacement under recycled ids.
   snapshot.dispose();
@@ -220,4 +237,16 @@ export function checkSemanticModel(snapshot: SemanticSnapshot, checker: Semantic
   refused = false;
   try { answerSymbol.declarations[0]!.resolve(); } catch { refused = true; }
   check(refused, "declaration access after disposal");
+}
+
+/** Exercise the concrete client through its own predicates. Field reads
+ * retain the original tagged layout while the views retain object identity. */
+export function checkSemanticRefinements(type: SemanticType): string {
+  if (type.isStringLiteralType()) return "string:" + type.value.toUpperCase();
+  if (type.isNumberLiteralType()) return "number:" + (type.value + 1);
+  if (type.isBigIntLiteralType()) return "bigint:" + (type.value + 1n).toString();
+  if (type.isBooleanLiteralType()) return "boolean:" + (type.value ? "yes" : "no");
+  if (type.isObjectType()) return "object:" + type.objectFlags.toString();
+  if (type.isIntrinsicType()) return "intrinsic:" + type.intrinsicName.toUpperCase();
+  return "other";
 }

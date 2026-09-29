@@ -1,21 +1,13 @@
 /* Focused LLVM expression emission extracted from emitter.ts. */
 import { InternalCompilerError } from "../../errors.js";
 import { matchStringSelfConcat, undefinedArmTag } from "../../ir/analysis.js";
-import { isRefCounted, type IrBytesElem } from "../../ir/ir.js";
+import { isRefCounted } from "../../ir/ir.js";
 import { mangleRecordClone, mangleRecordNew } from "../mangle.js";
 import { arrNewCall, elemAccess } from "./shapes.js";
 import { LlvmUnsupportedError } from "./unsupported.js";
 import type { LlvmEmitterContext, ExprOf, LlValue } from "./expr-context.js";
 
-/** ScrBytesElem (scr_runtime.h): U8, U32, F32, I32, F64. */
-const BYTES_ELEM_NUM: Record<IrBytesElem, number> = {
-  u8: 0,
-  u32: 1,
-  f32: 2,
-  i32: 3,
-  f64: 4,
-};
-import { f64Lit } from "./common.js";
+import { BYTES_ELEM_NUM, f64Lit } from "./common.js";
 
 export function emitLiteralExpr(host: LlvmEmitterContext, e: ExprOf<"numLit" | "boolLit" | "strLit" | "moduleNsRef" | "unitLit" | "varRef">): LlValue {
     const B = host.B;
@@ -350,7 +342,9 @@ export function emitStringExpr(host: LlvmEmitterContext, e: ExprOf<"strConcat" |
           B.startBlock(join);
           const t = B.tmp();
           B.line(`${t} = load ptr, ptr ${slot}`);
-          return host.own({ name: t, type: e.type });
+          const result = host.own({ name: t, type: e.type });
+          host.emitPendingCheck();
+          return result;
         }
         if (v.type.kind === "record") {
           // String(record) / `${record}`: Object.prototype.toString's
@@ -364,7 +358,9 @@ export function emitStringExpr(host: LlvmEmitterContext, e: ExprOf<"strConcat" |
           host.declare(`declare ptr @scr_caught_to_string(ptr)`);
           const t = B.tmp();
           B.line(`${t} = call ptr @scr_caught_to_string(ptr ${v.name})`);
-          return host.own({ name: t, type: e.type });
+          const result = host.own({ name: t, type: e.type });
+          host.emitPendingCheck();
+          return result;
         }
         if (v.type.kind === "dyn") {
           // String(unknown): dispatch over the dyn kind (dyn.ts's sc_ds —
@@ -372,7 +368,9 @@ export function emitStringExpr(host: LlvmEmitterContext, e: ExprOf<"strConcat" |
           const helper = host.dyn.dynToStrHelper();
           const t = B.tmp();
           B.line(`${t} = call ptr @${helper}(ptr ${v.name})`);
-          return host.own({ name: t, type: e.type });
+          const result = host.own({ name: t, type: e.type });
+          host.emitPendingCheck();
+          return result;
         }
         const t = B.tmp();
         if (v.type.kind === "f64") {
@@ -515,9 +513,8 @@ export function emitContainerExpr(host: LlvmEmitterContext, e: ExprOf<"arrayLit"
       case "bytesNew": {
         // Typed-array/Buffer construction; the SOURCE's static type picks
         // the runtime entry. The source is borrowed; every form hands
-        // back +1. Only the f64 (length) form can throw (Node's "Invalid
-        // typed array length" RangeError) — pending check after the temp
-        // joins its frame.
+        // back +1. Length and checked-input forms can throw; check after
+        // the result joins its ownership frame.
         if (e.type.kind !== "bytes") throw new InternalCompilerError("llvm emitter bug: bytesNew of non-bytes type");
         const kind = BYTES_ELEM_NUM[e.type.elem];
         if (!e.source) {
@@ -536,9 +533,16 @@ export function emitContainerExpr(host: LlvmEmitterContext, e: ExprOf<"arrayLit"
           return out;
         }
         if (e.source.type.kind === "bytes") {
-          host.declare(`declare ptr @scr_bytes_copy(ptr)`);
-          B.line(`${t} = call ptr @scr_bytes_copy(ptr ${src.name})`);
+          host.declare(`declare ptr @scr_bytes_convert(i32, ptr)`);
+          B.line(`${t} = call ptr @scr_bytes_convert(i32 ${kind}, ptr ${src.name})`);
           return host.own({ name: t, type: e.type });
+        }
+        if (e.source.type.kind === "dyn") {
+          host.declare(`declare ptr @scr_bytes_from_dyn(i32, ptr, i1 zeroext)`);
+          B.line(`${t} = call ptr @scr_bytes_from_dyn(i32 ${kind}, ptr ${src.name}, i1 zeroext ${e.from ? "true" : "false"})`);
+          const out = host.own({ name: t, type: e.type });
+          host.emitPendingCheck();
+          return out;
         }
         if (e.source.type.kind === "array") {
           host.declare(`declare ptr @scr_bytes_from_arr(i32, ptr)`);

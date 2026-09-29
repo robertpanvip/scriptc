@@ -458,9 +458,9 @@
       "apiEntries": 276,
       "static": {
         "supported": 0,
-        "partial": 48,
+        "partial": 49,
         "refused": 0,
-        "not-implemented": 228,
+        "not-implemented": 227,
         "by-design": 0,
         "unreviewed": 0,
         "not-applicable": 0
@@ -842,9 +842,9 @@
       "apiEntries": 119,
       "static": {
         "supported": 0,
-        "partial": 25,
+        "partial": 30,
         "refused": 0,
-        "not-implemented": 94,
+        "not-implemented": 89,
         "by-design": 0,
         "unreviewed": 0,
         "not-applicable": 0
@@ -1178,9 +1178,9 @@
       "apiEntries": 62,
       "static": {
         "supported": 0,
-        "partial": 5,
+        "partial": 6,
         "refused": 0,
-        "not-implemented": 57,
+        "not-implemented": 56,
         "by-design": 0,
         "unreviewed": 0,
         "not-applicable": 0
@@ -39213,9 +39213,9 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "detail": "No static compiler lowering is registered for this API yet.",
-        "verification": "registry-gap"
+        "status": "partial",
+        "detail": "Implemented for the call shapes accepted by the compiler lowering.",
+        "verification": "test-backed"
       },
       "dynamic": {
         "status": "not-implemented",
@@ -65658,9 +65658,9 @@
       "anchor": "processgetbuiltinmoduleid",
       "nodeStability": null,
       "static": {
-        "status": "not-implemented",
-        "detail": "No static compiler lowering is registered for this API yet.",
-        "verification": "registry-gap"
+        "status": "partial",
+        "detail": "Implemented for the documented scriptc module-loader subset.",
+        "verification": "test-backed"
       },
       "dynamic": {
         "status": "not-implemented",
@@ -67481,9 +67481,9 @@
       "anchor": "",
       "nodeStability": null,
       "static": {
-        "status": "not-implemented",
-        "detail": "No static compiler lowering is registered for this API yet.",
-        "verification": "registry-gap"
+        "status": "partial",
+        "detail": "Stored JavaScript process streams support native input listeners, pause/resume and buffered reads, synchronous output writes, and output write replacement; other stream operations remain unsupported.",
+        "verification": "test-backed"
       },
       "dynamic": {
         "status": "partial",
@@ -67527,9 +67527,9 @@
       "anchor": "",
       "nodeStability": null,
       "static": {
-        "status": "not-implemented",
-        "detail": "No static compiler lowering is registered for this API yet.",
-        "verification": "registry-gap"
+        "status": "partial",
+        "detail": "Stored JavaScript process streams support native input listeners, pause/resume and buffered reads, synchronous output writes, and output write replacement; other stream operations remain unsupported.",
+        "verification": "test-backed"
       },
       "dynamic": {
         "status": "partial",
@@ -67573,9 +67573,9 @@
       "anchor": "",
       "nodeStability": null,
       "static": {
-        "status": "not-implemented",
-        "detail": "No static compiler lowering is registered for this API yet.",
-        "verification": "registry-gap"
+        "status": "partial",
+        "detail": "Stored JavaScript process streams support native input listeners, pause/resume and buffered reads, synchronous output writes, and output write replacement; other stream operations remain unsupported.",
+        "verification": "test-backed"
       },
       "dynamic": {
         "status": "partial",
@@ -67734,9 +67734,9 @@
       "anchor": "",
       "nodeStability": null,
       "static": {
-        "status": "not-implemented",
-        "detail": "No static compiler lowering is registered for this API yet.",
-        "verification": "registry-gap"
+        "status": "partial",
+        "detail": "Implemented for the documented scriptc module-loader subset.",
+        "verification": "test-backed"
       },
       "dynamic": {
         "status": "partial",
@@ -82322,9 +82322,9 @@
         "inherited": true
       },
       "static": {
-        "status": "not-implemented",
-        "detail": "No static compiler lowering is registered for this API yet.",
-        "verification": "registry-gap"
+        "status": "partial",
+        "detail": "Supports absolute inputs and relative inputs with string or URL bases; setters and some WHATWG parsing behavior remain unsupported.",
+        "verification": "test-backed"
       },
       "dynamic": {
         "status": "partial",

@@ -9,10 +9,10 @@ const any = (...features) => ({ any: features });
 const all = (...features) => ({ all: features });
 
 const BASE_RUNTIME_SOURCES = [
-  "scr_number.c", "scr_string.c", "scr_array.c", "scr_bytes.c",
+  "scr_number.c", "scr_bigint.c", "scr_string.c", "scr_grapheme.c", "scr_array.c", "scr_bytes.c",
   "scr_bytes_io.c", "scr_map.c", "scr_closure.c", "scr_ffi.c",
   "scr_object.c", "scr_union.c", "scr_exception.c", "scr_error.c",
-  "scr_console.c", "scr_lib.c", "scr_path.c", "scr_url.c", "scr_json.c",
+  "scr_console.c", "scr_lib.c", "scr_path.c", "scr_url.c", "scr_json.c", "scr_node_builtin.c",
   "scr_async.c", "scr_crypto_async.c", "scr_child.c", "scr_cycle.c",
 ];
 
@@ -32,7 +32,7 @@ const optional = [
   ["scr_inspect.c", "inspect"],
   ["scr_dyn_invoke.c", any("dynInvoke", "nativeFetch")],
   ["scr_dc.c", "dc"],
-  ["scr_async_dyn.c", any("dynAsync", "dynInvoke", "dc", "nativeFetch")],
+  ["scr_async_dyn.c", any("dynAsync", "dynInvoke", "dc", "fileHandle", "nativeFetch")],
   ["scr_zlib.c", "zlib"],
   ["scr_zlib_island.c", all("zlib", "dynamic")],
   ["scr_events.c", "events"],
@@ -40,7 +40,6 @@ const optional = [
   ["scr_events_emitter.c", "emitter"],
   ["scr_dyn_handle.c", any("emitter", "netEffective")],
   ["scr_symbol.c", "symbol"],
-  ["scr_bigint.c", "bigint"],
   ["scr_bigint_assert.c", all("assert", "bigint")],
   ["scr_url_params.c", "searchParams"],
   ["scr_qs.c", "qs"],

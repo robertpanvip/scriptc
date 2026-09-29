@@ -1,9 +1,43 @@
 import { expect, test } from "vitest";
-import { BOOL, F64, NULL_T, STRING, UNDEFINED_T, VOID, arrayOf, mapOf, setOf, type IrExpr, type IrModule, type IrType, type IrUnionDef } from "./ir.js";
+import { BOOL, DYN, F64, NULL_T, STRING, UNDEFINED_T, VOID, arrayOf, mapOf, setOf, type IrExpr, type IrModule, type IrType, type IrUnionDef } from "./ir.js";
 import { deserializeModule, serializeModule } from "./serialize.js";
 import { validateModule } from "./validate.js";
 
 const loc = { file: "numeric-read.ts", start: 0, end: 0 };
+
+function localClassModule(): IrModule {
+  const self: IrType = { kind: "object", className: "Local" };
+  const mod = expressionModule({ kind: "classRef", className: "Local", captures: ["outer"], type: { kind: "classval", className: "Local" }, loc }, []);
+  mod.classes = [{ name: "Local", jsName: "Local", fields: [], localCaptures: [{ localId: "shared", name: "value", type: F64 }], loc }];
+  mod.functions[0]!.locals = [{ id: "outer", name: "value", type: F64, mutable: true, boxed: true }];
+  mod.functions.push({
+    name: "%Local.constructor", params: [{ localId: "self", name: "this", type: self }],
+    locals: [{ id: "self", name: "this", type: self, mutable: false }, { id: "capture", name: "value", type: F64, mutable: true, boxed: true }],
+    classCaptures: [{ localId: "capture", name: "value", type: F64, slot: 0 }],
+    returnType: VOID, body: [], loc,
+  });
+  return mod;
+}
+
+test("local classes retain serialized capture slots and fresh identity", () => {
+  const mod = localClassModule();
+  expect(validateModule(mod)).toEqual([]);
+  expect(deserializeModule(serializeModule(mod))).toEqual(mod);
+});
+
+test.each(["missing", "unboxed", "type", "slot", "receiver", "closure", "layout", "direct-new"])("local classes reject an invalid %s environment", (variant) => {
+  const mod = localClassModule();
+  const ctor = mod.functions[1]!;
+  if (variant === "missing") mod.functions[0]!.locals = [];
+  if (variant === "unboxed") delete mod.functions[0]!.locals[0]!.boxed;
+  if (variant === "type") ctor.locals[1]!.type = STRING;
+  if (variant === "slot") ctor.classCaptures![0]!.slot = 1;
+  if (variant === "receiver") ctor.params[0]!.type = F64;
+  if (variant === "closure") ctor.captures = [];
+  if (variant === "layout") mod.classes![0]!.runtime = true;
+  if (variant === "direct-new") mod.functions[0]!.body = [{ kind: "exprStmt", expr: { kind: "new", className: "Local", args: [], type: { kind: "object", className: "Local" }, loc }, loc }];
+  expect(validateModule(mod).length).toBeGreaterThan(0);
+});
 
 test.each([mapOf(STRING, F64), setOf(STRING), { kind: "promise", inner: F64 } as IrType])("nullable %j payloads preserve an explicit absence tag", (type) => {
   const mod = expressionModule({ kind: "numLit", value: 0, type: F64, loc }, [
@@ -46,6 +80,23 @@ function expressionModule(expr: IrExpr, unions: IrUnionDef[]): IrModule {
     functions: [{ name: "main", params: [], locals: [], returnType: VOID, body: [{ kind: "exprStmt", expr, loc }], loc }],
   };
 }
+
+test.each(["callValue", "dynCall"] as const)("%s requires a checked-value receiver and preserves it in serialization", (kind) => {
+  const funcType: IrType = { kind: "func", params: [], ret: DYN };
+  const closure: IrExpr = { kind: "closure", fnName: "callback", captures: [], type: funcType, loc };
+  const receiver: IrExpr = { kind: "dynFrom", value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc }, type: DYN, loc };
+  const call: IrExpr = kind === "callValue"
+    ? { kind, callee: closure, receiver, args: [], type: DYN, loc }
+    : { kind, callee: { kind: "dynFrom", value: closure, type: DYN, loc }, receiver, calleeName: "callback", args: [], type: DYN, loc };
+  const mod = expressionModule(call, []);
+  mod.functions.push({ name: "callback", params: [], locals: [], returnType: DYN, body: [{ kind: "return", value: receiver, loc }], loc });
+  expect(validateModule(mod)).toEqual([]);
+  expect(deserializeModule(serializeModule(mod))).toEqual(mod);
+  call.receiver = { kind: "numLit", value: 1, type: F64, loc };
+  expect(validateModule(mod).some((error) => error.message.includes(`${kind} receiver`))).toBe(true);
+  call.receiver = { kind: "varRef", localId: "missing", type: DYN, loc };
+  expect(validateModule(mod).some((error) => error.message.includes("missing"))).toBe(true);
+});
 
 function optionalUnionModule(arms: IrType[] = [BOOL, F64, UNDEFINED_T]): IrModule {
   const type: IrType = { kind: "union", unionId: "receiver" };
@@ -230,7 +281,7 @@ test("global assignments cannot masquerade as lexical initialization", () => {
   expect(validateModule(mod).some((error) => error.message.includes("initializing assign requires a TDZ binding"))).toBe(true);
 });
 
-test("TDZ globals require record storage and round-trip initialization", () => {
+test("TDZ globals require guarded pointer storage and round-trip initialization", () => {
   const mod = tdzModule();
   const type = { kind: "record", shapeId: "codec" } as const;
   mod.records = [{ id: "codec", fields: [{ name: "%TextEncoder", type: F64 }], declaredOrder: [] }];
@@ -243,7 +294,7 @@ test("TDZ globals require record storage and round-trip initialization", () => {
   expect(validateModule(mod)).toEqual([]);
   expect(deserializeModule(serializeModule(mod))).toEqual(mod);
   mod.globals[0]!.type = F64;
-  expect(validateModule(mod).some((error) => error.message.includes('TDZ global "value" must have record storage'))).toBe(true);
+  expect(validateModule(mod).some((error) => error.message.includes('TDZ global "value" must have record, function, or checked-value storage'))).toBe(true);
 });
 
 test("legacy const TDZ declarations remain readable", () => {
@@ -370,4 +421,14 @@ test("mixed literal discriminators resolve field unions declared later", () => {
   expect(validateModule(mod)).toEqual([]);
   mod.unions![0]!.discriminant!.cases[1]!.values.push(false);
   expect(validateModule(mod).some((error) => error.message.includes("invalid or repeated"))).toBe(true);
+});
+
+
+test("typed-array brand tests serialize their element kind and reject misplaced brands", () => {
+  const expr: IrExpr = { kind: "dynTest", test: "bytes", bytesElem: "u16", value: { kind: "dynObjLit", type: DYN, loc }, type: BOOL, loc };
+  const mod = expressionModule(expr, []);
+  expect(validateModule(mod)).toEqual([]);
+  expect(deserializeModule(serializeModule(mod))).toEqual(mod);
+  expr.test = "array";
+  expect(validateModule(mod).map((d) => d.message)).toContain("in main: dynTest bytesElem requires a valid bytes test");
 });

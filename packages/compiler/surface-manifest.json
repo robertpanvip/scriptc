@@ -1078,6 +1078,12 @@
       "status": "static"
     },
     {
+      "id": "node-builtin.fs.realpathSync.native",
+      "kind": "node-builtin",
+      "name": "fs.realpathSync.native",
+      "status": "static"
+    },
+    {
       "id": "node-builtin.fs.rename",
       "kind": "node-builtin",
       "name": "fs.rename",
@@ -1598,6 +1604,13 @@
       "note": "numeric writes in statement position set the implicit exit status; process.exit() reads it"
     },
     {
+      "id": "node-builtin.process.getBuiltinModule",
+      "kind": "node-builtin",
+      "name": "process.getBuiltinModule",
+      "status": "static",
+      "note": "native path and os export subsets plus main-thread worker_threads metadata; other modules and exports throw SC2020"
+    },
+    {
       "id": "node-builtin.process.getgid",
       "kind": "node-builtin",
       "name": "process.getgid",
@@ -1661,6 +1674,13 @@
       "kind": "node-builtin",
       "name": "process.uptime",
       "status": "static"
+    },
+    {
+      "id": "node-builtin.process.versions",
+      "kind": "node-builtin",
+      "name": "process.versions",
+      "status": "static",
+      "note": "shared version dictionary containing node and openssl; other components are absent unless defined by the program"
     },
     {
       "id": "node-builtin.querystring",
@@ -1738,7 +1758,7 @@
       "name": "stream/consumers.arrayBuffer",
       "status": "unsupported",
       "code": "SC2020",
-      "note": "no free-standing ArrayBuffer value exists here (typed arrays own their storage) — buffer(stream) collects the same bytes as a Buffer"
+      "note": "collecting a stream directly into an ArrayBuffer has no native lowering yet; buffer(stream) collects the same bytes as a Buffer"
     },
     {
       "id": "node-builtin.stream.consumers.blob",
@@ -3421,9 +3441,8 @@
       "id": "stdlib.response.arrayBuffer",
       "kind": "stdlib",
       "name": "Response.arrayBuffer",
-      "status": "dynamic-only",
-      "code": "SC2020",
-      "note": "Node 24.15.0 / Undici 7.24.4; free-standing ArrayBuffer values have no static representation; use Response.bytes()"
+      "status": "static",
+      "note": "Node 24.15.0 / Undici 7.24.4; facets: body-consumption, promise-settlement, state-machine, error-shape; differential evidence: fixture:static"
     },
     {
       "id": "stdlib.response.blob",
@@ -3725,15 +3744,15 @@
       "id": "stdlib.string.replace",
       "kind": "stdlib",
       "name": "string.prototype.replace",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "string patterns with primitive replacements or typed callbacks; regex forms have separate lowering"
     },
     {
       "id": "stdlib.string.replaceAll",
       "kind": "stdlib",
       "name": "string.prototype.replaceAll",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "string patterns with primitive replacements or typed callbacks; regex forms have separate lowering"
     },
     {
       "id": "stdlib.string.slice",

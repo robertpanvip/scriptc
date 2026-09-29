@@ -9,7 +9,7 @@ import { InternalCompilerError } from "../../errors.js";
 import type { CEmitter } from "./c-emitter.js";
 import { DYN_HANDLE_KINDS, type IrType, type IrUnionDef, isDynTypedRefType, isRefCounted, typeEquals, typeKey } from "../../ir/ir.js";
 import { dynDesc, undefinedArmTag, unionWideningTags } from "../../ir/analysis.js";
-import { cCommentText, cDecl, cStringLiteral, cType, elemAccess, releaseCallC, retainCallC, vAdapters } from "./types.js";
+import { bytesElemKindC, cCommentText, cDecl, cStringLiteral, cType, elemAccess, releaseCallC, retainCallC, vAdapters } from "./types.js";
 import { mangleField, mangleRecordNew, mangleRecordStruct } from "../mangle.js";
 import { jsonObjectKeyLabel } from "../json-literal.js";
 import { OVERFLOW_MEMBER } from "./shapes.js";
@@ -302,6 +302,12 @@ export function unionWidenHelper(emitter: CEmitter, fromId: string, toId: string
       `  case SCR_DYN_UNDEF: scr_jb_puts(b, "undefined"); break;`,
       `  case SCR_DYN_NULL: scr_jb_puts(b, "null"); break;`,
       `  case SCR_DYN_BOOL: scr_jb_puts(b, d->v.b ? "true" : "false"); break;`,
+      `  case SCR_DYN_BIGINT: {`,
+      `    ScrStr *s = scr_bigint_to_string(d->v.bigint, 10);`,
+      `    for (size_t i = 0; i < s->len; i++) scr_jb_putc(b, s->data[i]);`,
+      `    scr_str_release(s);`,
+      `    break;`,
+      `  }`,
       `  case SCR_DYN_NUM: {`,
       `    ScrStr *s = scr_f64_to_scrstr(d->v.num); /* String(n): NaN/Infinity spelled out, not JSON null */`,
       `    for (size_t i = 0; i < s->len; i++) scr_jb_putc(b, s->data[i]);`,
@@ -350,9 +356,9 @@ export function unionWidenHelper(emitter: CEmitter, fromId: string, toId: string
       `    }`,
       `    for (size_t i = 0; i < d->v.bytes->len; i++) {`,
       `      if (i > 0) scr_jb_putc(b, ',');`,
-      `      char n[16];`,
-      `      snprintf(n, sizeof n, "%u", (unsigned)d->v.bytes->data[i]);`,
-      `      scr_jb_puts(b, n);`,
+      `      ScrStr *n = scr_f64_to_scrstr(scr_bytes_get(d->v.bytes, (double)i));`,
+      `      for (size_t j = 0; j < n->len; j++) scr_jb_putc(b, n->data[j]);`,
+      `      scr_str_release(n);`,
       `    }`,
       `    break;`,
       `  }`,
@@ -364,11 +370,12 @@ export function unionWidenHelper(emitter: CEmitter, fromId: string, toId: string
       `    if (d->v.fn.name) scr_jb_puts(b, d->v.fn.name);`,
       `    scr_jb_puts(b, "() { [native code] }");`,
       `    break;`,
-      `  case SCR_DYN_HANDLE:`,
-      `    /* Object.prototype.toString — Node's String() over these`,
-      `     * classes (IncomingMessage/ServerResponse/Socket). */`,
-      `    scr_jb_puts(b, "[object Object]");`,
+      `  case SCR_DYN_HANDLE: {`,
+      `    ScrStr *s = scr_dyn_to_string(d, NULL);`,
+      `    for (size_t i = 0; i < s->len; i++) scr_jb_putc(b, s->data[i]);`,
+      `    scr_str_release(s);`,
       `    break;`,
+      `  }`,
       `  case SCR_DYN_PROMISE:`,
       `    /* Object.prototype.toString with the Promise @@toStringTag. */`,
       `    scr_jb_puts(b, "[object Promise]");`,
@@ -384,6 +391,9 @@ export function unionWidenHelper(emitter: CEmitter, fromId: string, toId: string
       `    scr_dyn_release(sc_materialized);`,
       `    break;`,
       `  }`,
+      `  case SCR_DYN_PROXY:`,
+      `    scr_dyn_proxy_unsupported("string conversion");`,
+      `    break;`,
       `  }`,
       `}`,
       `static ScrStr *${name}(const ScrDyn *d) { /* String(unknown) -> owned (+1) */`,
@@ -771,6 +781,15 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
       );
     }
     switch (t.kind) {
+      case "regex":
+        d.push(`  return scr_dyn_native_regex_is(d);`);
+        break;
+      case "set":
+        d.push(`  return scr_dyn_native_set_is(d);`);
+        break;
+      case "bigint":
+        d.push(`  return d->kind == SCR_DYN_BIGINT;`);
+        break;
       case "f64":
         d.push(`  return d->kind == SCR_DYN_NUM;`);
         break;
@@ -797,12 +816,13 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
         d.push(`  return true;`);
         break;
       case "bytes":
-        // A Uint8Array target (the checked-dynamic tree carries u8 payloads only).
-        if (t.elem !== "u8") throw new InternalCompilerError(`emitter bug: dynMatch of bytes<${t.elem}>`);
-        d.push(`  return d->kind == SCR_DYN_BYTES;`);
+        d.push(`  return scr_dyn_bytes_is(d, ${bytesElemKindC(t.elem)});`);
         break;
       case "func":
         d.push(`  return d->kind == SCR_DYN_FUNC;`);
+        break;
+      case "classval":
+        d.push(`  return scr_dyn_class_is(d, ${cStringLiteral(Buffer.from(key, "utf8"))});`);
         break;
       case "object":
         if (t.className === "%Error") {
@@ -1007,7 +1027,7 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
       `    if (d->kind == SCR_DYN_ARR) {`,
       `      item = i < d->v.arr.len ? scr_dyn_retain(d->v.arr.items[i]) : scr_dyn_retain(scr_dyn_undefined());`,
       `    } else if (d->kind == SCR_DYN_BYTES) {`,
-      `      item = i < d->v.bytes->len ? scr_dyn_new_num((double)d->v.bytes->data[i]) : scr_dyn_retain(scr_dyn_undefined());`,
+      `      item = i < d->v.bytes->len ? scr_dyn_new_num(scr_bytes_get(d->v.bytes, (double)i)) : scr_dyn_retain(scr_dyn_undefined());`,
       `    } else {`,
       `      /* String iteration: whole code POINTS (astral chars arrive`,
       `       * unsplit — the string iterator, not charAt). */`,
@@ -1068,6 +1088,7 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
     d.push(`  if (d->kind == SCR_DYN_OBJ) {`);
     d.push(`    return scr_dyn_obj_read(d, k->data, k->len);`);
     d.push(`  }`);
+    d.push(`  if (d->kind == SCR_DYN_PROXY) return scr_dyn_proxy_get(d, k);`);
     d.push(`  if (d->kind == SCR_DYN_JSVAL) {`);
     d.push(`    /* Island-held: o[k] reads the REAL engine property (getters`);
     d.push(`     * included, throws bridged catchably) and the result wraps`);
@@ -1082,21 +1103,7 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
     d.push(`     * loud not-supported ladder (scr_json.c). */`);
     d.push(`    return scr_dyn_handle_key_get(d, k);`);
     d.push(`  }`);
-    d.push(`  if (d->kind == SCR_DYN_BYTES) {`);
-    d.push(`    /* Buffer-shaped dyn (a stream's 'data' chunk in the JS lane):`);
-    d.push(`     * .length and canonical-index byte reads answer like Node. */`);
-    d.push(`    if (k->len == 6 && memcmp(k->data, "length", 6) == 0) {`);
-    d.push(`      return scr_dyn_new_num((double)d->v.bytes->len);`);
-    d.push(`    }`);
-    d.push(`    if (k->len > 0 && !(k->len > 1 && k->data[0] == '0')) {`);
-    d.push(`      size_t idx = 0; bool digits = true;`);
-    d.push(`      for (size_t i = 0; i < k->len; i++) {`);
-    d.push(`        if (k->data[i] < '0' || k->data[i] > '9' || idx > (SIZE_MAX - 9) / 10) { digits = false; break; }`);
-    d.push(`        idx = idx * 10 + (size_t)(k->data[i] - '0');`);
-    d.push(`      }`);
-    d.push(`      if (digits && idx < d->v.bytes->len) return scr_dyn_new_num((double)d->v.bytes->data[idx]);`);
-    d.push(`    }`);
-    d.push(`  }`);
+    d.push(`  if (d->kind == SCR_DYN_BYTES) return scr_dyn_bytes_key_get(d, k);`);
     d.push(`  if (d->kind == SCR_DYN_FUNC) {`);
     d.push(`    /* own props (defineProperties writes), then name/length —`);
     d.push(`     * the function-instance members test/common copies. */`);
@@ -1230,9 +1237,23 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
       }
     }
     switch (t.kind) {
+      case "regex":
+        d.push(`  return scr_dyn_native_regex_check(d, path);`);
+        break;
+      case "set":
+        d.push(`  if (!scr_dyn_native_set_is(d)) { scr_dyn_check_fail(path, ${want}, d); return NULL; }`);
+        d.push(`  return scr_map_retain((ScrMap *)d->v.handle.ptr);`);
+        break;
+      case "bigint":
+        d.push(`  if (d->kind != SCR_DYN_BIGINT) { scr_dyn_check_fail(path, ${want}, d); return NULL; }`);
+        d.push(`  return scr_bigint_retain(d->v.bigint);`);
+        break;
       case "f64":
         d.push(`  if (d->kind != SCR_DYN_NUM) { scr_dyn_check_fail(path, ${want}, d); return 0; }`);
         d.push(`  return d->v.num;`);
+        break;
+      case "classval":
+        d.push(`  return scr_dyn_class_check(d, ${cStringLiteral(Buffer.from(key, "utf8"))}, path);`);
         break;
       case "bool":
         d.push(`  if (d->kind != SCR_DYN_BOOL) { scr_dyn_check_fail(path, ${want}, d); return false; }`);
@@ -1250,11 +1271,9 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
         d.push(`  return scr_dyn_retain((ScrDyn *)d);`);
         break;
       case "bytes":
-        // `u as Uint8Array`: kind check, then a fresh COPY out (the
-        // boundary's aliasing stance in both directions).
-        if (t.elem !== "u8") throw new InternalCompilerError(`emitter bug: dynCheck of bytes<${t.elem}>`);
-        d.push(`  if (d->kind != SCR_DYN_BYTES) { scr_dyn_check_fail(path, ${want}, d); return NULL; }`);
-        d.push(`  return scr_dyn_bytes_copy_out(d);`);
+        // Check the exact element brand before retaining the shared view.
+        d.push(`  if (!scr_dyn_bytes_is(d, ${bytesElemKindC(t.elem)})) { scr_dyn_check_fail(path, ${want}, d); return NULL; }`);
+        d.push(`  return scr_dyn_bytes_unbox(d);`);
         break;
       case "object":
         // The %Error extraction (an instanceof-Error narrow on unknown):
@@ -1300,6 +1319,14 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
           break;
         }
         d.push(`  if (d->kind != SCR_DYN_OBJ) { scr_dyn_check_fail(path, ${want}, d); return NULL; }`);
+        if (shape.fields.length === 0 && !shape.indexValue) {
+          const sourceAccessor = `${emitter.toDynHelper(t)}_source_access`;
+          const rc = vAdapters(t);
+          d.push(`  {`);
+          d.push(`    ${cDecl(t, "sc_source")} = (${cType(t).trim()})scr_dyn_obj_source_cast(d, &${sourceAccessor}, &${rc.retain});`);
+          d.push(`    if (sc_source) return sc_source;`);
+          d.push(`  }`);
+        }
         d.push(`  ${cDecl(t, "r")} = ${mangleRecordNew(t.shapeId)}();`);
         for (const f of shape.fields) {
           const keyLit = cStringLiteral(Buffer.from(f.name, "utf8"));
@@ -1475,7 +1502,7 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
         d.push(`  if (strcmp(d->v.fn.sig, ${sigLit}) == 0) return scr_closure_retain(d->v.fn.clo);`);
         d.push(`  {`);
         d.push(`    ScrClosure *a = scr_closure_new((void *)&${adapter}, 1);`);
-        d.push(`    a->caps[0] = scr_box_new_obj(&scr_dyn_retain_v, &scr_dyn_release_v, NULL);`);
+        d.push(`    a->caps[0] = scr_box_new_obj(&scr_dyn_retain_v, &scr_dyn_release_v, &scr_dyn_trace_v);`);
         d.push(`    scr_box_set_ref(a->caps[0], scr_dyn_retain((ScrDyn *)d));`);
         d.push(`    return a;`);
         d.push(`  }`);
@@ -1516,6 +1543,15 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
     const d: string[] = [`${sig} { /* to-dyn ${key} */`];
     let sourceAccessor: { name: string; release: string } | null = null;
     switch (t.kind) {
+      case "regex":
+        d.push(`  return scr_dyn_native_regex(v);`);
+        break;
+      case "set":
+        d.push(`  return scr_dyn_native_set(v);`);
+        break;
+      case "bigint":
+        d.push(`  return scr_dyn_new_bigint(v); /* retains v */`);
+        break;
       case "f64":
         d.push(`  return scr_dyn_new_num(v);`);
         break;
@@ -1559,6 +1595,9 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
         // immutable-through-copies.
         d.push(`  return scr_dyn_retain(v);`);
         break;
+      case "classval":
+        d.push(`  return scr_dyn_new_class(v, ${cStringLiteral(Buffer.from(key, "utf8"))});`);
+        break;
       case "func":
         // Function-valued record/array fields (EventListenerObject's
         // handleEvent method) box through the same identity-preserving
@@ -1566,10 +1605,8 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
         d.push(`  return ${dynFuncBoxHelper(emitter, t)}(v, NULL);`);
         break;
       case "bytes":
-        // bytes<u8> → the checked-dynamic tree's bytes kind, payload COPIED (the boundary
-        // stance; stdin chunks into unknown-typed helpers).
-        if (t.elem !== "u8") throw new InternalCompilerError(`emitter bug: to-dyn of bytes<${t.elem}>`);
-        d.push(`  return scr_dyn_new_bytes_copy(v);`);
+        // Preserve the view, its element brand, and its backing allocation.
+        d.push(`  return scr_dyn_new_bytes(v);`);
         break;
       case "record": {
         const shape = emitter.recordsById.get(t.shapeId);
@@ -1587,20 +1624,20 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
             d.push(`  scr_dyn_arr_push(d, ${emitter.toDynHelper(f.type)}(v->${mangleField(f.name)}));`);
           }
           if (cyclicRec) d.push(`  scr_dyn_from_leave();`);
-          d.push(`  return d;`);
+          d.push(`  return scr_dyn_mark_snapshot(d);`);
           break;
         }
         const carriesListenerIdentity = shape.fields.some(
           (f) => f.name === "handleEvent" && f.type.kind === "func",
         );
-        if (carriesListenerIdentity) {
+        if ((shape.fields.length === 0 && !shape.indexValue) || carriesListenerIdentity) {
           const rc = vAdapters(t);
           sourceAccessor = {
             name: `${name}_source_access`,
             release: rc.release,
           };
           emitter.walkerProtos.push(
-            `static ScrDyn *${sourceAccessor.name}(void *v, bool materialize); /* live listener source ${key} */`,
+            `static ScrDyn *${sourceAccessor.name}(void *v, bool materialize); /* record source ${key} */`,
           );
           d.push(
             `  ScrDyn *d = scr_dyn_new_obj_with_identity(v, &${rc.retain}, &${sourceAccessor.name});`,
@@ -1655,7 +1692,7 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
           d.push(`  }`);
         }
         if (cyclicRec) d.push(`  scr_dyn_from_leave();`);
-        d.push(`  return d;`);
+        d.push(`  return scr_dyn_mark_snapshot(d);`);
         break;
       }
       case "array": {
@@ -1665,6 +1702,7 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
         if (cyclicArr) d.push(`  scr_dyn_from_enter(v);`);
         d.push(`  ScrDyn *d = scr_dyn_new_arr();`);
         d.push(`  for (size_t i = 0; i < v->len; i++) {`);
+        d.push(`    if (scr_arr_state(v, (double)i) == SCR_ARR_UNDEFINED) { scr_dyn_arr_push(d, scr_dyn_retain(scr_dyn_undefined())); continue; }`);
         if (elem.kind === "f64") {
           d.push(`    scr_dyn_arr_push(d, scr_dyn_new_num(scr_arr_get_f64(v, (double)i)));`);
         } else if (elem.kind === "bool") {
@@ -1676,7 +1714,7 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
         }
         d.push(`  }`);
         if (cyclicArr) d.push(`  scr_dyn_from_leave();`);
-        d.push(`  return d;`);
+        d.push(`  return scr_dyn_mark_snapshot(d);`);
         break;
       }
       case "union": {
@@ -1760,7 +1798,7 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
     emitter.walkerProtos.push(`${sig}; /* dyn-box settle adapter for promise<${key}> */`);
     const d: string[] = [`${sig} { /* dyn-box settle adapter for promise<${key}> */`];
     const fulfill = (expr: string) =>
-      `  scr_promise_fulfill_ref(dst, ${expr}, scr_dyn_retain_v, scr_dyn_release_v, NULL);`;
+      `  scr_promise_fulfill_ref(dst, ${expr}, scr_dyn_retain_v, scr_dyn_release_v, scr_dyn_trace_v);`;
     switch (inner.kind) {
       case "void":
       case "undefinedT":
@@ -1844,6 +1882,8 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
     const sig = `static ScrDyn *${name}(ScrClosure *c, ScrDyn *const *args, size_t argc)`;
     emitter.walkerProtos.push(`${sig}; /* dyn call thunk for ${key} */`);
     const d: string[] = [`${sig} { /* dyn call thunk for ${key} */`];
+    const typedRest = t.rest === true && t.restAbi === "typed";
+    const hiddenRest = t.rest === true && !typedRest;
     if (t.params.length === 0) d.push(`  (void)args;`);
     d.push(`  (void)argc;`);
     t.params.forEach((p, i) => {
@@ -1852,7 +1892,13 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
       // anything; a number param throws the catchable TypeError).
       d.push(`  ${cDecl(p, `a${i}`)};`);
       d.push(`  {`);
-      d.push(`    const ScrDyn *ad = ${i} < argc ? args[${i}] : scr_dyn_undefined();`);
+      const packsRest = typedRest && i === t.params.length - 1;
+      if (packsRest) {
+        d.push(`    ScrDyn *ad = scr_dyn_new_arr();`);
+        d.push(`    for (size_t ri = ${i}; ri < argc; ri++) scr_dyn_arr_push(ad, scr_dyn_retain(args[ri]));`);
+      } else {
+        d.push(`    const ScrDyn *ad = ${i} < argc ? args[${i}] : scr_dyn_undefined();`);
+      }
       if (p.kind === "dyn") {
         d.push(`    a${i} = scr_dyn_retain((ScrDyn *)ad);`);
       } else if (p.kind === "jsval") {
@@ -1866,8 +1912,9 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
           .flatMap((q, j) => (isRefCounted(q) ? [`${releaseCallC(q, `a${j}`)};`] : []));
         d.push(`    if (!a${i}) { ${undo.join(" ")}${undo.length > 0 ? " " : ""}return NULL; }`);
       } else {
-        d.push(`    ScrDynPath pp = { NULL, NULL, ${i} };`);
-        d.push(`    a${i} = ${emitter.dynCheckHelper(p)}(ad, &pp);`);
+        if (!packsRest) d.push(`    ScrDynPath pp = { NULL, NULL, ${i} };`);
+        d.push(`    a${i} = ${emitter.dynCheckHelper(p)}(ad, ${packsRest ? "NULL" : "&pp"});`);
+        if (packsRest) d.push(`    scr_dyn_release(ad);`);
         const undo = t.params
           .slice(0, i)
           .flatMap((q, j) => (isRefCounted(q) ? [`${releaseCallC(q, `a${j}`)};`] : []));
@@ -1879,7 +1926,7 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
     // param carries the call's arguments from index params.length on —
     // the mustCall wrapper's `arguments`, a JS `...args`. Built fresh per
     // call (+1, moved into the callee like every param).
-    if (t.rest) {
+    if (hiddenRest) {
       d.push(`  ScrDyn *rest = scr_dyn_new_arr();`);
       d.push(`  for (size_t ri = ${t.argumentsAll ? 0 : t.params.length}; ri < argc; ri++) {`);
       d.push(`    scr_dyn_arr_push(rest, scr_dyn_retain((ScrDyn *)args[ri]));`);
@@ -1887,8 +1934,8 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
     }
     // The closure CONSUMES its params (+1 each moved in — exactly what the
     // builders above returned).
-    const castParams = ["ScrClosure *", ...t.params.map((p) => cType(p).trim()), ...(t.rest ? ["ScrDyn *"] : [])].join(", ");
-    const call = `((${cType(t.ret).trim()} (*)(${castParams}))c->fn)(${["c", ...t.params.map((_, i) => `a${i}`), ...(t.rest ? ["rest"] : [])].join(", ")})`;
+    const castParams = ["ScrClosure *", ...t.params.map((p) => cType(p).trim()), ...(hiddenRest ? ["ScrDyn *"] : [])].join(", ");
+    const call = `((${cType(t.ret).trim()} (*)(${castParams}))c->fn)(${["c", ...t.params.map((_, i) => `a${i}`), ...(hiddenRest ? ["rest"] : [])].join(", ")})`;
     if (t.ret.kind === "void") {
       d.push(`  ${call};`);
       d.push(`  if (scr_exc_pending()) return NULL;`);
@@ -1922,7 +1969,7 @@ export function jsonWriteHelper(emitter: CEmitter, t: IrType): string {
     const sigLit = cStringLiteral(Buffer.from(key, "utf8"));
     emitter.walkerDefs.push(
       `${sig} { /* box ${key} into dyn */`,
-      `  return scr_dyn_new_func(scr_closure_retain(v), &${thunk}, ${t.params.length}, ${sigLit}, fname);`,
+      `  return scr_dyn_new_func(scr_closure_retain(v), &${thunk}, ${t.params.length - (t.restAbi === "typed" ? 1 : 0)}, ${sigLit}, fname);`,
       `}`,
       ``,
     );

@@ -430,6 +430,9 @@ export const STR_METHODS: Record<
 /** String index reads return an undefined arm and compose the existing UTF-16 intrinsics. */
 export const STRING_INDEX_METHODS = new Set(["at", "codePointAt"]);
 
+/** String-pattern replacement composes native search, slice, and callback operations. */
+export const STRING_REPLACE_METHODS = new Set(["replace", "replaceAll"]);
+
 /** One member of the island-backed ambient surface: declared argument
  * types (tsc enforces them at call sites; the arity double-checks the
  * table against the ambient file) and the validated island-exit target the
@@ -605,7 +608,7 @@ export interface BuiltinModuleFn {
   defaults?: string[];
   /** The source-level function-value signature. Each admitted entry
    * materializes as an interned zero-capture adapter over the fixed runtime
-   * libCall ABI. Optional parameters name the string default selected for
+   * libCall ABI. Optional parameters name the scalar default selected for
    * omission or explicit undefined; rest parameters pack into one typed
    * array slot. Entries with call-site-specific validation remain absent. */
   valueParams?: BuiltinValueParam[];
@@ -613,7 +616,7 @@ export interface BuiltinModuleFn {
 
 export type BuiltinValueParam =
   | { mode: "required"; type: IrType }
-  | { mode: "optional"; type: IrType; defaultValue: string }
+  | { mode: "optional"; type: IrType; defaultValue: string | number }
   | { mode: "rest"; type: IrType };
 
 /** The common first-class shape for builtin functions whose supported
@@ -623,6 +626,17 @@ export type BuiltinValueParam =
 function exactValueParams(...types: IrType[]): BuiltinValueParam[] {
   return types.map((type) => ({ mode: "required", type }));
 }
+
+/** Object helpers whose checked-native ABI is also their stored value ABI.
+ * These adapters operate on the live checked object/property table. */
+export const OBJECT_CALLABLE_VALUES: Record<string, BuiltinModuleFn | undefined> = {
+  defineProperty: { fn: "dyn.defineProperty", params: [DYN, DYN, DYN], result: DYN, valueParams: exactValueParams(DYN, DYN, DYN) },
+  getOwnPropertyDescriptor: { fn: "dyn.getOwnPropertyDescriptor", params: [DYN, DYN], result: DYN, valueParams: exactValueParams(DYN, DYN) },
+  defineProperties: { fn: "dyn.defineProps", params: [DYN, DYN], result: DYN, valueParams: exactValueParams(DYN, DYN) },
+  keys: { fn: "dyn.objKeys", params: [DYN], result: DYN, valueParams: exactValueParams(DYN) },
+  values: { fn: "dyn.objValues", params: [DYN], result: DYN, valueParams: exactValueParams(DYN) },
+  entries: { fn: "dyn.objEntries", params: [DYN], result: DYN, valueParams: exactValueParams(DYN) },
+};
 
 /** The lowerable surface of the supported node builtin modules, keyed by
  * CANONICAL module name (both "fs" and "node:fs" land on "fs" — see
@@ -704,6 +718,7 @@ export const BUILTIN_MODULE_FNS: Record<string, Record<string, BuiltinModuleFn |
     // realpath(3) — Node's realpathSync (failures spell syscall "lstat",
     // Node's own message shape).
     realpathSync: { fn: "fs.realpathSync", params: [STRING], result: STRING },
+    "realpathSync.native": { fn: "fs.realpathNativeSync", params: [STRING], result: STRING },
     // The fd pair behind spawn's fd-stdio form (the daemon-log idiom:
     // openSync(logPath, "a") → spawn stdio ["ignore", fd, fd] →
     // closeSync). String flags use the established two-argument path;
@@ -742,7 +757,11 @@ export const BUILTIN_MODULE_FNS: Record<string, Record<string, BuiltinModuleFn |
     // open's optional flags/mode completion is special-cased in
     // lowerBuiltinModuleCall; this row routes all import spellings and
     // gives coverage the static member.
-    open: { fn: "fsp.open", params: [STRING, STRING, F64], result: { kind: "promise", inner: FILEHANDLE_T } },
+    open: { fn: "fsp.open", params: [STRING, STRING, F64], result: { kind: "promise", inner: FILEHANDLE_T }, valueParams: [
+      { mode: "required", type: STRING },
+      { mode: "optional", type: STRING, defaultValue: "r" },
+      { mode: "optional", type: F64, defaultValue: 0o666 },
+    ] },
   },
   // The bare module's POSIX-target binding; a win32 target rebinds it to
   // the win32 table (builtinModuleFnsOf — Node on Windows IS path.win32).
@@ -981,6 +1000,9 @@ export const BUILTIN_MODULE_CONSTS: Record<string, Record<string, string | numbe
  * BUILTIN_MODULE_FNS; consumed by the fence taxonomy
  * (library/fence-eval.ts) and the attestation-parity test. */
 export const BUILTIN_MODULE_FN_ALIASES: Record<string, Record<string, readonly IrLibFn[] | undefined> | undefined> = {
+  url: {
+    pathToFileURL: ["url.pathToFileURLPlatform"],
+  },
   fs: {
     // Inline numeric O_* flags use a target-neutral runtime entry point.
     openSync: ["fs.openNumericSync"],
@@ -989,6 +1011,7 @@ export const BUILTIN_MODULE_FN_ALIASES: Record<string, Record<string, readonly I
     readFileSync: ["fs.readFileSyncBuf", "fs.readFileSyncBytes", "fs.readFileSyncDyn", "fs.readFdSync", "fs.readFdSyncBytes"],
     // The bytes-data form and the { mode } options form.
     writeFileSync: ["fs.writeFileSyncBytes", "fs.writeFileModeSync"],
+    appendFileSync: ["fs.appendFileSyncBytes"],
     // The utf8 string overload; the table row is the Buffer-window form.
     writeSync: ["fs.writeStrSync"],
     // The { recursive, mode } option lowerings.
@@ -1138,6 +1161,16 @@ export const AMBIENT_SURFACE_FNS: readonly AmbientSurfaceRow[] = [
     note: "reads, writes, deletes, and enumeration of the process environment (the process global)",
   },
   { id: "node-builtin.process.argv", kind: "node-builtin", name: "process.argv", fns: ["process.argv"] },
+  {
+    id: "node-builtin.process.getBuiltinModule", kind: "node-builtin", name: "process.getBuiltinModule",
+    fns: ["process.builtinId", "process.builtinModule", "process.builtinUnsupported"],
+    note: "native path and os export subsets plus main-thread worker_threads metadata; other modules and exports throw SC2020",
+  },
+  {
+    id: "node-builtin.process.versions", kind: "node-builtin", name: "process.versions",
+    fns: ["process.versions"],
+    note: "shared version dictionary containing node and openssl; other components are absent unless defined by the program",
+  },
   { id: "node-builtin.process.cwd", kind: "node-builtin", name: "process.cwd", fns: ["process.cwd"] },
   { id: "node-builtin.process.chdir", kind: "node-builtin", name: "process.chdir", fns: ["process.chdir"] },
   { id: "node-builtin.process.pid", kind: "node-builtin", name: "process.pid", fns: ["process.pid"] },
@@ -1412,7 +1445,7 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
   },
   "stream/consumers": {
     arrayBuffer:
-      "no free-standing ArrayBuffer value exists here (typed arrays own their storage) — " +
+      "collecting a stream directly into an ArrayBuffer has no native lowering yet; " +
       "buffer(stream) collects the same bytes as a Buffer",
     blob:
       "Blob values have no representation in a compiled binary — " +
@@ -1622,9 +1655,8 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
         "a RegExp at runtime, which has no lowering";
     } else if (container === "ArrayBuffer" || container.startsWith("ArrayBuffer<")) {
       hint =
-        "resize/transfer/maxByteLength need the buffer to exist as a runtime value, and no " +
-        "free-standing ArrayBuffer value does — typed arrays own fixed-length storage " +
-        "(new Uint8Array(n)); allocate a new view and copy instead";
+        "native ArrayBuffer storage is fixed-length; resize and transfer are unsupported — " +
+        "allocate a new buffer and copy through typed-array views instead";
     } else if (container === "SharedArrayBuffer" || container.startsWith("SharedArrayBuffer<")) {
       hint =
         "no shared-memory threads exist in a compiled program — Uint8Array is the byte storage " +
@@ -1641,7 +1673,8 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
         "locale- and ICU-backed behavior lives outside the static runtime (the localeCompare " +
         "stance: code-unit order, no collation/locale data) — what lowers: the composed " +
         'new Intl.NumberFormat("en-US").format(x) and x.toLocaleString("en-US") with default ' +
-        "options; format with template literals, toFixed, and toString otherwise";
+        "options, plus default Unicode grapheme segmentation with Intl.Segmenter; locale " +
+        "negotiation, word/sentence segmentation, and resolvedOptions remain unsupported";
     } else if (container === "Object" && member === "assign") {
       hint =
         "spread instead: { ...a, ...b } builds the merged record; what lowers: the empty-target " +
@@ -1712,11 +1745,11 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
   export function stdlibGlobalNameOf(lowerer: Lowerer, expr: ts.Expression): string | null {
     if (ts.isParenthesizedExpression(expr)) return stdlibGlobalNameOf(lowerer, expr.expression);
     if (ts.isIdentifier(expr)) {
-      // `globalThis` itself: a reserved intrinsic — tsc rejects user
-      // bindings of the name, and its special symbol carries no ordinary
-      // declarations for the provenance check to see.
-      if (expr.text === "globalThis") return "globalThis";
       const symbol = lowerer.checker.getSymbolAtLocation(expr);
+      // `globalThis` itself: a reserved intrinsic — tsc rejects user
+      // global bindings, but local parameters can shadow it. Its special
+      // symbol has no ordinary declarations for the provenance check.
+      if (expr.text === "globalThis" && (!symbol || lowerer.checker.declarationsOf(symbol).length === 0 || lowerer.isStdlibSymbol(symbol))) return "globalThis";
       if (!symbol) return null;
       const alias = lowerer.stdlibGlobalAliases.get(symbol);
       if (alias !== undefined) return alias;
@@ -1831,6 +1864,10 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
     if (!ts.isIdentifier(nameNode)) return false;
     const name = stdlibGlobalAliasNameOf(lowerer, init);
     if (name === null) return false;
+    // Mutable global-object bindings keep real storage, even when never
+    // reassigned: var can be observed before initialization and let has TDZ.
+    if (name === "globalThis" && ts.isVariableDeclaration(nameNode.parent) &&
+        (ts.getCombinedNodeFlags(nameNode.parent) & ts.NodeFlags.Const) === 0) return false;
     const symbol = lowerer.checker.getSymbolAtLocation(nameNode);
     if (!symbol) return false;
     lowerer.stdlibGlobalAliases.set(symbol, name);

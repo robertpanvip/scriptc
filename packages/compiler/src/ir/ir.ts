@@ -24,10 +24,18 @@ export interface SrcLoc {
 
 /* ── types ─────────────────────────────────────────────────────────────── */
 
-/** Typed-array element kinds with a runtime representation: Uint8Array/Buffer,
- * Uint32Array, Int32Array, Float32Array, and Float64Array. Other flavors stay
- * frontend-fenced. */
-export type IrBytesElem = "u8" | "u32" | "i32" | "f32" | "f64";
+/** Numeric typed-array element kinds with a native representation. Float16
+ * and BigInt typed arrays remain frontend-fenced. */
+export type IrBytesElem = "u8" | "u8c" | "i8" | "u16" | "i16" | "u32" | "i32" | "f32" | "f64";
+
+export const BYTES_ELEMENT_SIZE: Record<IrBytesElem, number> = {
+  u8: 1, u8c: 1, i8: 1, u16: 2, i16: 2, u32: 4, i32: 4, f32: 4, f64: 8,
+};
+
+export const BYTES_ELEMENT_NAME: Record<IrBytesElem, string> = {
+  u8: "Uint8Array", u8c: "Uint8ClampedArray", i8: "Int8Array", u16: "Uint16Array", i16: "Int16Array",
+  u32: "Uint32Array", i32: "Int32Array", f32: "Float32Array", f64: "Float64Array",
+};
 
 export type IrType =
   | { kind: "f64" }
@@ -239,11 +247,9 @@ export type IrType =
   | { kind: "object"; className: string } // heap, refcounted class instance
   /** The class STATIC side as a value — `typeof C`, the type of the class
    * name itself and of `new (…) => T` constructor-typed slots. Runtime
-   * representation is the per-class IMMORTAL class object (ScrClassObj:
-   * preorder interval, construct thunk, .name string) emitted once per
-   * classRef-referenced class — so identity `===` is one pointer compare
-   * and retains/releases are no-ops on the immortal (the regex-literal
-   * discipline; isRefCounted says true for container/RC uniformity).
+   * representation is ScrClassObj: an immortal top-level template or a fresh
+   * function-local object owning captured binding boxes. Identity is one
+   * pointer comparison; local instances retain their constructor object.
    * Values of `classval:C` are C's class object or a STRICT DESCENDANT's —
    * the object kind's nominal, upcast-only story — and every legal flow
    * preserves the constructor ABI (upcast requires the descendant's
@@ -251,7 +257,8 @@ export type IrType =
    * completion against C's one signature sound. Allowed in locals,
    * globals, params, returns, class/record fields, capture boxes, array
    * elements, Map VALUES, and union arms; fenced out of Map keys, Set
-   * elements, JSON, dyn/jsval conversion, and ToString. */
+   * elements, JSON, jsval conversion, and ToString. Unknown slots retain
+   * class identity and allow an exact typed constructor round trip. */
   | { kind: "classval"; className: string }
   /** An ECMAScript module namespace object for one statically-known module.
    * `moduleId` is a canonical compiled source-file or builtin identity.
@@ -535,7 +542,7 @@ export function isUnitType(t: IrType): boolean {
  * backends. Array-producing lowerings can learn their result element from
  * a callback rather than through mapType's ordinary T[] gate, so they must
  * share this predicate instead of reconstructing an array around an
- * otherwise-valid standalone type (Map, Set, opaque handles, ...). */
+ * otherwise-valid standalone type (Date, opaque handles, ...). */
 export function isSupportedArrayElem(t: IrType): boolean {
   switch (t.kind) {
     // Native collection seeds and drains retain checked values in a
@@ -546,6 +553,8 @@ export function isSupportedArrayElem(t: IrType): boolean {
     case "bool":
     case "string":
     case "array":
+    case "map":
+    case "set":
     case "bytes":
     case "record":
     case "object":
@@ -603,8 +612,7 @@ export function isSupportedSetElem(t: IrType, unionArms?: IrType[]): boolean {
 }
 
 /** The Map VALUE fence: scalars, supported native references and checked
- * values. Functions require checked-value boxing; nested maps and jsval
- * have no native Map slot.
+ * values. Functions require checked-value boxing; jsval has no native slot.
  * Record/object/union values can point back at the map holding them, which
  * is exactly why ref-valued maps are cycle-capable (see the backend's
  * cycle analysis and docs/memory.md). Shared frontend/validator. */
@@ -619,6 +627,10 @@ export function isSupportedMapValue(t: IrType): boolean {
     case "object":
     case "union":
     case "array":
+    // Nested collections use the existing ref slot and scr_map adapters.
+    // Their key/value tracing participates in the cycle-analysis fixpoint.
+    case "map":
+    case "set":
       return true;
     // A spawned child handle (Map<string, ChildProcess> — the mdns
     // publisher registry): an ordinary refcounted pointer value (the
@@ -661,22 +673,16 @@ export function isSupportedMapValue(t: IrType): boolean {
 /** The INDEX-SIGNATURE value fence (`{ [k: string]: V }` shapes): the map
  * VALUE kinds — the overflow portion IS a string-keyed map — plus dyn
  * (`unknown`, an unknown-valued pricing-table shape: overflow reads surface ordinary
- * dyn values validated by the usual checked casts) and three kinds the
- * overflow store carries that user Maps don't admit yet:
+ * dyn values validated by the usual checked casts) and callable values:
  *   func — `Record<string, () => void>`, the command-registry pattern
  *          (scr_closure adapters; closures are cycle-headered and traced,
  *          so a handler capturing its own registry collects)
- *   map/set — `Record<string, Map<K, V>>`/`Record<string, Set<T>>`
- *          nested-container tables (scr_map adapters; a map value's own
- *          cycle capability propagates through the trace fixpoint)
  * Nested index-signature RECORDS ride the record kind like any other.
  * Shared frontend (mapType) / validator. */
 export function isSupportedIndexValue(t: IrType): boolean {
   return (
     t.kind === "dyn" ||
     t.kind === "func" ||
-    t.kind === "map" ||
-    t.kind === "set" ||
     isSupportedMapValue(t)
   );
 }
@@ -1118,6 +1124,10 @@ export interface IrLibIdentity {
 
 export interface IrClassDef {
   name: string;
+  /** Present for a class evaluated inside a function. Each evaluation owns
+   * fresh identity and these shared binding boxes; instance layouts carry a
+   * private class-object pointer before their source fields. */
+  localCaptures?: IrParam[];
   /** The JS-observable `.name` of the class (the runtime class object's
    * name string, and what `C.name` folds to). Differs from `name` because
    * IR names are program-qualified (`%m1.C`, `%cx…` for class
@@ -1125,6 +1135,8 @@ export interface IrClassDef {
    * binding name for `const x = class {}`, or "" for truly anonymous
    * expressions. Absent on the runtime-provided defs (never valuable). */
   jsName?: string;
+  /** JavaScript constructor arity, ending before the first default or rest parameter. */
+  jsLength?: number;
   /** RUNTIME-PROVIDED class (the builtin Error hierarchy): the struct, RC
    * helpers, and vtable live in the runtime (ScrError / scr_error_*), so
    * backends emit no definitions for it — only the preorder-interval
@@ -1341,6 +1353,10 @@ export interface IrFunction {
    * variables received through the closure environment, in caps[] order.
    * Each is also listed in `locals` (with boxed: true); it is NOT a param. */
   captures?: IrParam[];
+  /** Instance methods/constructors of local classes borrow captures through
+   * their first (`this`) parameter. The slot indexes the class object's
+   * capture array; no closure parameter is added to the method ABI. */
+  classCaptures?: (IrParam & { slot: number })[];
   /** Async: the body runs on a fiber; `returnType` is the INNER type T (a
    * `return v` fulfills with v) while ordinary call sites receive
    * Promise<T>. With `generator` present, call sites receive the lazy
@@ -1383,8 +1399,8 @@ export interface IrGlobal {
   name: string;
   type: IrType;
   mutable: boolean;
-  /** A lexical codec binding uses its initially-null record slot as the
-   * TDZ sentinel. Reads and later writes throw until initializing assign. */
+  /** Lexical record/function/checked-value bindings use their initially-null
+   * pointer as a TDZ sentinel. Reads and later writes throw until initializing assign. */
   tdz?: true;
   /** Original declaration and lexical scope, when this is a source binding. */
   source?: IrBindingSource;
@@ -1791,11 +1807,15 @@ export type IrStrIntrinsicMethod =
  * (integer kinds by modular truncation, Float32 by double→float
  * rounding). No BIG setters exist — bigint arguments never lower. */
 export type IrBytesIntrinsicMethod =
+  | "buffer"
   | "length"
   | "byteLength"
   | "get"
   | "slice"
   | "subarray"
+  /** In-place overlapping copy, [target, start, end] relative indices;
+   * returns the receiver (+1). */
+  | "copyWithin"
   /** Fresh Uint8Array copying methods. `with` takes [index, value] and
    * throws a catchable RangeError for an invalid relative index. */
   | "toReversed"
@@ -1807,6 +1827,7 @@ export type IrBytesIntrinsicMethod =
    * array spread and typed-array destructuring rest. */
   | "toArray"
   | "setFrom"
+  | "setFromDyn"
   | "toString"
   /** Buffer.toString with a runtime-valued encoding. Same signature as
    * toString, but canonicalizes aliases/case and may throw
@@ -1880,6 +1901,7 @@ export const MAY_THROW_BYTES_METHODS: ReadonlySet<IrBytesIntrinsicMethod> = new 
   "toStringVar",
   "with",
   "setFrom",
+  "setFromDyn",
   "readNum",
   "writeNum",
   "readNumVar",
@@ -1955,6 +1977,7 @@ export type IrRegexIntrinsicMethod =
   | "search"
   | "source"
   | "flags"
+  | "toString"
   | "replace"
   | "replaceAll"
   | "split";
@@ -1972,12 +1995,34 @@ export type IrRegexIntrinsicMethod =
  * assume the island runtime is linked when they see it; island exceptions
  * bridge into the exception cell as catchable strings (may-throw). */
 export type IrLibFn =
+  | "intl.segmenterNew"
+  | "weakMap.is"
+  | "weakSet.is"
+  | "weakMap.new"
+  | "weakSet.new"
+  | "dyn.fromEntries"
+  | "arrayBuffer.new"
+  | "arrayBuffer.is"
+  | "arrayBuffer.isView"
+  | "arrayBuffer.byteLengthGetter"
+  | "arrayBuffer.byteLengthDescriptor"
+  | "arrayBuffer.viewU8C"
+  | "arrayBuffer.viewI8"
+  | "arrayBuffer.viewU16"
+  | "arrayBuffer.viewI16"
+  | "arrayBuffer.viewU8"
+  | "arrayBuffer.viewU32"
+  | "arrayBuffer.viewI32"
+  | "arrayBuffer.viewF32"
+  | "arrayBuffer.viewF64"
+  | "arrayBuffer.viewDV"
   /** Native static fetch and its Web-platform companions. fetch.start
    * answers once the response head arrives; the response body readers
    * consume the native body stream. AbortSignal and ReadableStream values
    * are opaque checked-dynamic handles. */
   | "fetch.start"
   | "fetch.responseNew"
+  | "fetch.responseArrayBuffer"
   | "fetch.responseJson"
   | "fetch.responseText"
   | "fetch.responseBytes"
@@ -2030,6 +2075,17 @@ export type IrLibFn =
    * SEMANTICS.md notes the sloppy divergence: loud, never silent). Void
    * result; in the may-throw seed set. */
   | "dyn.keySet"
+  | "dyn.keySetComputed"
+  /** Delete an ordinary checked-native object's own key. Borrows both
+   * arguments; other receiver representations retain a runtime refusal. */
+  | "dyn.keyDelete"
+  /** Native own properties on globalThis keyed by symbol identity. */
+  | "dyn.globalSymbolGet"
+  | "dyn.globalSymbolSet"
+  | "dyn.globalSymbolHas"
+  | "dyn.globalSymbolDelete"
+  /** Exact native class capsule identity, without materializing its fields. */
+  | "dyn.typedRefIs"
   /** Destructuring pack over a dyn source — `const [a, b] = d`, a
    * destructured dyn callback param (args: the source and the STATIC
    * TypeError spelling, "" when the source has none — both borrowed;
@@ -2040,6 +2096,8 @@ export type IrLibFn =
    * not iterable (cannot read property Symbol(Symbol.iterator))"). In the
    * may-throw seed set. */
   | "dyn.iterPack"
+  | "dyn.mapSeedEntries"
+  | "dyn.mapSeedEntry"
   /** The for-of-over-dyn pack accessors — the emitted index loop drives
    * them over a dyn.iterPack result (ARR by construction). arrLen: the
    * ARR length as f64 (0 for non-ARR kinds; arg borrowed). arrAt: the
@@ -2050,17 +2108,19 @@ export type IrLibFn =
   /** `key in v` with a RUNTIME (string) key on a checked-dynamic
    * receiver (args: value dyn, key string; result bool): OBJ answers
    * own-member presence, ARR answers 'length'/a valid index — exactly
-   * the compile-time dynHasKey fold, per value. Never throws. */
+   * the literal-key dynHasKey path. Proxy has traps may throw. */
   | "dyn.hasKey"
   /** Object.defineProperties over dyn values (args: target, descriptors —
    * both borrowed dyn; result: the target, +1 — JS's return value).
-   * Value descriptors become plain own properties on OBJ and FUNC targets
-   * (writable/enumerable/configurable accepted and IGNORED — dyn
-   * properties are plain data properties, SEMANTICS.md); get/set
+   * Value descriptors become own properties on OBJ and FUNC targets;
+   * OBJ targets preserve data attributes. get/set
    * descriptors and non-object targets/descriptors throw catchably
    * (Node's TypeError texts; accessors the loud unsupported Error). In
    * the may-throw seed set. */
   | "dyn.defineProps"
+  | "dyn.defineProperty"
+  | "dyn.getOwnPropertyDescriptor"
+  | "dyn.arrayProtoCall"
   /** Bare `typeof v` on a dyn value AS A STRING (arg: the dyn value,
    * borrowed; result: an owned string) — the dyn kind's JS answer:
    * undefined→"undefined", null/object/array/bytes→"object" (JS's oldest
@@ -2069,6 +2129,10 @@ export type IrLibFn =
   | "dyn.typeof"
   /** Object.prototype.toString.call on a checked-dynamic value. */
   | "dyn.objectTag"
+  | "dyn.freeze"
+  | "dyn.isFrozen"
+  | "dyn.nativeSetIs"
+  | "dyn.nativeRegexIs"
   /** toString() on a checked-dynamic receiver: runtime kind dispatch
    * (bytes decode per the literal encoding — utf8 default; strings,
    * numbers, booleans, arrays, objects answer JS-exactly; undefined and
@@ -2337,6 +2401,7 @@ export type IrLibFn =
    * encoded slashes, and non-empty hosts. url.pathToFileURL resolves the
    * path (getcwd) and never throws. */
   | "url.new"
+  | "url.newBase"
   | "url.protocol"
   | "url.origin"
   | "url.username"
@@ -2349,6 +2414,9 @@ export type IrLibFn =
   | "url.fileURLToPathUrl"
   | "url.fileURLToPathStr"
   | "url.pathToFileURL"
+  /** Explicit path syntax from the options.windows argument, independent
+   * of the executable's host platform. Windows UNC input can throw. */
+  | "url.pathToFileURLPlatform"
   /** pathToFileURL under a win32 TARGET: the same scr_url_from_path call
    * (the runtime selects the win32 arm by _WIN32), but a distinct IR name
    * because that arm THROWS for malformed UNC inputs — may-throw seeds on
@@ -3358,6 +3426,13 @@ export type IrLibFn =
    * bytes<u8>[] arg (the list) and returns a fresh copy. `Buffer.from(u8)`
    * and `Buffer.alloc(n)` need no libFn — they lower to bytesNew. */
   | "buffer.fromStr"
+  | "buffer.brand"
+  /** Buffer.from on checked-native strings, bytes, arrays and data-only
+   * array-like/Buffer-JSON objects. The encoding is a normalized literal;
+   * non-string inputs ignore it. Copies the input and may throw during
+   * element coercion or argument validation. Custom object valueOf and
+   * opaque reference inputs retain explicit runtime refusals. */
+  | "buffer.fromDyn"
   | "buffer.concat"
   /** Buffer.byteLength(string, enc) — enc a NORMALIZED literal like
    * fromStr's — and Buffer.isEncoding(name) over a runtime string
@@ -3426,13 +3501,14 @@ export type IrLibFn =
    * "defaultMaxListeners" for the module-property assignment). */
   | "emitter.setMaxChk"
   | "emitter.setDefaultMaxChk"
-  /** The Buffer forms of the fs quartet: readFileSync(path) with NO
-   * encoding → bytes<u8> (+1), writeFileSync(path, bytes), and the
+  /** The Buffer forms of fs: readFileSync(path) with NO
+   * encoding → bytes<u8> (+1), writeFileSync/appendFileSync(path, bytes), and the
    * fs/promises readFile(path) no-encoding form (an already-settled
    * promise, rejecting on failure like the other fsp members). The sync
-   * pair THROWS catchably on failure exactly like the utf8 forms. */
+   * forms THROW catchably on failure exactly like the utf8 forms. */
   | "fs.readFileSyncBytes"
   | "fs.writeFileSyncBytes"
+  | "fs.appendFileSyncBytes"
   | "fsp.readFileBytes"
   /** node:zlib (scr_zlib.c — native-toolchain.ts compiles/links it ONLY when these
    * appear on the IR, the regex/libcurl gating precedent): one-shot zlib,
@@ -3554,6 +3630,12 @@ export type IrLibFn =
    * "x64") — Node's answer for its own build on the same machine.
    * Interned; +1 per read. Never throws. */
   | "process.arch"
+  /** Stable native version dictionary. node/openssl identify compatibility
+   * targets; components absent from the native runtime are omitted. */
+  | "process.versions"
+  | "process.builtinId"
+  | "process.builtinModule"
+  | "process.builtinUnsupported"
   /** process.versions.node: the runtime's Node COMPATIBILITY TARGET —
    * there is no Node under the binary, so this reports the version whose
    * semantics the runtime implements (SEMANTICS.md divergence 60, the
@@ -3584,6 +3666,8 @@ export type IrLibFn =
   /** realpath(3) with Node's error shape (syscall "lstat" in the message,
    * Node's own spelling for realpathSync failures). +1 fresh string. */
   | "fs.realpathSync"
+  /** Native realpath with syscall "realpath" on failure. +1 fresh string. */
+  | "fs.realpathNativeSync"
   /** kill(2) with Node's exact semantics and error shapes: the pid must be
    * an int32 (else the ERR_INVALID_ARG_TYPE TypeError text), the named
    * form resolves Node's signal-name table (unknown names throw the
@@ -3617,6 +3701,7 @@ export type IrLibFn =
    * never throws. */
   | "process.stdoutWrite"
   | "process.stderrWrite"
+  | "process.stdio"
   | "timers.setTimeout"
   /** The repeating timer pair. setInterval takes (callback, ms) like
    * setTimeout and RETURNS the f64 handle the fallback declarations
@@ -3764,6 +3849,9 @@ export type IrLibFn =
    * when absent); hasCause distinguishes absence from present undefined. */
   | "error.cause"
   | "error.hasCause"
+  /** Assignment borrows both operands and retains the new cause. */
+  | "error.setCause"
+  | "error.deleteCause"
   /** The compiler-resolved Node-parity throw for always-throwing lowered
    * arms (ERR_INVALID_THIS receivers, ERR_MISSING_ARGS arity ladders,
    * the symbol-to-string TypeError): args are [error-kind f64 (the
@@ -3782,13 +3870,18 @@ export type IrLibFn =
    * valueOf/toString ordering; user throws propagate). Borrowed dyn;
    * f64 result, or a throw. Used by statically lowered numeric coercions
    * whose checker type remained any. */
+  | "dyn.numberConstructor"
   | "dyn.toNumberCoerce"
+  | "dyn.add"
+  | "dyn.proxyNew"
   /** A read of a `declare`d const NOTHING defines (the bundler-define
    * pattern — __VERSION__): always throws the catchable ReferenceError
    * Node raises at the access ("<name> is not defined"). args[0] is the
    * name; the result type is the read's declared type (a typed dummy the
    * unwind abandons — the value never exists). */
   | "global.undefRead"
+  /** A native reference to the global object; known names retain value fences. */
+  | "global.native"
   /** `X.name` through a class VALUE (scr_object.c): args[0] is a borrowed
    * classval; the result is the class object's stored .name string,
    * retained (+1 — the string is an interned immortal, so the retain is a
@@ -3842,6 +3935,7 @@ export type IrLibFn =
    * empty array; null/undefined throw Node's catchable TypeError
    * ("Cannot convert undefined or null to object"). */
   | "dyn.objKeys"
+  | "dyn.forInKeys"
   | "dyn.hasOwn"
   | "dyn.assign"
   /** Variadic Object.assign over CHECKED-DYNAMIC targets (`Object.assign(
@@ -3895,6 +3989,7 @@ export type IrLibFn =
    * The result TYPE is the regex kind, so the link switch pulls the
    * engine exactly like a literal. */
   | "regex.new"
+  | "regex.newChecked"
   /** structuredClone with a NON-EMPTY transfer array of static values:
    * nothing static is transferable, so the call always throws Node's
    * catchable DataCloneError ("Found invalid value in transferList.") —
@@ -3934,6 +4029,7 @@ export type IrLibFn =
   | "emitter.emitError"
   | "emitter.count"
   | "emitter.countFn"
+  | "emitter.countDyn"
   | "emitter.names"
   | "emitter.listeners"
   | "emitter.setMax"
@@ -4498,6 +4594,9 @@ export type IrLibFn =
    * from UTF-16 code units. Adjacent surrogate pairs combine; lone
    * surrogates follow the runtime's replacement policy. */
   | "string.fromCharCode"
+  /** Numeric code points, with catchable RangeError for non-integers or
+   * values outside 0..0x10ffff. Uses the same UTF-8 surrogate policy. */
+  | "string.fromCodePoint"
   /** lastIndexOf returns the last UTF-16 start index, or -1. The two-arg
    * form searches at or before its numeric position; NaN starts at the end.
    * String arguments are borrowed and neither form throws. */
@@ -4686,8 +4785,7 @@ export type IrExpr =
   /** Numeric operands; comparisons yield bool. `===`/`!==` additionally
    * accept two same-typed arrays: reference identity (pointer compare),
    * matching JS object equality — and two same-typed CLASS VALUES, where
-   * the pointer compare IS class identity (one immortal object per
-   * class). */
+   * the pointer compare IS class identity. */
   | { kind: "bin"; op: IrNumBinOp; left: IrExpr; right: IrExpr; type: IrType; loc: SrcLoc }
   /** `~` is JS bitwise NOT: ToInt32 the operand, complement, back to f64. */
   | { kind: "unary"; op: "-" | "!" | "~"; operand: IrExpr; type: IrType; loc: SrcLoc }
@@ -4915,12 +5013,14 @@ export type IrExpr =
    *   truncate; a negative/huge result THROWS Node's "Invalid typed array
    *   length" RangeError catchably — backends' may-throw analyses seed on
    *   bytesNew with a non-bytes, non-array source).
-   * - bytes (same elem — frontend-fenced) — an independent COPY. Never
-   *   throws.
+   * - bytes — an independent, element-coerced COPY. Never throws.
    * - array of f64 — a per-element-coerced copy (ToUint8/ToUint32/float).
    *   Never throws.
+   * - dyn — checked native input; can throw on invalid lengths/coercion.
+   *   `from` selects TypedArray.from's iterable/array-like semantics instead
+   *   of constructor length coercion (notably for strings and numbers).
    * The source is BORROWED; the result is owned (+1). */
-  | { kind: "bytesNew"; source: IrExpr | null; type: IrType; loc: SrcLoc }
+  | { kind: "bytesNew"; source: IrExpr | null; from?: true; type: IrType; loc: SrcLoc }
   /** Typed-array/Buffer method or property on a bytes receiver — see
    * IrBytesIntrinsicMethod for the surface and conventions. Methods in
    * MAY_THROW_BYTES_METHODS raise catchable RangeErrors (may-throw
@@ -5012,8 +5112,10 @@ export type IrExpr =
   | { kind: "closure"; fnName: string; captures: string[]; type: IrType; loc: SrcLoc }
   /** Indirect call of a func-typed value. Args follow `call`'s convention
    * (callee owns its params, callers pass +1). The callee expression is an
-   * ordinary owned temp, released at statement end. */
-  | { kind: "callValue"; callee: IrExpr; args: IrExpr[]; type: IrType; loc: SrcLoc }
+   * ordinary owned temp, released at statement end. receiver supplies the
+   * call-time this value; absence means undefined. Evaluate callee, receiver,
+   * then args, and restore the ambient receiver before unwinding. */
+  | { kind: "callValue"; callee: IrExpr; receiver?: IrExpr; args: IrExpr[]; type: IrType; loc: SrcLoc }
   /** The currently-executing closure, as a value (+1). Valid only inside a
    * lifted function. Exists so a named nested function can recurse on itself
    * WITHOUT capturing its own binding — a box holding its own closure would
@@ -5078,14 +5180,13 @@ export type IrExpr =
    * with the new object as arg 0 (retained — the ctor owns and releases its
    * `this` param like any callee). Result is owned (+1). */
   | { kind: "new"; className: string; args: IrExpr[]; type: IrType; loc: SrcLoc }
-  /** The class itself as a value: a pointer to `className`'s immortal
-   * class object (type `classval:className`, +1 — a no-op retain on the
-   * immortal, kept for the uniform owned-temp discipline, the regexLit
-   * pattern). The frontend notes an edge to `%className.constructor` at
+  /** The class itself as an owned value. `captures` creates fresh identity
+   * and retains the named boxes; absent captures use an immortal template.
+   * The frontend notes an edge to `%className.constructor` at
    * every classRef, so a value's construct thunk always has a constructor
    * to call; backends emit class objects (and thunks) for exactly the
    * classes some classRef in the module names. */
-  | { kind: "classRef"; className: string; type: IrType; loc: SrcLoc }
+  | { kind: "classRef"; className: string; captures?: string[]; type: IrType; loc: SrcLoc }
   /** `new X(args)` through a class VALUE: call the class object's
    * construct thunk. `callee` is classval-typed; args are completed
    * against `%<callee.className>.constructor`'s ABI — sound because every
@@ -5252,7 +5353,7 @@ export type IrExpr =
    * the nullish text spells), evaluated and flattened left-to-right (JS's
    * ArgumentListEvaluation). The emitters build one fresh argument array
    * and apply through it. */
-  | { kind: "dynCall"; callee: IrExpr; calleeName: string; args: IrExpr[]; spreads?: { arg: number; what: string }[]; type: IrType; loc: SrcLoc }
+  | { kind: "dynCall"; callee: IrExpr; receiver?: IrExpr; calleeName: string; args: IrExpr[]; spreads?: { arg: number; what: string }[]; type: IrType; loc: SrcLoc }
   /** Prototype-method DISPATCH on a dyn receiver — `recv.m(...)` where `m`
    * is a name a dyn-representable prototype declares (Array/String/
    * Function shared names: push, slice, join, forEach, map, apply, ...),
@@ -5271,10 +5372,8 @@ export type IrExpr =
    * `['pwd', []]` — and evolving `[]` declarations): each element is
    * already a dyn value; the result owns them. Never throws. */
   | { kind: "dynArrLit"; elems: IrExpr[]; type: IrType; loc: SrcLoc }
-  /** A dyn OBJECT built member-by-member. With no `fields` it is the empty
-   * object (the JS stand-in for opaque container values — `new WeakMap()`
-   * in harness code: the value exists for identity; every reached METHOD
-   * use meets its own fence). With `fields` it is a JS object literal whose
+  /** A dyn OBJECT built member-by-member. With no `fields` it is an empty
+   * object. With `fields` it is a JS object literal whose
    * keys are RUNTIME values (the computed-key idiom `{ [field]: criteria,
    * actual: 0 }` in test/common's _mustCallInner): each entry's key is a
    * string-typed expression (identifier/string keys lower to strLits;
@@ -5289,9 +5388,9 @@ export type IrExpr =
    * control flow understands on `unknown`: `typeof v === "string" |
    * "number" | "boolean" | "undefined"` and the unit comparisons `v ===
    * undefined` / `v === null` (`"nullish"` is the LOOSE `v == null` pair —
-   * undefined or null in one test), and `v instanceof Uint8Array`
-   * (`"bytes"` — the checked-dynamic tree's bytes kind; Node's Buffer IS a Uint8Array
-   * subclass and both worlds answer true for it, SEMANTICS.md 45), plus
+   * undefined or null in one test), and `v instanceof TypedArray`
+   * (`"bytes"` plus bytesElem, default u8; Node's Buffer is a Uint8Array
+   * subclass), plus
    * the two object-family tests: `"object"` is `typeof v === "object"`
    * exactly (true for the checked-dynamic tree's object, array, bytes, AND null kinds —
    * JS's oldest wart preserved), `"array"` is `Array.isArray(v)` (the
@@ -5313,7 +5412,7 @@ export type IrExpr =
    * "function"` — true exactly for the checked-dynamic tree's function kind (boxed
    * closures); function values are truthy and answer FALSE to the
    * `"object"` test, JS-exact. */
-  | { kind: "dynTest"; test: "string" | "number" | "boolean" | "undefined" | "null" | "nullish" | "bytes" | "object" | "array" | "truthy" | "error" | "function"; negated?: true; value: IrExpr; type: IrType; loc: SrcLoc }
+  | { kind: "dynTest"; test: "bigint" | "string" | "number" | "boolean" | "undefined" | "null" | "nullish" | "bytes" | "buffer" | "object" | "array" | "truthy" | "error" | "function"; bytesElem?: IrBytesElem; negated?: true; value: IrExpr; type: IrType; loc: SrcLoc }
   /** Keyed read on a dyn value — `pkg.name` / `pkg["k"]` / the
    * `pkg?.scripts` chain step on a JSON.parse result. `key` is
    * string-typed (a strLit for the dot form); `type` is always dyn. An
@@ -5794,6 +5893,21 @@ export function isJsonStringifySafeType(
   return isJsonSafeAt(t, getRecord, getUnion, true, false, new Set());
 }
 
+/** A JSON-shaped container with unknown payloads needs the runtime JSON
+ * traversal. Its declared structure can be boxed, but payloads may carry
+ * omitted values, toJSON methods, or cycles. This predicate does not widen
+ * the type-directed serializer, checked-island boundary, or root-undefined
+ * contract; callers must select the checked runtime traversal explicitly. */
+export function isJsonStringifyDynamicType(
+  t: IrType,
+  getRecord: (shapeId: string) => IrRecordShape | undefined,
+  getUnion: (unionId: string) => IrUnionDef | undefined,
+): boolean {
+  return (t.kind === "record" || t.kind === "array" || t.kind === "union") &&
+    isJsonSafeAt(t, getRecord, getUnion, true, false, new Set(), true) &&
+    !isJsonStringifySafeType(t, getRecord, getUnion);
+}
+
 /** The recursion shared by checked JSON conversion and stringification.
  * Ordinary record fields always admit undefined by dropping the key. Array
  * and tuple slots admit it only for stringification, which writes null. */
@@ -5804,18 +5918,18 @@ function isJsonSafeAt(
   stringify: boolean,
   undefinedAllowed: boolean,
   visiting: Set<string>,
-  dynFields = false,
+  nativeFields = false,
 ): boolean {
   if (HANDLE_KINDS.has(t.kind)) return false;
   switch (t.kind) {
     case "dyn":
-      return dynFields;
+      return nativeFields;
     case "f64":
     case "string":
     case "bool":
       return true;
     case "array":
-      return isJsonSafeAt(t.elem, getRecord, getUnion, stringify, stringify, visiting, dynFields);
+      return isJsonSafeAt(t.elem, getRecord, getUnion, stringify, stringify, visiting, nativeFields);
     case "record": {
       const shape = getRecord(t.shapeId);
       if (!shape) return false;
@@ -5825,7 +5939,7 @@ function isJsonSafeAt(
       // short-circuits every `every` up the walk).
       if (visiting.has(t.shapeId)) return true;
       visiting.add(t.shapeId);
-      if (!shape.fields.every((f) => isJsonSafeAt(f.type, getRecord, getUnion, stringify, !shape.tuple || stringify, visiting, dynFields))) {
+      if (!shape.fields.every((f) => isJsonSafeAt(f.type, getRecord, getUnion, stringify, !shape.tuple || stringify, visiting, nativeFields))) {
         return false;
       }
       // Overflow values sit in record-key position too: dyn is JSON-safe
@@ -5833,7 +5947,7 @@ function isJsonSafeAt(
       // like any undefined-valued key), everything else follows the
       // record-field rule.
       if (shape.indexValue && shape.indexValue.kind !== "dyn") {
-        return isJsonSafeAt(shape.indexValue, getRecord, getUnion, stringify, true, visiting, dynFields);
+        return isJsonSafeAt(shape.indexValue, getRecord, getUnion, stringify, true, visiting, nativeFields);
       }
       return true;
     }
@@ -5843,8 +5957,15 @@ function isJsonSafeAt(
       const key = `${t.unionId}:${stringify}:${undefinedAllowed}`;
       if (visiting.has(key)) return true; // the recursive knot, union-flavored
       visiting.add(key);
-      return def.arms.every((a) => a.kind === "undefinedT" ? undefinedAllowed : isJsonSafeAt(a, getRecord, getUnion, stringify, undefinedAllowed, visiting, dynFields));
+      return def.arms.every((a) => a.kind === "undefinedT" ? undefinedAllowed : isJsonSafeAt(a, getRecord, getUnion, stringify, undefinedAllowed, visiting, nativeFields));
     }
+    case "set":
+      return nativeFields && !stringify && t.elem.kind === "dyn";
+    case "bigint":
+    case "regex":
+      return nativeFields && !stringify;
+    case "bytes":
+      return nativeFields;
     case "func":
     case "object":
     // Class values stringify as "{}" husks in Node (own enumerable statics
@@ -5853,11 +5974,6 @@ function isJsonSafeAt(
     // Maps are not JSON (JSON.stringify(new Map()) is "{}" in Node — an
     // empty-object husk nobody wants; stringify/dynCheck reject instead).
     case "map":
-    // Sets stringify as the same "{}" husk — rejected like Maps.
-    case "set":
-    // Regexes are not JSON (JSON.stringify(/a/) is "{}" in Node — the same
-    // empty-object husk as Maps; stringify/dynCheck reject instead).
-    case "regex":
     case "date":
     // URLs stringify as "{}" husks in Node too (data properties live on
     // internal slots) — rejected the same way; use url.href instead.
@@ -5868,11 +5984,6 @@ function isJsonSafeAt(
     // Symbols are DROPPED by Node's stringify (undefined at the top level,
     // omitted as object values) — silent divergence banned; rejected.
     case "symbol":
-    case "bigint":
-    // Typed arrays stringify as index-keyed objects ({"0":1,...}) and
-    // Buffers as {type:"Buffer",data:[...]} in Node — neither shape is
-    // representable type-directedly; rejected like Maps.
-    case "bytes":
     case "jsval":
     case "caught":
     case "promise":
@@ -5934,7 +6045,8 @@ export function canMarshalFuncIntoIsland(t: IrType): boolean {
 
 /** Parameter types a TYPED closure may declare when it crosses INTO the
  * island as a host function: jsval params take the engine argument as a
- * handle (the all-'any' shape above); every other admitted type converts
+ * handle (the all-'any' shape above); dyn params normalize scalars or retain
+ * engine objects by reference. Every other admitted type converts
  * AT CALL TIME through the validated-exit machinery — strict primitives,
  * JSON round-trip composites (the dynCheck walker: width-tolerant records,
  * path-annotated failures). On top of the jsExit set, a bare `T | undefined`
@@ -5947,7 +6059,7 @@ export function isIslandCallbackParamType(
   getRecord: (shapeId: string) => IrRecordShape | undefined,
   getUnion: (unionId: string) => IrUnionDef | undefined,
 ): boolean {
-  if (t.kind === "jsval") return true;
+  if (t.kind === "jsval" || t.kind === "dyn") return true;
   if (isJsonSafeType(t, getRecord, getUnion)) return true;
   if (t.kind === "union") {
     // A bare undefined-armed union: every non-undefined arm must be
@@ -5995,8 +6107,8 @@ export function islandCallbackRet(
  * closures whose params are per-argument-convertible at call time
  * (isIslandCallbackParamType) and whose return classifies
  * (islandCallbackRet). Same arity cap — the runtime's host-call argument
- * buffer. Closures taking closures and 'unknown'-typed params stay fenced
- * (no per-type extraction exists for them inside a host call). */
+ * buffer. Statically typed closure parameters stay fenced; unknown values
+ * enter as checked-dynamic values and are validated at each typed use. */
 export function canMarshalTypedFuncIntoIsland(
   t: IrType,
   getRecord: (shapeId: string) => IrRecordShape | undefined,
@@ -6066,6 +6178,7 @@ export function canMarshalTypedFuncIntoIsland(
  * (dynCheck's "expected IncomingMessage ..." texts). */
 export const DYN_HANDLE_KINDS: ReadonlyMap<string, { tag: string; cls: string }> = new Map([
   ["child", { tag: "SCR_DYNH_CHILD", cls: "ChildProcess" }],
+  ["fileHandle", { tag: "SCR_DYNH_FILE_HANDLE", cls: "FileHandle" }],
   ["httpReq", { tag: "SCR_DYNH_HTTP_REQ", cls: "IncomingMessage" }],
   ["httpRes", { tag: "SCR_DYNH_HTTP_RES", cls: "ServerResponse" }],
   ["netSocket", { tag: "SCR_DYNH_NET_SOCKET", cls: "Socket" }],
@@ -6091,8 +6204,25 @@ export function isClassOwnEnumerableFieldName(name: string): boolean {
   return !name.startsWith("#") && !name.startsWith("%");
 }
 
+/** A class capsule can always preserve its exact native identity. Its
+ * optional property view additionally needs converters in both directions;
+ * fields such as Maps may remain opaque without preventing the round trip. */
+export function classDynViewSupported(
+  fields: readonly { name: string; type: IrType }[],
+  getRecord: (shapeId: string) => IrRecordShape | undefined,
+  getUnion: (unionId: string) => IrUnionDef | undefined,
+): boolean {
+  const checkable = (type: IrType): boolean => {
+    if (isDynTypedRefType(type) || isUnitType(type)) return true;
+    if (type.kind === "union") return getUnion(type.unionId)?.arms.every(checkable) ?? false;
+    return canDynCheckTo(type, getRecord, getUnion);
+  };
+  return fields.every((field) => !isClassOwnEnumerableFieldName(field.name) ||
+    (canConvertToDyn(field.type, getRecord, getUnion) && checkable(field.type)));
+}
+
 /** A static type that CONVERTS into a dyn value — the dynFrom domain:
- * JSON-safe data, bytes<u8> (payload copied), identity-preserving class
+ * JSON-safe data, numeric typed arrays (retained views), identity-preserving class
  * references, undefined-armed unions of those arms, boxable function types,
  * and the runtime HANDLE kinds (boxed by reference — DYN_HANDLE_KINDS). */
 export function canConvertToDyn(
@@ -6101,18 +6231,19 @@ export function canConvertToDyn(
   getUnion: (unionId: string) => IrUnionDef | undefined,
 ): boolean {
   if (isJsonSafeType(t, getRecord, getUnion)) return true;
-  // bytes<u8> and boxable functions are dyn kinds the walker boxes
-  // ANYWHERE (bytes copied, functions held by identity), including nested
+  // numeric typed arrays and boxable functions are dyn kinds the walker boxes
+  // ANYWHERE (bytes and functions held by identity), including nested
   // in records/arrays/unions. isJsonSafeType rejects them, but dynFrom
   // needs only that the walker can build the dyn value, so this composite
   // fold extends the JSON-safe core.
   if (canBoxDynComposite(t, getRecord, getUnion)) return true;
-  if (t.kind === "bytes" && t.elem === "u8") return true;
+  if (t.kind === "bytes") return true;
   // %Error converts as the checked-dynamic tree's error encoding ({%error, name, message,
   // code?} — the caughtToDyn shape, scr_dyn_from_error): the dyn 'error'
   // listener boundary (a mustCall-wrapped handler receiving the payload).
   if (t.kind === "object" && t.className === "%Error") return true;
   if (isDynTypedRefType(t)) return true;
+  if (t.kind === "classval") return true;
   if (t.kind === "func") return canBoxFuncIntoDyn(t, getRecord, getUnion);
   if (DYN_HANDLE_KINDS.has(t.kind)) return true;
   // Promises box by REFERENCE (SCR_DYN_PROMISE): promise<dyn> carries its
@@ -6136,7 +6267,7 @@ export function canConvertToDyn(
     // boundary exactly like a bare func dynFrom).
     return !!def && def.arms.every((a) =>
       a.kind === "undefinedT" || isJsonSafeType(a, getRecord, getUnion) ||
-      isDynTypedRefType(a) || DYN_HANDLE_KINDS.has(a.kind) ||
+      isDynTypedRefType(a) || a.kind === "classval" || DYN_HANDLE_KINDS.has(a.kind) ||
       (a.kind === "func" && canBoxFuncIntoDyn(a, getRecord, getUnion)) ||
       (a.kind === "promise" && canConvertToDyn(a, getRecord, getUnion)),
     );
@@ -6145,7 +6276,7 @@ export function canConvertToDyn(
 }
 
 /** The composite extension of the dynFrom domain: JSON-safe scalars plus
- * bytes<u8> and boxable functions anywhere, recursing through records
+ * numeric typed arrays and boxable functions anywhere, recursing through records
  * (fields + index value), arrays, and unit-armed unions — exactly the
  * sc_td_* walker's capability. Returns false for a composite carrying a
  * kind the walker cannot box (Maps or handles nested in a record); those
@@ -6158,16 +6289,21 @@ function canBoxDynComposite(
 ): boolean {
   switch (t.kind) {
     case "f64":
+    case "bigint":
     case "string":
     case "bool":
     case "dyn":
     case "undefinedT":
     case "nullT":
+    case "classval":
       return true;
     case "bytes":
-      return t.elem === "u8";
+    case "regex":
+      return true;
     case "func":
       return canBoxFuncIntoDyn(t, getRecord, getUnion);
+    case "set":
+      return t.elem.kind === "dyn";
     case "array":
       return canBoxDynComposite(t.elem, getRecord, getUnion, visiting);
     case "record": {
@@ -6193,7 +6329,7 @@ function canBoxDynComposite(
 }
 
 /** A type a dyn value can be VALIDATED into — the dynCheck domain:
- * JSON-safe data, bytes<u8> (a fresh copy out), the %Error extraction,
+ * JSON-safe data, numeric typed arrays (retained views), the %Error extraction,
  * undefined-armed unions of JSON-safe arms, adaptable function types,
  * and the runtime HANDLE kinds (a tag-checked reference unwrap —
  * DYN_HANDLE_KINDS). */
@@ -6208,13 +6344,18 @@ export function canDynCheckTo(
   // serializable. Backends already retain dyn fields and fill missing
   // unknown record fields with the undefined value.
   if (isJsonSafeAt(t, getRecord, getUnion, false, false, new Set(), true)) return true;
-  if (t.kind === "bytes" && t.elem === "u8") return true;
+  if (t.kind === "bigint" || t.kind === "set" && t.elem.kind === "dyn") return true;
+  if (t.kind === "bytes") return true;
+  if (t.kind === "classval") return true;
   if (t.kind === "object" && t.className === "%Error") return true;
   if (t.kind === "func") return canAdaptDynFuncTo(t, getRecord, getUnion);
   if (DYN_HANDLE_KINDS.has(t.kind)) return true;
   if (t.kind === "union") {
     const def = getUnion(t.unionId);
-    return !!def && def.arms.every((a) => a.kind === "undefinedT" || isJsonSafeAt(a, getRecord, getUnion, false, false, new Set(), true));
+    // Optional native callbacks and handles retain the same checked
+    // conversion as their bare value. The union matcher selects the arm
+    // before its adapter/extractor runs.
+    return !!def && def.arms.every((a) => isUnitType(a) || (a.kind !== "union" && canDynCheckTo(a, getRecord, getUnion)));
   }
   return false;
 }
@@ -6230,10 +6371,11 @@ export function canBoxFuncIntoDyn(
 ): boolean {
   return (
     t.kind === "func" &&
-    // Only the legacy hidden-dyn rest ABI has a checked-dynamic call thunk.
-    // Typed rest stays static (its trailing array is compiler-packed), and
-    // island rest has its separate engine host-callback adapter.
-    (t.rest !== true || t.restAbi === undefined) &&
+    // Typed rest occupies the final native array parameter; its thunk
+    // checks a fresh array containing all remaining call arguments.
+    // Island rest keeps its separate engine host-callback adapter.
+    (t.rest !== true || t.restAbi === undefined ||
+      (t.restAbi === "typed" && t.params.at(-1)?.kind === "array")) &&
     // A jsval (island) param converts through scr_jsval_from_dyn in the
     // thunk (wrapped cells unwrap by reference, dyn data deep-copies) —
     // the checker-'any' callback params of the routed-dispatch lane
@@ -6361,7 +6503,7 @@ export function moduleUsesRegex(mod: IrModule): boolean {
     }
     // RegExp.escape lives in scr_regex.c too (needing no engine — it
     // keeps the always-linked string TU out of hello-world's size class).
-    if (kind === "libCall" && (v as { fn?: unknown }).fn === "regexp.escape") {
+    if (kind === "libCall" && ["regexp.escape", "dyn.nativeRegexIs"].includes(String((v as { fn?: unknown }).fn))) {
       found = true;
       return;
     }
@@ -6488,6 +6630,7 @@ export function moduleUsesFetch(mod: IrModule): boolean {
 /** The libCall fns served by the OPTIONAL events unit (scr_events.c):
  * process signal/exit listeners and the piped-stdin surface. */
 const PROCESS_EVENT_LIB_FNS: ReadonlySet<string> = new Set([
+  "process.stdio",
   "process.onSignal",
   "process.offSignal",
   "process.onExit",
@@ -6711,7 +6854,8 @@ export function moduleUsesDynInvoke(mod: IrModule): boolean {
       return;
     }
     const node = v as { kind?: unknown; fn?: unknown };
-    if (node.kind === "dynInvoke" || (node.kind === "libCall" && node.fn === "dyn.defineProps")) {
+    if (node.kind === "dynInvoke" || (node.kind === "libCall" &&
+        (node.fn === "dyn.defineProps" || node.fn === "dyn.arrayProtoCall"))) {
       found = true;
       return;
     }
@@ -7465,6 +7609,27 @@ export function moduleLibNondeterministicSurface(mod: IrModule): string | null {
  * seed on `dynCheck` and `awaitExpr` nodes, which throw on validation
  * failure / promise rejection). */
 export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
+  "process.stdoutWrite",
+  "process.stderrWrite",
+  "process.stdoutWriteBytes",
+  "process.stderrWriteBytes",
+  "procStream.write",
+  "weakMap.new",
+  "weakSet.new",
+  "dyn.fromEntries",
+  "arrayBuffer.new",
+  "arrayBuffer.byteLengthGetter",
+  "arrayBuffer.viewU8C",
+  "arrayBuffer.viewI8",
+  "arrayBuffer.viewU16",
+  "arrayBuffer.viewI16",
+  "arrayBuffer.viewU8",
+  "arrayBuffer.viewU32",
+  "arrayBuffer.viewI32",
+  "arrayBuffer.viewF32",
+  "arrayBuffer.viewF64",
+  "arrayBuffer.viewDV",
+
   "bigint.parse",
   "bigint.fromF64",
   "bigint.div",
@@ -7683,9 +7848,16 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   // Error messages use the same coercion protocol before installing cause.
   "error.newOptions",
   "error.ctorOptions",
+  "error.cause",
+  "error.setCause",
+  "error.deleteCause",
   "dyn.objectTag",
   // Numeric coercion runs user valueOf/toString — throws propagate.
+  "dyn.numberConstructor",
   "dyn.toNumberCoerce",
+  "dyn.add",
+  "dyn.proxyNew",
+  "dyn.hasKey",
   "child.kill",
   // The caller's lookup runs synchronously inside the connect call — a
   // throw there propagates like Node's.
@@ -7745,6 +7917,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "dyn.cloneTransferFail",
   // the dyn Object walks throw on null/undefined receivers
   "dyn.objKeys",
+  "dyn.forInKeys",
   "dyn.hasOwn",
   "dyn.assign",
   // variadic Object.assign: spread flattening throws V8's spread-call
@@ -7758,13 +7931,28 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   // new RegExp compiles the pattern eagerly: an invalid pattern or flag
   // throws Node's catchable SyntaxError at construction.
   "regex.new",
+  "regex.newChecked",
   "dyn.keySet",
+  "dyn.keySetComputed",
+  "process.builtinId",
+  "process.builtinModule",
+  "process.builtinUnsupported",
+  "dyn.keyDelete",
   // the destructuring pack throws V8's TypeError on non-iterable dyn kinds
   "dyn.iterPack",
+  "dyn.mapSeedEntries",
+  "dyn.mapSeedEntry",
+  "dyn.freeze",
+  "dyn.isFrozen",
   "dyn.toString",
+  "string.fromCodePoint",
   "dyn.defineProps",
+  "dyn.defineProperty",
+  "dyn.getOwnPropertyDescriptor",
+  "dyn.arrayProtoCall",
   "process.chdir",
   "fs.realpathSync",
+  "fs.realpathNativeSync",
   "fs.readFileSync",
   "fs.writeFileSync",
   "fs.appendFileSync",
@@ -7774,6 +7962,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "fs.readdirSync",
   "fs.readdirTypesSync",
   "url.new",
+  "url.newBase",
   "url.fileURLToPathUrl",
   "url.fileURLToPathStr",
   // The win32-target flavor of pathToFileURL (same runtime entry point —
@@ -7781,6 +7970,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   // raises ERR_INVALID_ARG_VALUE TypeErrors for malformed UNC inputs, so
   // only THIS flavor seeds may-throw — posix emission stays untouched.
   "url.pathToFileURLWin32",
+  "url.pathToFileURLPlatform",
   // URLSearchParams from a string[][]: Node's ERR_INVALID_TUPLE TypeError
   // on a row that is not a [name, value] pair. The rest of the sp family
   // never throws.
@@ -7811,6 +8001,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "crypto.pbkdf2Cb",
   "buffer.concat",
   "buffer.concatLen",
+  "buffer.fromDyn",
   // The checked-dynamic compare/equals validators: Node's argument
   // ladders throw ERR_INVALID_ARG_TYPE / ERR_OUT_OF_RANGE catchably.
   "buffer.compareChk",
@@ -7838,6 +8029,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "emitter.setDefaultMaxChk",
   "fs.readFileSyncBytes",
   "fs.writeFileSyncBytes",
+  "fs.appendFileSyncBytes",
   "zlib.inflateSync",
   "zlib.inflateRawSync",
   "zlib.gunzipSync",

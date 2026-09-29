@@ -18,7 +18,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "./ir.js";
-import { arrayOf, BOOL, BYTES_U8, bytesOf, canAdaptDynFuncTo, canDynCheckTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, CHILDWRITER_T, CRYPTOHASH_T, CRYPTOHMAC_T, DATE_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, ffiClassType, ffiSourceParamTypes, FILEHANDLE_T, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isDynTypedRefType, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isJsonSafeType, isJsonStringifySafeType, isRefCounted, isSupportedArrayElem, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, shapeHasAccessorSlots, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionContainerArmsOk, URL_T, VOID } from "./ir.js";
+import { arrayOf, BYTES_ELEMENT_NAME, BOOL, BYTES_U8, bytesOf, canAdaptDynFuncTo, canDynCheckTo, canConvertToDyn, canExitIslandToType, canMarshalIntoIsland, canMarshalTypedFuncIntoIsland, CHILD_T, CHILDSTREAM_T, CHILDWRITER_T, CRYPTOHASH_T, CRYPTOHMAC_T, DATE_T, DGRAMSOCK_T, DYN, DYN_HANDLE_KINDS, F64, ffiClassType, ffiSourceParamTypes, FILEHANDLE_T, FSWATCHER_T, HTTP2SESSION_T, HTTP2STREAM_T, HTTPCLIENTREQ_T, HTTPREQ_T, HTTPRES_T, islandPromisePayloadTag, isDynTypedRefType, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isJsonSafeType, isJsonStringifySafeType, isRefCounted, isSupportedArrayElem, isSupportedIndexValue, isSupportedMapKey, isSupportedMapValue, isSupportedSetElem, isUnitType, jsOpResultKind, JSVAL, NETSERVER_T, NETSOCKET_T, PROCSTREAM_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, SEARCH_PARAMS_T, SECURECTX_T, shapeHasAccessorSlots, SPAWNRES_T, STATS_T, STRING, SYMBOL_T, TESTCTX_T, typeEquals, typeKey, unionContainerArmsOk, URL_T, VOID } from "./ir.js";
 import { BIGINT_T } from "./ir.js";
 import { unionWideningTags } from "./analysis.js";
 import { alwaysReturns } from "./control-flow.js";
@@ -73,6 +73,7 @@ export const REGEX_INTRINSIC_SIGS: Record<
   search: { receiver: STRING, argTypes: [REGEX], result: F64 },
   source: { receiver: REGEX, argTypes: [], result: STRING },
   flags: { receiver: REGEX, argTypes: [], result: STRING },
+  toString: { receiver: REGEX, argTypes: [], result: STRING },
   replace: { receiver: STRING, argTypes: [REGEX, STRING], result: STRING },
   replaceAll: { receiver: STRING, argTypes: [REGEX, STRING], result: STRING },
   split: { receiver: STRING, argTypes: [REGEX, F64], result: arrayOf(STRING) },
@@ -88,6 +89,7 @@ export const REGEX_INTRINSIC_SIGS: Record<
 export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result: IrType }> = {
   "fetch.start": { argTypes: [STRING, DYN], result: { kind: "promise", inner: DYN } },
   "fetch.responseNew": { argTypes: [DYN, DYN], result: DYN },
+  "fetch.responseArrayBuffer": { argTypes: [DYN], result: { kind: "promise", inner: DYN } },
   "fetch.responseJson": { argTypes: [DYN], result: { kind: "promise", inner: DYN } },
   "fetch.responseText": { argTypes: [DYN], result: { kind: "promise", inner: STRING } },
   "fetch.responseBytes": { argTypes: [DYN], result: { kind: "promise", inner: BYTES_U8 } },
@@ -112,12 +114,28 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "json.parseReviver": { argTypes: [STRING, DYN], result: DYN },
   "json.stringifyReplacer": { argTypes: [DYN, DYN, STRING], result: DYN },
   "dyn.keySet": { argTypes: [DYN, STRING, DYN], result: VOID },
+  "dyn.keySetComputed": { argTypes: [DYN, DYN, DYN], result: VOID },
+  "dyn.keyDelete": { argTypes: [DYN, STRING, BOOL], result: VOID },
+  "dyn.globalSymbolGet": { argTypes: [SYMBOL_T], result: DYN },
+  "dyn.globalSymbolSet": { argTypes: [SYMBOL_T, DYN], result: VOID },
+  "dyn.globalSymbolHas": { argTypes: [SYMBOL_T], result: BOOL },
+  "dyn.globalSymbolDelete": { argTypes: [SYMBOL_T], result: VOID },
+  "dyn.typedRefIs": { argTypes: [DYN, STRING], result: BOOL },
   "dyn.iterPack": { argTypes: [DYN, STRING], result: DYN },
+  "dyn.mapSeedEntries": { argTypes: [DYN], result: DYN },
+  "dyn.mapSeedEntry": { argTypes: [DYN], result: DYN },
   "dyn.arrLen": { argTypes: [DYN], result: F64 },
   "dyn.arrAt": { argTypes: [DYN, F64], result: DYN },
   "dyn.hasKey": { argTypes: [DYN, STRING], result: BOOL },
-  "dyn.toString": { argTypes: [DYN, STRING, STRING], result: STRING },
+  "dyn.freeze": { argTypes: [DYN], result: DYN },
+  "dyn.isFrozen": { argTypes: [DYN], result: BOOL },
+  "dyn.nativeSetIs": { argTypes: [DYN], result: BOOL },
+  "dyn.nativeRegexIs": { argTypes: [DYN], result: BOOL },
+  "dyn.toString": { argTypes: [DYN, DYN, STRING], result: STRING },
   "dyn.defineProps": { argTypes: [DYN, DYN], result: DYN },
+  "dyn.defineProperty": { argTypes: [DYN, DYN, DYN], result: DYN },
+  "dyn.getOwnPropertyDescriptor": { argTypes: [DYN, DYN], result: DYN },
+  "dyn.arrayProtoCall": { argTypes: [DYN, STRING, DYN], result: DYN },
   "dyn.typeof": { argTypes: [DYN], result: STRING },
   "dyn.objectTag": { argTypes: [DYN], result: STRING },
   "module.registryInit": { argTypes: [F64], result: VOID },
@@ -221,6 +239,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "net.getAutoSelTimeout": { argTypes: [], result: F64 },
   "net.setAutoSelTimeout": { argTypes: [F64], result: VOID },
   "fs.realpathSync": { argTypes: [STRING], result: STRING },
+  "fs.realpathNativeSync": { argTypes: [STRING], result: STRING },
   "os.userName": { argTypes: [], result: STRING },
   "os.userShell": { argTypes: [], result: STRING },
   "os.userHomedir": { argTypes: [], result: STRING },
@@ -321,6 +340,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "bigint.dataViewGet": { argTypes: [BYTES_U8, F64, BOOL, BOOL], result: BIGINT_T },
   "bigint.dataViewSet": { argTypes: [BYTES_U8, F64, BIGINT_T, BOOL], result: VOID },
   "url.new": { argTypes: [STRING], result: URL_T },
+  "url.newBase": { argTypes: [STRING, STRING], result: URL_T },
   "url.protocol": { argTypes: [URL_T], result: STRING },
   "url.origin": { argTypes: [URL_T], result: STRING },
   "url.username": { argTypes: [URL_T], result: STRING },
@@ -333,6 +353,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "url.fileURLToPathUrl": { argTypes: [URL_T], result: STRING },
   "url.fileURLToPathStr": { argTypes: [STRING], result: STRING },
   "url.pathToFileURL": { argTypes: [STRING], result: URL_T },
+  "url.pathToFileURLPlatform": { argTypes: [STRING, BOOL], result: URL_T },
   "url.pathToFileURLWin32": { argTypes: [STRING], result: URL_T },
   "sp.new": { argTypes: [], result: SEARCH_PARAMS_T },
   "sp.parse": { argTypes: [STRING], result: SEARCH_PARAMS_T },
@@ -942,6 +963,8 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   // The Buffer statics and the fs/zlib Buffer forms: fixed always-u8
   // signatures (Buffer IS a Uint8Array — one bytes kind).
   "buffer.fromStr": { argTypes: [STRING, STRING], result: BYTES_U8 },
+  "buffer.brand": { argTypes: [BYTES_U8], result: BYTES_U8 },
+  "buffer.fromDyn": { argTypes: [DYN, STRING], result: BYTES_U8 },
   "buffer.concat": { argTypes: [arrayOf(BYTES_U8)], result: BYTES_U8 },
   "buffer.byteLenStr": { argTypes: [STRING, STRING], result: F64 },
   "buffer.isEncoding": { argTypes: [STRING], result: BOOL },
@@ -970,6 +993,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "emitter.setDefaultMaxChk": { argTypes: [DYN, STRING], result: VOID },
   "fs.readFileSyncBytes": { argTypes: [STRING], result: BYTES_U8 },
   "fs.writeFileSyncBytes": { argTypes: [STRING, BYTES_U8], result: VOID },
+  "fs.appendFileSyncBytes": { argTypes: [STRING, BYTES_U8], result: VOID },
   "fsp.readFileBytes": { argTypes: [STRING], result: { kind: "promise", inner: BYTES_U8 } },
   "zlib.deflateSync": { argTypes: [BYTES_U8], result: BYTES_U8 },
   "zlib.inflateSync": { argTypes: [BYTES_U8], result: BYTES_U8 },
@@ -1044,11 +1068,16 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "process.getgid": { argTypes: [], result: F64 },
   "process.execPath": { argTypes: [], result: STRING },
   "process.arch": { argTypes: [], result: STRING },
+  "process.versions": { argTypes: [], result: DYN },
+  "process.builtinId": { argTypes: [DYN, arrayOf(STRING)], result: STRING },
+  "process.builtinModule": { argTypes: [STRING, DYN], result: DYN },
+  "process.builtinUnsupported": { argTypes: [STRING, STRING], result: DYN },
   "process.versionsNode": { argTypes: [], result: STRING },
   "process.versionsOpenssl": { argTypes: [], result: STRING },
   "process.kill": { argTypes: [F64, STRING], result: BOOL },
   "process.killNum": { argTypes: [F64, F64], result: BOOL },
   "process.stdoutWrite": { argTypes: [STRING], result: BOOL },
+  "process.stdio": { argTypes: [F64], result: DYN },
   "process.stderrWrite": { argTypes: [STRING], result: BOOL },
   // error.new's result and the receiver slots are builtin-error classes —
   // program-dependent object types, checked in the libCall case.
@@ -1057,12 +1086,18 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "error.ctorOptions": { argTypes: [null, DYN, DYN], result: VOID },
   "error.cause": { argTypes: [null], result: DYN },
   "error.hasCause": { argTypes: [null], result: BOOL },
+  "error.setCause": { argTypes: [null, DYN], result: VOID },
+  "error.deleteCause": { argTypes: [null], result: VOID },
   "error.nodeThrow": { argTypes: [F64, STRING, STRING], result: VOID },
   "dyn.toStringCoerce": { argTypes: [DYN], result: STRING },
+  "dyn.numberConstructor": { argTypes: [DYN], result: F64 },
   "dyn.toNumberCoerce": { argTypes: [DYN], result: F64 },
+  "dyn.add": { argTypes: [DYN, DYN], result: DYN },
+  "dyn.proxyNew": { argTypes: [DYN, DYN], result: DYN },
   // Always throws; the result is the READ's declared type (a typed dummy
   // the unwind abandons) — the libCall case skips the result check.
   "global.undefRead": { argTypes: [STRING], result: VOID },
+  "global.native": { argTypes: [arrayOf(STRING)], result: DYN },
   // `X.name` through a class value: the arg is a program-dependent
   // classval (a null slot; the libCall case checks the kind).
   "class.name": { argTypes: [null], result: STRING },
@@ -1082,7 +1117,29 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "error.domCause": { argTypes: [null], result: DYN },
   "error.domClone": { argTypes: [null, DYN], result: VOID },
   "dyn.errInstanceof": { argTypes: [DYN, F64], result: BOOL },
+  "weakMap.is": { argTypes: [DYN], result: BOOL },
+  "weakSet.is": { argTypes: [DYN], result: BOOL },
+  "weakMap.new": { argTypes: [DYN], result: DYN },
+  "weakSet.new": { argTypes: [DYN], result: DYN },
+  "dyn.fromEntries": { argTypes: [DYN], result: DYN },
+  "arrayBuffer.new": { argTypes: [DYN], result: DYN },
+  "intl.segmenterNew": { argTypes: [], result: DYN },
+  "arrayBuffer.is": { argTypes: [DYN], result: BOOL },
+  "arrayBuffer.isView": { argTypes: [DYN], result: BOOL },
+  "arrayBuffer.byteLengthGetter": { argTypes: [], result: F64 },
+  "arrayBuffer.byteLengthDescriptor": { argTypes: [DYN], result: DYN },
+  "arrayBuffer.viewU8C": { argTypes: [DYN, DYN, DYN], result: bytesOf("u8c") },
+  "arrayBuffer.viewI8": { argTypes: [DYN, DYN, DYN], result: bytesOf("i8") },
+  "arrayBuffer.viewU16": { argTypes: [DYN, DYN, DYN], result: bytesOf("u16") },
+  "arrayBuffer.viewI16": { argTypes: [DYN, DYN, DYN], result: bytesOf("i16") },
+  "arrayBuffer.viewU8": { argTypes: [DYN, DYN, DYN], result: BYTES_U8 },
+  "arrayBuffer.viewU32": { argTypes: [DYN, DYN, DYN], result: bytesOf("u32") },
+  "arrayBuffer.viewI32": { argTypes: [DYN, DYN, DYN], result: bytesOf("i32") },
+  "arrayBuffer.viewF32": { argTypes: [DYN, DYN, DYN], result: bytesOf("f32") },
+  "arrayBuffer.viewF64": { argTypes: [DYN, DYN, DYN], result: bytesOf("f64") },
+  "arrayBuffer.viewDV": { argTypes: [DYN, DYN, DYN], result: BYTES_U8 },
   "dyn.objKeys": { argTypes: [DYN], result: DYN },
+  "dyn.forInKeys": { argTypes: [DYN], result: DYN },
   "dyn.hasOwn": { argTypes: [DYN, STRING], result: BOOL },
   "dyn.assign": { argTypes: [DYN, DYN], result: DYN },
   "dyn.packPush": { argTypes: [DYN, DYN], result: VOID },
@@ -1096,6 +1153,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "dyn.cloneMissing": { argTypes: [], result: DYN },
   "dyn.cloneTransferFail": { argTypes: [], result: DYN },
   "regex.new": { argTypes: [STRING, STRING], result: REGEX },
+  "regex.newChecked": { argTypes: [DYN, DYN], result: REGEX },
   // node:events EventEmitter: receivers are emitter-hierarchy objects and
   // the chaining forms (on/off/removeAll/setMax) return the receiver's
   // own class — program-dependent object types, checked in the libCall
@@ -1120,6 +1178,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "emitter.emitError": { argTypes: [null, STRING, null], result: BOOL },
   "emitter.count": { argTypes: [null, STRING], result: F64 },
   "emitter.countFn": { argTypes: [null, STRING, null], result: F64 },
+  "emitter.countDyn": { argTypes: [null, STRING, DYN], result: F64 },
   "emitter.names": { argTypes: [null], result: VOID },
   "emitter.listeners": { argTypes: [null, STRING], result: VOID },
   "emitter.onData": { argTypes: [null, STRING, null, BOOL, BOOL], result: VOID },
@@ -1376,6 +1435,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   // Arg 0 is a packed f64[] OR a bytes value (the spread-typed-array
   // form) — checked in the libCall case.
   "string.fromCharCode": { argTypes: [null], result: STRING },
+  "string.fromCodePoint": { argTypes: [null], result: STRING },
   "string.lastIndexOf": { argTypes: [STRING, STRING], result: F64 },
   "string.lastIndexOfFrom": { argTypes: [STRING, STRING, F64], result: F64 },
   "string.raw": { argTypes: [arrayOf(STRING), arrayOf(STRING)], result: STRING },
@@ -1586,6 +1646,12 @@ export function validateModule(mod: IrModule): IrValidationError[] {
       errors.push({ message: `duplicate class "${cls.name}"`, loc: cls.loc });
     }
     classesByName.set(cls.name, cls);
+    if (cls.localCaptures !== undefined && (cls.runtime || cls.base !== undefined || cls.genericOf !== undefined)) {
+      errors.push({ message: `class ${cls.name}: local class cannot use a runtime or inherited layout`, loc: cls.loc });
+    }
+    if (cls.jsLength !== undefined && (!Number.isSafeInteger(cls.jsLength) || cls.jsLength < 0)) {
+      errors.push({ message: `class ${cls.name}: invalid constructor length`, loc: cls.loc });
+    }
     const seen = new Set<string>();
     for (const f of cls.fields) {
       if (seen.has(f.name)) {
@@ -1625,6 +1691,9 @@ export function validateModule(mod: IrModule): IrValidationError[] {
     if (!base) {
       errors.push({ message: `class ${cls.name}: undeclared base "${cls.base}"`, loc: cls.loc });
       continue;
+    }
+    if (base.localCaptures !== undefined) {
+      errors.push({ message: `class ${cls.name}: cannot extend a local class`, loc: cls.loc });
     }
     const seen = new Set<string>([cls.name]);
     for (let c: IrClassDef | undefined = base; c; c = c.base !== undefined ? classesByName.get(c.base) : undefined) {
@@ -1883,8 +1952,8 @@ export function validateModule(mod: IrModule): IrValidationError[] {
     }
   };
   for (const g of mod.globals ?? []) {
-    if (g.tdz && g.type.kind !== "record") {
-      errors.push({ message: `TDZ global "${g.name}" must have record storage`, loc: noLoc });
+    if (g.tdz && g.type.kind !== "record" && g.type.kind !== "func" && g.type.kind !== "dyn") {
+      errors.push({ message: `TDZ global "${g.name}" must have record, function, or checked-value storage`, loc: noLoc });
     }
     if (isUnitType(g.type)) {
       errors.push({ message: `global "${g.name}" has bare unit type ${g.type.kind}`, loc: noLoc });
@@ -2027,11 +2096,25 @@ function validateFunction(
     }
     if (p.type.kind === "caught") err(`param "${p.name}" is caught-typed`, fn.loc);
   }
-  for (const c of fn.captures ?? []) {
+  for (const c of [...(fn.captures ?? []), ...(fn.classCaptures ?? [])]) {
     const local = locals.get(c.localId);
     if (!local) err(`capture "${c.name}" has no local entry "${c.localId}"`, fn.loc);
     else if (!local.boxed) err(`capture local "${c.localId}" is not boxed`, fn.loc);
+    else if (!typeEquals(local.type, c.type)) err(`capture local "${c.localId}" has the wrong type`, fn.loc);
     if (c.type.kind === "caught") err(`capture "${c.name}" is caught-typed`, fn.loc);
+  }
+  if (fn.classCaptures !== undefined) {
+    const self = fn.params[0];
+    const cls = self?.type.kind === "object" ? classes.get(self.type.className) : undefined;
+    if (fn.captures !== undefined || cls?.localCaptures === undefined) {
+      err("class captures require a local-class instance receiver and no closure environment", fn.loc);
+    }
+    for (const capture of fn.classCaptures) {
+      const slot = cls?.localCaptures?.[capture.slot];
+      if (!Number.isInteger(capture.slot) || !slot || !typeEquals(slot.type, capture.type)) {
+        err(`class capture "${capture.name}" has an invalid slot or type`, fn.loc);
+      }
+    }
   }
 
   const expectType = (expr: IrExpr, want: IrType, what: string) => {
@@ -2149,6 +2232,7 @@ function validateFunction(
           (e.left.type.kind === "array" ||
             e.left.type.kind === "map" ||
             e.left.type.kind === "set" ||
+            e.left.type.kind === "regex" ||
             e.left.type.kind === "object" ||
             e.left.type.kind === "record" ||
             // Symbol identity IS pointer identity (the frontend's rule).
@@ -2691,19 +2775,15 @@ function validateFunction(
         if (e.source) {
           checkExpr(e.source);
           const sk = e.source.type;
-          if (sk.kind === "bytes") {
-            // Same-elem copies only (cross-kind construction is fenced).
-            if (!typeEquals(sk, e.type)) {
-              err(`bytesNew copy source elem mismatch`, e.loc);
-            }
-          } else if (sk.kind === "array") {
+          if (sk.kind === "array") {
             if (sk.elem.kind !== "f64") {
               err(`bytesNew array source must hold f64, got ${sk.elem.kind}`, e.loc);
             }
-          } else if (sk.kind !== "f64") {
+          } else if (sk.kind !== "f64" && sk.kind !== "bytes" && sk.kind !== "dyn") {
             err(`bytesNew source of kind ${sk.kind}`, e.loc);
           }
         }
+        if (e.from && e.source?.type.kind !== "dyn") err("bytesNew from requires a dyn source", e.loc);
         break;
       }
       case "bytesIntrinsic": {
@@ -2740,6 +2820,9 @@ function validateFunction(
           err(`bytesIntrinsic ${e.method} args[1] must be a strLit encoding`, e.loc);
         }
         const EXTRA_SIGS: Record<string, { argTypes: IrType[]; minArgs: number; result: IrType } | undefined> = {
+          buffer: { argTypes: [], minArgs: 0, result: DYN },
+          setFromDyn: { argTypes: [DYN, F64], minArgs: 1, result: VOID },
+          copyWithin: { argTypes: [F64, F64, F64], minArgs: 3, result: bytesOf(recv.elem) },
           equals: { argTypes: [BYTES_U8], minArgs: 1, result: BOOL },
           compareBuf: { argTypes: [BYTES_U8, F64, F64, F64, F64], minArgs: 1, result: F64 },
           // [needle, align, byteOffset?] — an OMITTED byteOffset is Node's
@@ -2780,7 +2863,7 @@ function validateFunction(
                     : e.method === "toArray"
                       ? { argTypes: [], minArgs: 0, result: arrayOf(F64) }
                 : e.method === "setFrom"
-                  ? { argTypes: [bytesOf(recv.elem), F64], minArgs: 1, result: VOID }
+                  ? { argTypes: [e.args[0]?.type.kind === "bytes" ? e.args[0].type : bytesOf(recv.elem), F64], minArgs: 1, result: VOID }
                   : e.method === "toString" || e.method === "toStringVar"
                     ? { argTypes: [STRING, F64, F64], minArgs: 1, result: STRING }
                     : e.method === "readNum"
@@ -3168,6 +3251,10 @@ function validateFunction(
       }
       case "callValue": {
         checkExpr(e.callee);
+        if (e.receiver !== undefined) {
+          checkExpr(e.receiver);
+          expectType(e.receiver, DYN, "callValue receiver");
+        }
         for (const a of e.args) checkExpr(a);
         if (e.callee.type.kind !== "func") {
           err(`callValue callee is ${e.callee.type.kind}, not func`, e.loc);
@@ -3200,6 +3287,7 @@ function validateFunction(
           break;
         }
         const ctor = functions.get(`%${e.className}.constructor`);
+        if (cls.localCaptures !== undefined) err(`new ${e.className}: local class requires a class value`, e.loc);
         if (!ctor) {
           err(`new ${e.className}: missing constructor function`, e.loc);
           break;
@@ -3308,6 +3396,17 @@ function validateFunction(
         if (!typeEquals(e.type, { kind: "classval", className: e.className })) {
           err(`classRef to "${e.className}" must have that classval type`, e.loc);
         }
+        if ((e.captures === undefined) !== (cls.localCaptures === undefined) ||
+            (e.captures?.length ?? 0) !== (cls.localCaptures?.length ?? 0)) {
+          err(`classRef to "${e.className}" must supply its class captures`, e.loc);
+        }
+        (e.captures ?? []).forEach((id, index) => {
+          const local = locals.get(id);
+          const wanted = cls.localCaptures?.[index];
+          if (!local?.boxed || (wanted && !typeEquals(local.type, wanted.type))) {
+            err(`classRef capture "${id}" must name a box with the declared type`, e.loc);
+          }
+        });
         break;
       }
       case "newValue": {
@@ -3348,6 +3447,8 @@ function validateFunction(
         // Both sides must be hierarchy members: the operand needs a vt
         // word to read; a standalone target class has one possible value
         // and the frontend folds it statically.
+        if (classes.get(e.classValue.type.className)?.localCaptures !== undefined &&
+            e.value.type.kind === "object" && classes.get(e.value.type.className)?.localCaptures !== undefined) break;
         if (!hierarchy.has(e.classValue.type.className)) {
           err(`instanceOfValue against standalone class "${e.classValue.type.className}"`, e.loc);
         }
@@ -3618,6 +3719,10 @@ function validateFunction(
       }
       case "dynCall": {
         checkExpr(e.callee);
+        if (e.receiver !== undefined) {
+          checkExpr(e.receiver);
+          expectType(e.receiver, DYN, "dynCall receiver");
+        }
         expectType(e.callee, DYN, "dynCall callee");
         if (e.type.kind !== "dyn") err(`dynCall must be dyn-typed, got ${e.type.kind}`, e.loc);
         for (const a of e.args) {
@@ -3708,6 +3813,9 @@ function validateFunction(
         checkExpr(e.value);
         expectType(e.value, { kind: "dyn" }, "dynTest operand");
         if (e.type.kind !== "bool") err("dynTest must be bool", e.loc);
+        if (e.bytesElem !== undefined && (e.test !== "bytes" || !Object.hasOwn(BYTES_ELEMENT_NAME, e.bytesElem))) {
+          err("dynTest bytesElem requires a valid bytes test", e.loc);
+        }
         break;
       }
       case "dynKeyGet": {
@@ -4104,13 +4212,13 @@ function validateFunction(
           }
           break;
         }
-        if (e.fn === "string.fromCharCode") {
+        if (e.fn === "string.fromCharCode" || e.fn === "string.fromCodePoint") {
           // One packed f64[] or one bytes value (the spread form).
           const t = e.args[0]?.type;
           const ok =
             t && ((t.kind === "array" && t.elem.kind === "f64") || t.kind === "bytes");
           if (!ok) {
-            err(`libCall string.fromCharCode arg 0: expected number[] or bytes, got ${t?.kind}`, e.loc);
+            err(`libCall ${e.fn} arg 0: expected number[] or bytes, got ${t?.kind}`, e.loc);
           }
           break;
         }
@@ -5186,14 +5294,14 @@ function validateFunction(
           }
           if (e.fn === "emitter.emit" || e.fn === "emitter.emitFlex" || e.fn === "emitter.count" ||
               e.fn === "emitter.getMax" || e.fn === "emitter.ctor" ||
-              e.fn === "emitter.countFn" || e.fn === "emitter.emitError") {
+              e.fn === "emitter.countFn" || e.fn === "emitter.countDyn" || e.fn === "emitter.emitError") {
             if (!typeEquals(e.type, sig.result)) {
               err(`libCall ${e.fn} must be ${sig.result.kind}, got ${e.type.kind}`, e.loc);
             }
             break;
           }
         }
-        if (e.fn === "error.cause" || e.fn === "error.hasCause") {
+        if (e.fn === "error.cause" || e.fn === "error.hasCause" || e.fn === "error.setCause" || e.fn === "error.deleteCause") {
           const recv = e.args[0];
           let cls = recv?.type.kind === "object" ? classes.get(recv.type.className) : undefined;
           while (cls?.base) cls = classes.get(cls.base);

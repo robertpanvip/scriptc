@@ -3,7 +3,7 @@ import { InternalCompilerError } from "../../errors.js";
  * expression lands in a fresh C temp, with RC ownership tracked on the
  * emitter's frames (see the discipline comment in emitter core). */
 import type { CEmitter, Temp } from "./c-emitter.js";
-import { arrayOf, BOOL, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM_T, CHILDWRITER_T, DYN, F64, type IrExpr, type IrLibFn, type IrRecordShape, type IrType, islandPromisePayloadTag, isClassOwnEnumerableFieldName, isDynTypedRefType, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, NETSOCKET_T, RUNTIME_ERROR_CLASSES, STRING, typeEquals, typeKey } from "../../ir/ir.js";
+import { BYTES_ELEMENT_SIZE, arrayOf, BOOL, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM_T, CHILDWRITER_T, DYN, F64, type IrExpr, type IrLibFn, type IrRecordShape, type IrType, islandPromisePayloadTag, classDynViewSupported, isClassOwnEnumerableFieldName, isDynTypedRefType, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, NETSOCKET_T, RUNTIME_ERROR_CLASSES, STRING, typeEquals, typeKey } from "../../ir/ir.js";
 import { BYTES_NUM_KIND_C, BYTES_NUM_VAR_C, bytesElemKindC, cDecl, cFnPtrCast, cNumberLiteral, cStringLiteral, cType, DV_GET_KIND_C, DV_SET_KIND_C, elemAccess, mapKeyAccess, mapKeyKindC, mapValKindC, releaseCallC, retainCallC, vAdapters } from "./types.js";
 import { mangleClassNew, mangleClassRetain, mangleClassStruct, mangleField, mangleFnClosure, mangleFunction, mangleGlobal, mangleLocal, mangleRecordClone, mangleRecordNew, mangleRecordStruct, mangleVtStruct } from "../mangle.js";
 import { OVERFLOW_MEMBER } from "./shapes.js";
@@ -237,6 +237,13 @@ function streamTypedRefAdapter(
   /* Register before walking children: recursive record/array types refer
    * back to this prototype without recursively generating helpers. */
   ctx.adapters.set(key, adapter);
+  if (isDynTypedRefType(t)) {
+    const fields = emitter.classMeta.get(t.className)?.def.fields;
+    if (fields && !classDynViewSupported(fields, (id) => emitter.recordsById.get(id), (id) => emitter.unionsById.get(id))) {
+      adapter.snapshot = "scr_dyn_class_view_unavailable";
+      return adapter;
+    }
+  }
   emitter.walkerProtos.push(
     `static ScrDyn *${snapshot}(void *sc_p); /* materialize live stream value ${key} */`,
   );
@@ -1418,16 +1425,16 @@ function emitStringExpr(
           // The ARM value's ToString via the per-union interned helper
           // (unit arms are interned literals, string arms retain the
           // payload, f64/bool arms format). Box borrowed; result +1.
-          return emitter.newTemp(e.type, `${emitter.unionToStrHelper(v.type.unionId)}(${v.name})`);
+          return emitter.fallibleTemp(e.type, `${emitter.unionToStrHelper(v.type.unionId)}(${v.name})`);
         }
         if (v.type.kind === "caught") {
           // String(e) over the exception snapshot. Box borrowed; result +1.
-          return emitter.newTemp(e.type, `scr_caught_to_string(${v.name})`);
+          return emitter.fallibleTemp(e.type, `scr_caught_to_string(${v.name})`);
         }
         if (v.type.kind === "dyn") {
           // String(unknown): dispatch over the dyn kind (dynToStrHelper —
           // Node's String() incl. arrays-join and "[object Object]").
-          return emitter.newTemp(e.type, `${emitter.dynToStrHelper()}(${v.name})`);
+          return emitter.fallibleTemp(e.type, `${emitter.dynToStrHelper()}(${v.name})`);
         }
         if (v.type.kind === "record") {
           // String(record) / `${record}`: Object.prototype.toString's
@@ -1608,6 +1615,8 @@ function emitStringExpr(
             return emitter.newTemp(e.type, `scr_regex_source(${r.name})`);
           case "flags":
             return emitter.newTemp(e.type, `scr_regex_flags(${r.name})`);
+          case "toString":
+            return emitter.newTemp(e.type, `scr_regex_to_string(${r.name})`);
           case "replace":
             return emitter.newTemp(
               e.type,
@@ -1913,9 +1922,8 @@ function emitContainerExpr(
       case "bytesNew": {
         // Typed-array/Buffer construction; the SOURCE's static type picks
         // the runtime entry (see the node doc). The source is borrowed;
-        // every form hands back +1. Only the f64 (length) form can throw
-        // (Node's "Invalid typed array length" RangeError) — pending check
-        // after the temp joins its frame.
+        // every form hands back +1. Length and checked-input forms can
+        // throw; check after the result joins its ownership frame.
         if (e.type.kind !== "bytes") throw new InternalCompilerError("emitter bug: bytesNew of non-bytes type");
         const kind = bytesElemKindC(e.type.elem);
         if (!e.source) return emitter.newTemp(e.type, `scr_bytes_new(${kind}, 0)`);
@@ -1926,7 +1934,12 @@ function emitContainerExpr(
           return t;
         }
         if (e.source.type.kind === "bytes") {
-          return emitter.newTemp(e.type, `scr_bytes_copy(${src.name})`);
+          return emitter.newTemp(e.type, `scr_bytes_convert(${kind}, ${src.name})`);
+        }
+        if (e.source.type.kind === "dyn") {
+          const t = emitter.newTemp(e.type, `scr_bytes_from_dyn(${kind}, ${src.name}, ${e.from ? "true" : "false"})`);
+          emitter.emitPendingCheck();
+          return t;
         }
         if (e.source.type.kind === "array") {
           return emitter.newTemp(e.type, `scr_bytes_from_arr(${kind}, ${src.name})`);
@@ -1982,7 +1995,7 @@ function emitContainerExpr(
             }
             return emitter.newTemp(
               e.type,
-              `(double)(${r.name}->len * ${e.receiver.type.elem === "u8" ? "1" : e.receiver.type.elem === "f64" ? "8" : "4"})`,
+              `(double)(${r.name}->len * ${BYTES_ELEMENT_SIZE[e.receiver.type.elem]})`,
             );
           case "get":
             // Any invalid index traps (the array runtime's discipline).
@@ -2009,6 +2022,8 @@ function emitContainerExpr(
             );
           case "toReversed":
             return emitter.newTemp(e.type, `scr_bytes_to_reversed(${r.name})`);
+          case "copyWithin":
+            return emitter.newTemp(e.type, `scr_bytes_copy_within(${r.name}, ${args[0]!.name}, ${args[1]!.name}, ${args[2]!.name})`);
           case "with": {
             const out = emitter.newTemp(
               e.type,
@@ -2024,11 +2039,12 @@ function emitContainerExpr(
             );
           case "toArray":
             return emitter.newTemp(e.type, `scr_bytes_to_arr(${r.name})`);
-          case "setFrom": {
+          case "setFrom":
+          case "setFromDyn": {
             // dst.set(src, offset?) — void; throws Node's RangeError on
             // overflow (may-throw seed).
             emitter.line(
-              `scr_bytes_set_from(${r.name}, ${args[0]!.name}, ${args[1]?.name ?? "0"});${emitter.srcComment(e.loc)}`,
+              `${method === "setFromDyn" ? "scr_bytes_set_from_dyn" : "scr_bytes_set_from"}(${r.name}, ${args[0]!.name}, ${args[1]?.name ?? "0"});${emitter.srcComment(e.loc)}`,
             );
             emitter.emitPendingCheck();
             return { name: "", type: e.type };
@@ -2144,6 +2160,8 @@ function emitContainerExpr(
             // 0 for owners, the view's offset into its owner for a
             // DataView. Never throws.
             return emitter.newTemp(e.type, `scr_bytes_byte_offset(${r.name})`);
+          case "buffer":
+            return emitter.newTemp(e.type, `scr_array_buffer_from_bytes(${r.name})`);
           case "dataViewNew": {
             // new DataView(x.buffer, byteOffset?, byteLength?) — receiver
             // is x itself (the frontend peeled `.buffer`). Omitted offset
@@ -2602,18 +2620,22 @@ function emitCallExpr(
       }
       case "callValue": {
         const callee = emitter.emitExpr(e.callee);
+        const receiver = e.receiver === undefined ? null : emitter.emitExpr(e.receiver);
         const args = e.args.map((a) => emitter.emitExpr(a));
         for (const a of args) emitter.moveTemp(a); // callee owns its params
         if (e.callee.type.kind !== "func") throw new InternalCompilerError("emitter bug: callValue on non-func");
         const cast = cFnPtrCast(e.callee.type);
         const argList = [callee.name, ...args.map((a) => a.name)].join(", ");
         const call = `(${cast}${callee.name}->fn)(${argList})`;
+        emitter.line(`scr_dyn_this_push_dyn(${receiver?.name ?? "NULL"});`);
         if (e.type.kind === "void") {
           emitter.line(`${call};${emitter.srcComment(e.loc)}`);
+          emitter.line("scr_dyn_this_pop();");
           if (emitter.indirectMayThrow) emitter.emitPendingCheck();
           return { name: "", type: e.type };
         }
         const t = emitter.newTemp(e.type, call);
+        emitter.line("scr_dyn_this_pop();");
         if (emitter.indirectMayThrow) emitter.emitPendingCheck();
         return t;
       }
@@ -2639,6 +2661,13 @@ function emitCallExpr(
         // address. The +1 retain is a no-op on immortals but keeps the
         // owned-temps discipline uniform (the regexLit pattern).
         const sym = emitter.classObjSym(e.className);
+        if (e.captures !== undefined) {
+          const value = emitter.newTemp(e.type, `scr_classobj_new(&${sym}, ${e.captures.length})`);
+          e.captures.forEach((id, slot) => {
+            emitter.line(`${value.name}->caps[${slot}] = scr_box_retain(${mangleLocal(id)});`);
+          });
+          return value;
+        }
         return emitter.newTemp(e.type, `scr_classobj_retain(&${sym})`);
       }
       case "newValue": {
@@ -2658,8 +2687,8 @@ function emitCallExpr(
         const args = e.args.map((a) => emitter.emitExpr(a));
         for (const a of args) emitter.moveTemp(a); // the constructor owns its params
         const paramTypes = ctor.params.slice(1).map((p) => cType(p.type).trim());
-        const cast = `(void *(*)(${paramTypes.join(", ") || "void"}))`;
-        const call = `(${cast}${callee.name}->ctor)(${args.map((a) => a.name).join(", ")})`;
+        const cast = `(void *(*)(ScrClassObj *${paramTypes.length ? ", " + paramTypes.join(", ") : ""}))`;
+        const call = `(${cast}${callee.name}->ctor)(${[callee.name, ...args.map((a) => a.name)].join(", ")})`;
         const t = emitter.newTemp(e.type, `(${cType(e.type).trim()})${call}`);
         if (newValueMayThrow(cls, emitter.classMeta.get(cls), emitter.mayThrow)) emitter.emitPendingCheck();
         return t;
@@ -2670,6 +2699,9 @@ function emitCallExpr(
         // sides are hierarchy members, so the operand has a vt word.
         const v = emitter.emitExpr(e.value);
         const target = emitter.emitExpr(e.classValue);
+        if (e.value.type.kind === "object" && emitter.classMeta.get(e.value.type.className)?.def.localCaptures !== undefined) {
+          return emitter.newTemp(e.type, `${v.name}->sc_class == ${target.name}`);
+        }
         return emitter.newTemp(
           e.type,
           `${v.name}->vt->pre >= ${target.name}->pre && ${v.name}->vt->pre <= ${target.name}->post`,
@@ -2906,6 +2938,14 @@ function emitDynamicExpr(
         // with the frame as usual. The callee's source spelling rides
         // along for Node's "<name> is not a function" TypeError.
         const callee = emitter.emitExpr(e.callee);
+        const receiver = e.receiver === undefined ? null : emitter.emitExpr(e.receiver);
+        const invoke = (call: string): Temp => {
+          emitter.line(`scr_dyn_this_push_dyn(${receiver?.name ?? "NULL"});`);
+          const result = emitter.newTemp(e.type, call);
+          emitter.line("scr_dyn_this_pop();");
+          emitter.emitPendingCheck();
+          return result;
+        };
         const what = cStringLiteral(Buffer.from(e.calleeName, "utf8"));
         if (e.spreads !== undefined && e.spreads.length > 0) {
           // The RUNTIME-ARITY form (`f(...args)`): one fresh dyn array
@@ -2929,7 +2969,7 @@ function emitDynamicExpr(
               emitter.line(`scr_dyn_arr_push(${pack.name}, ${v.name});`);
             }
           });
-          return emitter.fallibleTemp(e.type, `scr_dyn_apply(${callee.name}, ${pack.name}, ${what})`);
+          return invoke(`scr_dyn_apply(${callee.name}, ${pack.name}, ${what})`);
         }
         const args = e.args.map((a) => emitter.emitExpr(a));
         let argsExpr = "NULL";
@@ -2938,10 +2978,7 @@ function emitDynamicExpr(
           emitter.line(`ScrDyn *${arr}[${args.length}] = { ${args.map((a) => a.name).join(", ")} };`);
           argsExpr = arr;
         }
-        return emitter.fallibleTemp(
-          e.type,
-          `scr_dyn_call(${callee.name}, ${argsExpr}, ${args.length}, ${what})`,
-        );
+        return invoke(`scr_dyn_call(${callee.name}, ${argsExpr}, ${args.length}, ${what})`);
       }
       case "dynInvoke": {
         // Prototype-method dispatch on a dyn receiver: everything is
@@ -3185,22 +3222,9 @@ function emitDynamicExpr(
         return emitter.fallibleTemp(e.type, call);
       }
       case "dynHasKey": {
-        // `"k" in pkg`: a kind-guarded presence answer, computed against
-        // the literal key at compile time — no allocation, borrowed box.
-        // An ISLAND-held receiver fences loudly (Node asks the real
-        // engine object — `false` would be a silent wrong answer), so
-        // the temp rides the fallible path.
-        const d = emitter.emitExpr(e.value);
-        const keyBytes = Buffer.from(e.key, "utf8");
-        const keyLit = cStringLiteral(keyBytes);
-        const objTest = `scr_dyn_obj_get(${d.name}, ${keyLit}, ${keyBytes.length}) != NULL`;
-        const arrTest =
-          e.key === "length"
-            ? "true"
-            : /^(0|[1-9][0-9]*)$/.test(e.key) && Number(e.key) <= Number.MAX_SAFE_INTEGER
-              ? `${d.name}->v.arr.len > ${e.key}`
-              : "false";
-        const test = `(${d.name}->kind == SCR_DYN_OBJ ? (${objTest}) : ${d.name}->kind == SCR_DYN_ARR ? (${arrTest}) : scr_dyn_isl_fence(${d.name}, "'in'"))`;
+        const value = emitter.emitExpr(e.value);
+        const key = emitter.emitExpr({ kind: "strLit", value: e.key, type: STRING, loc: e.loc });
+        const test = `scr_dyn_has_key(${value.name}, ${key.name})`;
         return emitter.fallibleTemp(e.type, e.negated ? `!${test}` : test);
       }
       case "dynScalarEq": {
@@ -3231,6 +3255,14 @@ function emitDynamicExpr(
         // kind, so the calls stay unconditional); narrowing never changes
         // representation (SEMANTICS.md).
         const d = emitter.emitExpr(e.value);
+        if (e.test === "bytes") {
+          const test = `scr_dyn_bytes_is(${d.name}, ${bytesElemKindC(e.bytesElem ?? "u8")})`;
+          return emitter.newTemp(e.type, e.negated ? `!${test}` : test);
+        }
+        if (e.test === "buffer") {
+          const test = `(${d.name}->kind == SCR_DYN_BYTES && ${d.name}->buffer)`;
+          return emitter.newTemp(e.type, e.negated ? `!${test}` : test);
+        }
         const test =
           e.test === "nullish"
             ? `(${d.name}->kind == SCR_DYN_UNDEF || ${d.name}->kind == SCR_DYN_NULL)`
@@ -3238,7 +3270,7 @@ function emitDynamicExpr(
               ? // `typeof v === "object"`: objects, arrays, bytes, native
                 // handles, promises, AND null — engine-held objects by the
                 // engine's own typeof.
-                `(${d.name}->kind == SCR_DYN_OBJ || ${d.name}->kind == SCR_DYN_ARR || ${d.name}->kind == SCR_DYN_BYTES || ${d.name}->kind == SCR_DYN_HANDLE || ${d.name}->kind == SCR_DYN_PROMISE || ${d.name}->kind == SCR_DYN_NULL || scr_dyn_isl_typeof_is(${d.name}, "object"))`
+                `(${d.name}->kind == SCR_DYN_OBJ || ${d.name}->kind == SCR_DYN_ARR || ${d.name}->kind == SCR_DYN_BYTES || ${d.name}->kind == SCR_DYN_HANDLE || ${d.name}->kind == SCR_DYN_PROMISE || ${d.name}->kind == SCR_DYN_PROXY || ${d.name}->kind == SCR_DYN_NULL || scr_dyn_isl_typeof_is(${d.name}, "object"))`
               : e.test === "truthy"
                 ? // Runtime ToBoolean includes typed-reference capsules and
                   // keeps this backend in lockstep with LLVM.
@@ -3256,7 +3288,7 @@ function emitDynamicExpr(
                     : e.test === "function"
                       ? `(${d.name}->kind == SCR_DYN_FUNC || scr_dyn_isl_typeof_is(${d.name}, "function"))`
                       : `${d.name}->kind == ${
-                          { string: "SCR_DYN_STR", number: "SCR_DYN_NUM", boolean: "SCR_DYN_BOOL", undefined: "SCR_DYN_UNDEF", null: "SCR_DYN_NULL", bytes: "SCR_DYN_BYTES" }[e.test]
+                          { bigint: "SCR_DYN_BIGINT", string: "SCR_DYN_STR", number: "SCR_DYN_NUM", boolean: "SCR_DYN_BOOL", undefined: "SCR_DYN_UNDEF", null: "SCR_DYN_NULL", bytes: "SCR_DYN_BYTES" }[e.test]
                         }`;
         return emitter.newTemp(e.type, e.negated ? `!(${test})` : test);
       }
@@ -3404,11 +3436,10 @@ function emitIntrinsicExpr(
           emitter.moveTemp(reason); // the cell takes ownership
           const rc = vAdapters(t);
           if (t.kind === "dyn") {
-            // The thrown-dyn representation (REF + dyn adapters): catch
-            // bindings and the unhandled dispatch see the dyn value
-            // itself — identity preserved.
+            // Preserve Error classification and checked-value identity
+            // through promise rejection and catch observers.
             emitter.line(
-              `scr_throw_ref_classified(${reason.name}, &${rc.retain}, &${rc.release}, NULL, scr_dyn_is_object(${reason.name}));${emitter.srcComment(e.loc)}`,
+              `scr_dyn_throw(${reason.name});${emitter.srcComment(e.loc)}`,
             );
           } else {
             emitter.line(
@@ -3671,9 +3702,11 @@ function emitAsyncExpr(
             } else if (t.kind === "symbol" || t.kind === "bigint" || t.kind === "func" || t.kind === "classval") {
               const rc = vAdapters(t);
               emitter.line(`scr_throw_primitive_ref(${a.name}, &${rc.retain}, &${rc.release}, NULL);${emitter.srcComment(e.loc)}`);
-            } else if (t.kind === "dyn" || t.kind === "jsval") {
+            } else if (t.kind === "dyn") {
+              emitter.line(`scr_dyn_throw(${a.name});${emitter.srcComment(e.loc)}`);
+            } else if (t.kind === "jsval") {
               const rc = vAdapters(t);
-              const test = t.kind === "dyn" ? "scr_dyn_is_object" : "scr_jsval_is_object";
+              const test = "scr_jsval_is_object";
               emitter.line(`scr_throw_ref_classified(${a.name}, &${rc.retain}, &${rc.release}, ${emitter.traceArgC(t)}, ${test}(${a.name}));${emitter.srcComment(e.loc)}`);
             } else {
               const rc = vAdapters(t);
@@ -3734,9 +3767,11 @@ function emitAsyncExpr(
           } else if (t.kind === "symbol" || t.kind === "bigint" || t.kind === "func" || t.kind === "classval") {
             const rc = vAdapters(t);
             emitter.line(`scr_throw_primitive_ref(${a.name}, &${rc.retain}, &${rc.release}, NULL);${emitter.srcComment(e.loc)}`);
-          } else if (t.kind === "dyn" || t.kind === "jsval") {
+          } else if (t.kind === "dyn") {
+            emitter.line(`scr_dyn_throw(${a.name});${emitter.srcComment(e.loc)}`);
+          } else if (t.kind === "jsval") {
             const rc = vAdapters(t);
-            const test = t.kind === "dyn" ? "scr_dyn_is_object" : "scr_jsval_is_object";
+            const test = "scr_jsval_is_object";
             emitter.line(`scr_throw_ref_classified(${a.name}, &${rc.retain}, &${rc.release}, ${emitter.traceArgC(t)}, ${test}(${a.name}));${emitter.srcComment(e.loc)}`);
           } else {
             const rc = vAdapters(t);
@@ -4305,6 +4340,8 @@ function emitWebLibCall(state: LibCallState): Temp {
             return finish(`scr_fetch_static(${arg(0)}, ${arg(1)})`);
           case "fetch.responseNew":
             return finish(`scr_fetch_response_new(${arg(0)}, ${arg(1)})`);
+          case "fetch.responseArrayBuffer":
+            return finish(`scr_fetch_response_array_buffer(${arg(0)})`);
           case "fetch.responseJson":
             return finish(`scr_fetch_response_json(${arg(0)})`);
           case "fetch.responseText":
@@ -4419,6 +4456,12 @@ function emitDynamicLibCall(state: LibCallState): Temp {
             // Object.defineProperties over dyn values: both borrowed,
             // result the target (+1); throws catchably (may-throw seed).
             return finish(`scr_dyn_define_props(${arg(0)}, ${arg(1)})`);
+          case "dyn.defineProperty":
+            return finish(`scr_dyn_define_property(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "dyn.getOwnPropertyDescriptor":
+            return finish(`scr_dyn_get_own_property_descriptor(${arg(0)}, ${arg(1)})`);
+          case "dyn.arrayProtoCall":
+            return finish(`scr_dyn_array_proto_call(${arg(0)}, ${arg(1)}, ${arg(2)})`);
           case "dyn.hasKey":
             // `k in v` with a runtime key: the dyn presence answer (both
             // borrowed, no allocation, never throws).
@@ -4428,12 +4471,30 @@ function emitDynamicLibCall(state: LibCallState): Temp {
             // member retains the value in); throws Node's TypeErrors on
             // non-object receivers (may-throw seed set).
             return finish(`scr_dyn_key_set(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "dyn.keySetComputed":
+            return finish(`scr_dyn_key_set_computed(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "dyn.keyDelete":
+            return finish(`scr_dyn_key_delete(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "dyn.globalSymbolGet":
+            return finish(`scr_dyn_global_symbol_get(${arg(0)})`);
+          case "dyn.globalSymbolSet":
+            return finish(`scr_dyn_global_symbol_set(${arg(0)}, ${arg(1)})`);
+          case "dyn.globalSymbolHas":
+            return finish(`scr_dyn_global_symbol_has(${arg(0)})`);
+          case "dyn.globalSymbolDelete":
+            return finish(`scr_dyn_global_symbol_delete(${arg(0)})`);
+          case "dyn.typedRefIs":
+            return finish(`scr_dyn_typed_ref_is_key(${arg(0)}, ${arg(1)})`);
           case "dyn.iterPack":
             // Destructuring/for-of pack over a dyn source: both borrowed,
             // fresh array +1; throws V8's not-iterable TypeError on
             // non-iterable dyn kinds and drains wrapped engine values
             // through the engine's protocol (may-throw seed set).
             return finish(`scr_dyn_iter_pack(${arg(0)}, ${arg(1)})`);
+          case "dyn.mapSeedEntries":
+            return finish(`scr_dyn_map_seed_entries(${arg(0)})`);
+          case "dyn.mapSeedEntry":
+            return finish(`scr_dyn_map_seed_entry(${arg(0)})`);
           case "dyn.arrLen":
             // The for-of pack's length (borrowed; never throws).
             return finish(`scr_dyn_arr_len(${arg(0)})`);
@@ -4446,21 +4507,33 @@ function emitDynamicLibCall(state: LibCallState): Temp {
             return finish(`scr_dyn_typeof(${arg(0)})`);
           case "dyn.objectTag":
             return finish(`scr_dyn_object_tag(${arg(0)})`);
+          case "dyn.freeze": return finish(`scr_dyn_freeze(${arg(0)})`);
+          case "dyn.isFrozen": return finish(`scr_dyn_is_frozen(${arg(0)})`);
+          case "dyn.nativeSetIs": return finish(`scr_dyn_native_set_is(${arg(0)})`);
+          case "dyn.nativeRegexIs": return finish(`scr_dyn_native_regex_is(${arg(0)})`);
           case "dyn.toString":
             // Receiver-kind-dispatched toString (+1); throws Node's
             // TypeError on undefined/null and the "is not a function"
             // TypeError on null-prototype dictionaries (may-throw seed
             // set) — args[2] carries the call's source spelling.
-            return finish(`scr_dyn_to_string_method(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+            return finish(`scr_dyn_to_string_argument(${arg(0)}, ${arg(1)}, ${arg(2)})`);
           case "dyn.toStringCoerce":
             // +1 string or NULL with the exception pending (user
             // toString/valueOf throws propagate). Borrows the dyn.
             return finish(`scr_dyn_string_coerce_js(${arg(0)})`);
+          case "dyn.numberConstructor":
+            return finish(`scr_dyn_number_constructor(${arg(0)})`);
           case "dyn.toNumberCoerce":
             // JS ToNumber (number-hint valueOf/toString protocol). A
             // thrown hook leaves the exception pending; the may-throw
             // epilogue abandons the NaN dummy.
             return finish(`scr_dyn_number_coerce(${arg(0)})`);
+          case "dyn.add":
+            return finish(`scr_dyn_add(${arg(0)}, ${arg(1)})`);
+          case "dyn.proxyNew":
+            return finish(`scr_dyn_proxy_new(${arg(0)}, ${arg(1)})`);
+          case "global.native":
+            return finish(`scr_global_native(${arg(0)})`);
           case "global.undefRead":
             // A declare-d const nothing defines: Node's catchable
             // ReferenceError at the access (always throws — the typed
@@ -4471,8 +4544,50 @@ function emitDynamicLibCall(state: LibCallState): Temp {
             );
           case "dyn.this":
             return finish(`scr_dyn_this_get()`);
+          case "dyn.fromEntries":
+            return finish(`scr_dyn_from_entries(${arg(0)})`);
+          case "weakSet.new":
+            return finish(`scr_weak_set_new(${arg(0)})`);
+          case "weakMap.is":
+            return finish(`scr_weak_map_is(${arg(0)})`);
+          case "weakSet.is":
+            return finish(`scr_weak_set_is(${arg(0)})`);
+          case "weakMap.new":
+            return finish(`scr_weak_map_new(${arg(0)})`);
+          case "arrayBuffer.new":
+            return finish(`scr_array_buffer_new(${arg(0)})`);
+          case "arrayBuffer.is":
+            return finish(`scr_array_buffer_is(${arg(0)})`);
+          case "arrayBuffer.isView":
+            return finish(`scr_array_buffer_is_view(${arg(0)})`);
+          case "arrayBuffer.byteLengthGetter":
+            return finish(`scr_array_buffer_byte_length_getter()`);
+          case "arrayBuffer.byteLengthDescriptor":
+            return finish(`scr_array_buffer_byte_length_descriptor(${arg(0)})`);
+          case "arrayBuffer.viewU8C":
+            return finish(`scr_array_buffer_view_u8c(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "arrayBuffer.viewI8":
+            return finish(`scr_array_buffer_view_i8(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "arrayBuffer.viewU16":
+            return finish(`scr_array_buffer_view_u16(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "arrayBuffer.viewI16":
+            return finish(`scr_array_buffer_view_i16(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "arrayBuffer.viewU8":
+            return finish(`scr_array_buffer_view_u8(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "arrayBuffer.viewU32":
+            return finish(`scr_array_buffer_view_u32(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "arrayBuffer.viewI32":
+            return finish(`scr_array_buffer_view_i32(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "arrayBuffer.viewF32":
+            return finish(`scr_array_buffer_view_f32(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "arrayBuffer.viewF64":
+            return finish(`scr_array_buffer_view_f64(${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "arrayBuffer.viewDV":
+            return finish(`scr_array_buffer_view_dv(${arg(0)}, ${arg(1)}, ${arg(2)})`);
           case "dyn.objKeys":
             return finish(`scr_dyn_obj_keys(${arg(0)})`);
+          case "dyn.forInKeys":
+            return finish(`scr_dyn_for_in_keys(${arg(0)})`);
           case "dyn.assign":
             // Object.assign over dyn values: own members copy, the target
             // returns (+1); non-object receivers throw like Node.
@@ -4719,13 +4834,15 @@ function emitFilesystemLibCall(state: LibCallState): Temp {
             return finish(
               `(scr_fs_stream_opts_chk(${arg(0)}, ${arg(1)}, ${arg(2)}), ${isRefCounted(e.type) ? `(${cType(e.type).trim()})NULL` : "0"})`,
             );
-          // The fs Buffer forms (scr_bytes_io.c): the sync pair throws
+          // The fs Buffer forms (scr_bytes_io.c): the sync forms throw
           // like the utf8 forms (may-throw seed set); the promise form
           // rejects instead.
           case "fs.readFileSyncBytes":
             return finish(`scr_fs_read_file_bytes(${arg(0)})`);
           case "fs.writeFileSyncBytes":
             return finish(`scr_fs_write_file_bytes(${arg(0)}, ${arg(1)})`);
+          case "fs.appendFileSyncBytes":
+            return finish(`scr_fs_append_file_bytes(${arg(0)}, ${arg(1)})`);
           case "fsp.readFileBytes":
             return finish(`scr_fsp_read_file_bytes(${arg(0)})`);
           // zlib (scr_zlib.c — linked only when these appear on the IR):
@@ -4841,6 +4958,8 @@ function emitFilesystemLibCall(state: LibCallState): Temp {
           }
           case "fs.realpathSync":
             return finish(`scr_fs_realpath(${arg(0)})`);
+          case "fs.realpathNativeSync":
+            return finish(`scr_fs_realpath_promise(${arg(0)})`);
           // The fs option forms (scr_lib.c) — all in the may-throw seed,
           // like the rest of sync fs.
           case "fs.mkdirRecursiveSync":
@@ -5061,6 +5180,8 @@ function emitPathUrlLibCall(state: LibCallState): Temp {
           }
           case "url.new":
             return finish(`scr_url_new(${arg(0)})`);
+          case "url.newBase":
+            return finish(`scr_url_new_base(${arg(0)}, ${arg(1)})`);
           case "url.protocol":
             return finish(`scr_url_protocol(${arg(0)})`);
           case "url.origin":
@@ -5089,6 +5210,8 @@ function emitPathUrlLibCall(state: LibCallState): Temp {
           // may-throw seed (the win32 arm's UNC TypeErrors).
           case "url.pathToFileURLWin32":
             return finish(`scr_url_from_path(${arg(0)})`);
+          case "url.pathToFileURLPlatform":
+            return finish(`scr_url_from_path_platform(${arg(0)}, ${arg(1)})`);
           // URLSearchParams (scr_url.c — always linked with the url unit).
           // Constructions come back +1; sp.fromPairs throws Node's
           // ERR_INVALID_TUPLE catchably (may-throw seed set). Mutators are
@@ -5340,6 +5463,8 @@ function emitPrimitiveLibCall(state: LibCallState): Temp {
             return finish(`scr_num_same_value(${arg(0)}, ${arg(1)})`);
           // Intl.NumberFormat("en-US").format / toLocaleString("en-US")
           // with default options (scr_lib.c). +1 string; no throw.
+          case "intl.segmenterNew":
+            return finish(`scr_intl_segmenter_new()`);
           case "intl.numFormatEnUs":
             return finish(`scr_intl_num_format_en_us(${arg(0)})`);
           // The URL surface (scr_url.c): construction and the two
@@ -5523,6 +5648,10 @@ function emitPrimitiveLibCall(state: LibCallState): Temp {
                 ? `scr_str_from_char_code_bytes(${arg(0)})`
                 : `scr_str_from_char_code(${arg(0)})`,
             );
+          case "string.fromCodePoint":
+            return finish(e.args[0]!.type.kind === "bytes"
+              ? `scr_str_from_code_point_bytes(${arg(0)})`
+              : `scr_str_from_code_point(${arg(0)})`);
           case "string.lastIndexOf":
             return finish(`scr_str_last_index_of(${arg(0)}, ${arg(1)})`);
           case "string.lastIndexOfFrom":
@@ -5639,6 +5768,10 @@ function emitCryptoBytesLibCall(state: LibCallState): Temp {
           // leniently (never throws), concat copies its borrowed list.
           case "buffer.fromStr":
             return finish(`scr_bytes_from_str(${arg(0)}, ${arg(1)})`);
+          case "buffer.brand":
+            return finish(`scr_bytes_as_buffer(${arg(0)})`);
+          case "buffer.fromDyn":
+            return finish(`scr_buffer_from_dyn(${arg(0)}, ${arg(1)})`);
           case "buffer.concat":
             return finish(`scr_bytes_concat(${arg(0)})`);
           case "buffer.concatLen":
@@ -7904,6 +8037,9 @@ function emitProcessLibCall(state: LibCallState): Temp {
             return finish(`scr_process_cwd()`);
           case "process.stdoutWrite":
             return finish(`scr_process_stdout_write(${arg(0)})`);
+          case "process.stdio":
+            emitter.usesTimers = true;
+            return finish(`scr_process_stdio(${arg(0)})`);
           case "process.stderrWrite":
             return finish(`scr_process_stderr_write(${arg(0)})`);
           case "process.envGet": {
@@ -8043,6 +8179,14 @@ function emitProcessLibCall(state: LibCallState): Temp {
           }
           case "process.arch":
             return finish(`scr_process_arch()`);
+          case "process.versions":
+            return finish(`scr_process_versions()`);
+          case "process.builtinId":
+            return finish(`scr_process_builtin_id(${arg(0)}, ${arg(1)})`);
+          case "process.builtinModule":
+            return finish(`scr_process_builtin_module(${arg(0)}, ${arg(1)})`);
+          case "process.builtinUnsupported":
+            return finish(`scr_process_builtin_unsupported(${arg(0)}, ${arg(1)})`);
           case "process.versionsNode":
             return finish(`scr_process_versions_node()`);
           case "process.versionsOpenssl":
@@ -8223,6 +8367,10 @@ function emitErrorsEventsLibCall(state: LibCallState): Temp {
             return finish(`scr_error_cause((ScrError *)${arg(0)})`);
           case "error.hasCause":
             return finish(`scr_error_has_cause((ScrError *)${arg(0)})`);
+          case "error.setCause":
+            return finish(`scr_error_set_cause((ScrError *)${arg(0)}, ${arg(1)})`);
+          case "error.deleteCause":
+            return finish(`scr_error_delete_cause((ScrError *)${arg(0)})`);
           case "error.toString":
             // Borrowed receiver; +1 "name: message" (Node's toString rules).
             return finish(`scr_error_to_string((ScrError *)${arg(0)})`);
@@ -8245,6 +8393,7 @@ function emitErrorsEventsLibCall(state: LibCallState): Temp {
             // Borrowed receiver + borrowed options; +1 %DOMException.
             // Option errors throw (may-throw seed set).
             return finish(`scr_domex_clone(${arg(0)}, ${arg(1)})`);
+          case "regex.newChecked": return finish(`scr_regex_new_checked(${arg(0)}, ${arg(1)})`);
           case "regex.new":
             // Eager compile: bad patterns/flags throw catchable
             // SyntaxError (may-throw seed set). Borrowed strings; +1.
@@ -8372,6 +8521,8 @@ function emitErrorsEventsLibCall(state: LibCallState): Temp {
             return finish(`scr_emitter_listener_count((ScrEmitter *)${arg(0)}, ${arg(1)})`);
           case "emitter.countFn":
             return finish(`scr_emitter_listener_count_fn((ScrEmitter *)${arg(0)}, ${arg(1)}, ${arg(2)})`);
+          case "emitter.countDyn":
+            return finish(`scr_emitter_listener_count_dyn((ScrEmitter *)${arg(0)}, ${arg(1)}, ${arg(2)})`);
           case "emitter.names":
             // +1 string[] in first-registration order.
             return finish(`scr_emitter_event_names((ScrEmitter *)${arg(0)})`);
@@ -9068,6 +9219,9 @@ function emitLibCallExpr(emitter: CEmitter, e: LibCallExpr): Temp {
     case "island":
     case "json":
       return emitWebLibCall(state);
+    case "weakSet":
+    case "weakMap":
+    case "arrayBuffer":
     case "dyn":
     case "global":
       return emitDynamicLibCall(state);

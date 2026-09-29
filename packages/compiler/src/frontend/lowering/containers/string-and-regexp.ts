@@ -5,7 +5,8 @@ import { locOf } from "../../program.js";
 import type { Lowerer } from "../lowerer.js";
 import { nodeThrowExpr, own } from "../lowerer.js";
 import { isRequireMainFilename } from "../expressions/optional-chains.js";
-import { STRING_INDEX_METHODS, STR_METHODS } from "../surfaces.js";
+import { STRING_INDEX_METHODS, STRING_REPLACE_METHODS, STR_METHODS } from "../surfaces.js";
+import { lowerStringReplacement } from "./string-replacement.js";
 import { coerceStringSearchValue, defaultAfterUndefined, lowerOptionalArgument, lowerPositionArgument, lowerStaticallyUndefinedArgument, lowerStringSearchArgument, positionNumber } from "../optional-arguments.js";
 
 function lowerSplitLimitArg(lowerer: Lowerer, node: ts.Expression | undefined, loc: SrcLoc): IrExpr {
@@ -26,7 +27,7 @@ export function lowerStringSplitCall(
 ): IrExpr {
   const loc = locOf(call);
   if (argumentNodes.length > 2 || argumentNodes.some(ts.isSpreadElement)) {
-    return lowerer.noLowering(`.split with ${argumentNodes.length} arguments`, call);
+    lowerer.noLowering(`.split with ${argumentNodes.length} arguments`, call);
   }
   const separatorNode = argumentNodes[0];
   const undefinedSeparator = separatorNode ? lowerStaticallyUndefinedArgument(lowerer, separatorNode) : null;
@@ -37,6 +38,14 @@ export function lowerStringSplitCall(
       : strLit("undefined", loc)
     : lowerer.lowerExpr(separatorNode);
   if (separator.type.kind === "nullT") separator = defaultAfterUndefined(separator, strLit("null", loc));
+  // JS functions returning null use a boxed ABI. Recover the nullish
+  // value through a checked union; keep object/@@split forms fenced.
+  if (separator.type.kind === "dyn" && separatorNode && (lowerer.typeOf(separatorNode).flags & ts.TypeFlags.Null) !== 0) {
+    separator = {
+      kind: "dynCheck", value: separator,
+      type: { kind: "union", unionId: lowerer.unions.intern([{ kind: "nullT" }, UNDEFINED_T]) }, loc,
+    };
+  }
   const scalar = separator.type.kind === "string" || separator.type.kind === "f64" ||
     separator.type.kind === "bool" || separator.type.kind === "bigint" ||
     (separator.type.kind === "union" && (lowerer.unions.get(separator.type.unionId)?.arms.every((arm) =>
@@ -154,7 +163,7 @@ export function lowerStringIndexCall(
 ): IrExpr {
   const loc = locOf(call);
   if (argumentNodes.length > 1 || argumentNodes.some(ts.isSpreadElement)) {
-    return lowerer.noLowering(`String.prototype.${method} with ${argumentNodes.length} arguments`, call);
+    lowerer.noLowering(`String.prototype.${method} with ${argumentNodes.length} arguments`, call);
   }
   const indexNode = argumentNodes[0];
   let index = lowerPositionArgument(lowerer, indexNode, numLit(0, loc));
@@ -163,7 +172,7 @@ export function lowerStringIndexCall(
   }
   const valueType = method === "at" ? STRING : F64;
   const resultType = lowerer.withUndefinedArmOf(valueType);
-  if (!resultType || resultType.kind !== "union") return lowerer.noLowering(`String.prototype.${method} result`, call);
+  if (!resultType || resultType.kind !== "union") lowerer.noLowering(`String.prototype.${method} result`, call);
   const undefinedTag = lowerer.armTag(resultType.unionId, UNDEFINED_T);
   const valueTag = lowerer.armTag(resultType.unionId, valueType);
   const key = `str.index:${method}:${typeKey(receiver.type)}:${typeKey(index.type)}`;
@@ -279,7 +288,7 @@ export function lowerStringPaddingCall(
   argumentNodes: readonly ts.Expression[],
 ): IrExpr {
   if (argumentNodes.length > 2) {
-    return lowerer.noLowering(`.${method} with ${argumentNodes.length} arguments`, call);
+    lowerer.noLowering(`.${method} with ${argumentNodes.length} arguments`, call);
   }
   const loc = locOf(call);
   const maxLength = lowerPositionArgument(lowerer, argumentNodes[0], numLit(0, loc));
@@ -456,7 +465,7 @@ export function lowerRegexMethodCall(lowerer: Lowerer, call: ts.CallExpression,
     const receiver = nullableStringRecv
       ? lowerMethodReceiver(lowerer, access.expression, STRING, access.name.text)
       : lowerReceiver();
-    const re = lowerer.lowerExpr(arg0);
+    const re = lowerer.lowerExprExpecting(arg0, { kind: "regex" });
     // RegExpMatchArray | null maps to the string[] | null union by
     // itself; intern it directly when the checker's spelling doesn't —
     // or when it maps to something WIDER (an optional-chain call node
@@ -481,7 +490,7 @@ export function lowerRegexMethodCall(lowerer: Lowerer, call: ts.CallExpression,
     if (!arg0 || lowerer.mapTypeOf(lowerer.typeOf(arg0))?.kind !== "regex") return null; // string-pattern form: the SC2020 fence
     if (call.arguments.length !== 1) return null;
     const receiver = lowerReceiver();
-    const re = lowerer.lowerExpr(arg0);
+    const re = lowerer.lowerExprExpecting(arg0, { kind: "regex" });
     return {
       kind: "regexIntrinsic",
       method: "matchAll",
@@ -500,7 +509,7 @@ export function lowerRegexMethodCall(lowerer: Lowerer, call: ts.CallExpression,
     if (!arg0 || lowerer.mapTypeOf(lowerer.typeOf(arg0))?.kind !== "regex") return null; // string-pattern form: the SC2020 fence
     if (call.arguments.length !== 1) return null;
     const receiver = lowerReceiver();
-    const re = lowerer.lowerExpr(arg0);
+    const re = lowerer.lowerExprExpecting(arg0, { kind: "regex" });
     return { kind: "regexIntrinsic", method: "search", receiver, args: [re], type: F64, loc };
   }
   if (
@@ -514,14 +523,25 @@ export function lowerRegexMethodCall(lowerer: Lowerer, call: ts.CallExpression,
     // both IR backends and the runtime have one required (regex, limit)
     // shape; an optional-number value selects the default at runtime.
     const args = name === "split"
-      ? [lowerer.lowerExpr(arg0), lowerSplitLimitArg(lowerer, call.arguments[1], loc)]
-      : call.arguments.map((a) => lowerer.lowerExpr(a));
-    if (name !== "split" && args[1]?.type.kind !== "string") {
-      lowerer.unsupported(
-        "SC1120",
-        call.arguments[1] ?? call,
-        "function replacement values (replacements must be string templates)",
-      );
+      ? [lowerer.lowerExprExpecting(arg0, { kind: "regex" }), lowerSplitLimitArg(lowerer, call.arguments[1], loc)]
+      : call.arguments.map((a, index) => index === 0 ? lowerer.lowerExprExpecting(a, { kind: "regex" }) : lowerer.lowerExpr(a));
+    if (name !== "split") {
+      const replacement = args[1];
+      const templateType = (type: IrType): boolean => type.kind === "union"
+        ? lowerer.unions.get(type.unionId)!.arms.every(templateType)
+        : type.kind === "string" || type.kind === "f64" || type.kind === "bool" ||
+          type.kind === "bigint" || isUnitType(type);
+      if (!replacement || !templateType(replacement.type)) {
+        lowerer.unsupported(
+          "SC1120",
+          call.arguments[1] ?? call,
+          "function replacement values (replacements must be string templates)",
+        );
+      }
+      // Array iteration can carry an explicit undefined even when the
+      // checker spells string. RegExp replacement applies ToString once,
+      // including when the pattern has no match; it does not call that value.
+      args[1] = coerceStringSearchValue(lowerer, replacement, call.arguments[1]!, loc);
     }
     return {
       kind: "regexIntrinsic",
@@ -547,7 +567,8 @@ export function lowerStringMethodCall(lowerer: Lowerer, call: ts.CallExpression,
   if (dynReceiver === undefined && access.name.text === "localeCompare") return lowerLocaleCompareCall(lowerer, call, access);
   const entry = own(STR_METHODS, access.name.text);
   const indexMethod = STRING_INDEX_METHODS.has(access.name.text) ? access.name.text as "at" | "codePointAt" : null;
-  if (!entry && !indexMethod) return null;
+  const replaceMethod = STRING_REPLACE_METHODS.has(access.name.text) ? access.name.text as "replace" | "replaceAll" : null;
+  if (!entry && !indexMethod && !replaceMethod) return null;
   // A validated dyn receiver (`pkg.name.replace(...)` on a JSON.parse
   // value) arrives pre-extracted through `dynReceiver`; its checker type
   // is `any`, so the type/symbol gates don't apply — the dyn value's
@@ -567,7 +588,7 @@ export function lowerStringMethodCall(lowerer: Lowerer, call: ts.CallExpression,
   }
   // The lib declares optional parameters beyond some lowered forms; fence
   // those arities instead of passing arguments the runtime doesn't take.
-  if (argumentNodes.length < (entry?.minArgs ?? 0) || argumentNodes.length > (entry?.maxArgs ?? 1)) {
+  if (argumentNodes.length < (entry?.minArgs ?? 0) || argumentNodes.length > (entry?.maxArgs ?? (replaceMethod ? 2 : 1))) {
     lowerer.noLowering(
       `.${access.name.text} with ${argumentNodes.length} argument${argumentNodes.length === 1 ? "" : "s"} on strings`,
       call,
@@ -577,6 +598,7 @@ export function lowerStringMethodCall(lowerer: Lowerer, call: ts.CallExpression,
     ? dynReceiver()
     : lowerMethodReceiver(lowerer, access.expression, STRING, access.name.text);
   const loc = locOf(call);
+  if (replaceMethod) return lowerStringReplacement(lowerer, call, replaceMethod, receiver, argumentNodes);
   if (indexMethod) return lowerStringIndexCall(lowerer, call, indexMethod, receiver, access.expression, argumentNodes);
   if (!entry) return null;
   if (entry.method === "split") return lowerStringSplitCall(lowerer, call, receiver, access.expression, argumentNodes);

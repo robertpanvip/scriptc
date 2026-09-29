@@ -19,9 +19,12 @@
  * emit arguments box to dyn, JS-exact arity, the original kept as the
  * registry entry's identity). Computed string names with a provable
  * constant prefix or suffix use a checked-dynamic callback and exact-arity
- * argument vector instead. The
- * pattern must exclude internal error, meta, and stream events; literal
- * names it may reach take the same path. The remaining cases are fenced:
+ * argument vector instead. The pattern must exclude internal error, meta,
+ * and stream events; literal names it may reach take the same path. The
+ * same vector handles varying or inference-unknown JavaScript emit tuples
+ * when every known listener accepts checked-dynamic parameters or no
+ * parameters. Typed listener constraints keep the fixed-tuple refusal.
+ * The remaining cases are fenced:
  * unrestricted names, symbol names, conflicting literal tuples, the
  * meta-events' listener-function argument (meta listeners take at most
  * the event name; dyn meta listeners fence — Node
@@ -62,7 +65,7 @@ const REGISTER_MEMBERS: ReadonlySet<string> = new Set([
 
 const META_EVENTS: ReadonlySet<string> = new Set(["newListener", "removeListener"]);
 
-interface EventSig {
+export interface EventSig {
   /** The unified argument tuple, positions in emit order. */
   tuple: IrType[];
   /** True once ANY emit site pinned the arity/types (listeners may then
@@ -80,9 +83,21 @@ interface EventSig {
   dynListener: boolean;
   /** At least one literal-name registration exists for this event. */
   hasListener: boolean;
+  /** JS emits may have varying arity/types or inference-only payloads. */
+  jsEmit?: true;
+  unmappedEmit?: true;
+  /** A listener with any concrete parameter still needs the fixed ABI. */
+  typedListener?: true;
 }
 
-interface ComputedEventPattern {
+function flexibleJsEvent(name: string, sig: EventSig | undefined): boolean {
+  // A stream may be upcast to EventEmitter. Its runtime-emitted payloads
+  // keep their fixed ABI even when the static receiver looks ordinary.
+  return !STREAM_FORCED_EVENT_NAMES.has(name) && sig?.jsEmit === true && sig.typedListener !== true &&
+    (sig.unmappedEmit === true || sig.conflict !== null);
+}
+
+export interface ComputedEventPattern {
   prefix: string;
   suffix: string;
   listener: boolean;
@@ -95,9 +110,10 @@ function scannedEmitterInfo(lowerer: Lowerer, receiver: IrType | null): ClassInf
     className = receiver.className;
   } else if (receiver.kind === "union") {
     const arms = lowerer.unions.get(receiver.unionId)?.arms ?? [];
-    const objects = arms.filter((arm): arm is Extract<IrType, { kind: "object" }> => arm.kind === "object");
-    if (objects.length !== 1 || !arms.every((arm) => arm.kind === "object" || isUnitType(arm))) return null;
-    className = objects[0]!.className;
+    const objects = arms.filter((arm): boolean => arm.kind === "object");
+    const object = objects[0];
+    if (objects.length !== 1 || object?.kind !== "object" || !arms.every((arm) => arm.kind === "object" || isUnitType(arm))) return null;
+    className = object.className;
   } else {
     return null;
   }
@@ -116,11 +132,7 @@ function computedPatternOverlapsReserved(pattern: ComputedEventPattern): boolean
  * types and non-literal names are simply not candidates — the touching
  * sites speak for themselves when they lower. */
 function emitterEvents(lowerer: Lowerer): Map<string, EventSig> {
-  const holder = lowerer as unknown as {
-    emitterEventTable?: Map<string, EventSig>;
-    emitterComputedPatterns?: ComputedEventPattern[];
-  };
-  if (holder.emitterEventTable) return holder.emitterEventTable;
+  if (lowerer.emitterEventTable) return lowerer.emitterEventTable;
   const table = new Map<string, EventSig>();
   const computedPatterns: ComputedEventPattern[] = [];
   const sigOf = (name: string): EventSig => {
@@ -134,10 +146,14 @@ function emitterEvents(lowerer: Lowerer): Map<string, EventSig> {
   table.set("removeListener", { tuple: [STRING], fromEmit: true, conflict: null, dynListener: false, hasListener: false });
 
   const fmt = (t: IrType): string => lowerer.fmt(t);
-  const mergeEmit = (name: string, args: (IrType | null)[]): void => {
-    if (args.some((a) => a === null)) return; // its own site will diagnose
-    const tuple = args as IrType[];
+  const mergeEmit = (name: string, args: (IrType | null)[], js: boolean): void => {
     const sig = sigOf(name);
+    if (js) sig.jsEmit = true;
+    if (args.some((a) => a === null)) {
+      sig.unmappedEmit = true;
+      return; // a flexible site's lowered values must still convert to dyn
+    }
+    const tuple = args as IrType[];
     if (sig.conflict) return;
     if (!sig.fromEmit) {
       // Listener prefixes seen so far must fit under this tuple.
@@ -233,10 +249,13 @@ function emitterEvents(lowerer: Lowerer): Map<string, EventSig> {
       if (streamForcedTuple(lowerer, info, name) !== null) return;
       try {
         if (isEmit) {
-          mergeEmit(name, node.arguments.slice(1).map((a) => lowerer.mapTypeOf(lowerer.typeOf(a))));
+          mergeEmit(name, node.arguments.slice(1).map((a) => lowerer.mapTypeOf(lowerer.typeOf(a))), isJsSourceFile(sf));
         } else if (node.arguments[1]) {
           const cbCt = lowerer.typeOf(node.arguments[1]);
           const cbT = lowerer.mapTypeOf(cbCt) ?? dynFallbackType(lowerer, node.arguments[1], cbCt);
+          if (cbT?.kind !== "dyn" && (cbT?.kind !== "func" || cbT.params.some((p) => p.kind !== "dyn"))) {
+            sigOf(name).typedListener = true;
+          }
           // Dyn-flavored listeners (a checked-dynamic value, or a func
           // with dyn parameters — the JS lane) register through the
           // adapter and constrain nothing: a dyn parameter accepts any
@@ -256,14 +275,14 @@ function emitterEvents(lowerer: Lowerer): Map<string, EventSig> {
     };
     walk(sf);
   }
-  holder.emitterEventTable = table;
-  holder.emitterComputedPatterns = computedPatterns;
+  lowerer.emitterEventTable = table;
+  lowerer.emitterComputedPatterns = computedPatterns;
   return table;
 }
 
 function computedPatterns(lowerer: Lowerer): ComputedEventPattern[] {
   emitterEvents(lowerer);
-  return (lowerer as unknown as { emitterComputedPatterns: ComputedEventPattern[] }).emitterComputedPatterns;
+  return lowerer.emitterComputedPatterns;
 }
 
 function computedPatternsOverlap(left: ComputedEventPattern, right: ComputedEventPattern): boolean {
@@ -546,14 +565,19 @@ function lowerDynListenerCall(
     }
   } else {
     const cb = lowerer.lowerExpr(cbNode);
-    if (cb.type.kind !== "func" || !canBoxFuncIntoDyn(cb.type, getRecord, getUnion)) {
+    // A wrapper can return a boxed closure even when the checker retains
+    // its callable signature. The registration helper validates that value.
+    if (cb.type.kind === "dyn") {
+      cbDyn = cb;
+    } else if (cb.type.kind === "func" && canBoxFuncIntoDyn(cb.type, getRecord, getUnion)) {
+      cbDyn = { kind: "dynFrom", value: cb, type: DYN, loc };
+    } else {
       lowerer.noLowering(
         `'${member}' with a listener of this signature`,
         cbNode,
         "a checked-dynamic listener's own parameters and return must box across the dynamic boundary",
       );
     }
-    cbDyn = { kind: "dynFrom", value: cb, type: DYN, loc };
   }
   const recvT = receiver.type;
   const adapterT: IrType = { kind: "func", params: tuple, ret: VOID };
@@ -724,19 +748,19 @@ export function lowerEmitterMethodCall(lowerer: Lowerer, call: ts.CallExpression
     }
     return receiver;
   };
-  const lowerFlexEmit = (name: IrExpr): IrExpr => {
+  const lowerFlexEmit = (name: IrExpr, kind = "computed-name"): IrExpr => {
     const below: ClassInfo[] = [];
     collectEmitOverridesBelow(info, below);
     if (emitOverrideAtOrAbove(info) || below.length > 0) {
       lowerer.noLowering(
-        "computed-name emit through an EventEmitter subclass overriding emit", call,
+        `${kind} emit through an EventEmitter subclass overriding emit`, call,
         "the override specialization needs a literal event name and fixed argument tuple",
       );
     }
     const receiver = lowerReceiver();
     if (receiver.type.kind !== "object") {
       lowerer.noLowering(
-        "computed-name emit on a nullable or non-emitter receiver", access.expression,
+        `${kind} emit on a nullable or non-emitter receiver`, access.expression,
         "narrow the receiver to an EventEmitter instance before emitting",
       );
     }
@@ -846,7 +870,7 @@ export function lowerEmitterMethodCall(lowerer: Lowerer, call: ts.CallExpression
     if (
       !META_EVENTS.has(name) && name !== "error" &&
       streamForcedTuple(lowerer, info, name) === null &&
-      computedPatterns(lowerer).some((pattern) => patternMatchesName(pattern, name))
+      (flexibleJsEvent(name, table.get(name)) || computedPatterns(lowerer).some((pattern) => patternMatchesName(pattern, name)))
     ) {
       return lowerFlexListenerCall(
         lowerer, member, strLit(name, loc), lowerReceiver(), args[1]!, registering,
@@ -973,8 +997,8 @@ export function lowerEmitterMethodCall(lowerer: Lowerer, call: ts.CallExpression
     if (
       name !== "error" && !META_EVENTS.has(name) &&
       streamForcedTuple(lowerer, info, name) === null &&
-      computedPatterns(lowerer).some((pattern) => patternMatchesName(pattern, name))
-    ) return lowerFlexEmit(strLit(name, loc));
+      (flexibleJsEvent(name, table.get(name)) || computedPatterns(lowerer).some((pattern) => patternMatchesName(pattern, name)))
+    ) return lowerFlexEmit(strLit(name, loc), flexibleJsEvent(name, table.get(name)) ? "variable-arity" : "computed-name");
     const receiver = lowerReceiver();
     if (name === "error") {
       // The special event: exactly one %Error-rooted payload; no listener
@@ -1072,6 +1096,9 @@ export function lowerEmitterMethodCall(lowerer: Lowerer, call: ts.CallExpression
       // The fn filter matches by identity — the listener's own type is
       // its word; no tuple check is needed to count.
       const cb = lowerer.lowerExpr(args[1]!);
+      if (cb.type.kind === "dyn") {
+        return { kind: "libCall", fn: "emitter.countDyn", args: [receiver, name, cb], type: F64, loc };
+      }
       if (cb.type.kind !== "func") {
         lowerer.noLowering(`listenerCount with a non-function filter`, args[1]!);
       }
@@ -1095,7 +1122,7 @@ export function lowerEmitterMethodCall(lowerer: Lowerer, call: ts.CallExpression
     }
     const name = eventNameOf(lowerer, member, args[0]!);
     const sig = table.get(name);
-    if (sig?.dynListener || computedPatterns(lowerer).some((pattern) => pattern.listener && patternMatchesName(pattern, name))) {
+    if (sig?.dynListener || flexibleJsEvent(name, sig) || computedPatterns(lowerer).some((pattern) => pattern.listener && patternMatchesName(pattern, name))) {
       // A dyn-adapted registration means the runtime bucket can hold
       // originals of MIXED signatures — no one honest element type.
       lowerer.noLowering(
@@ -1318,7 +1345,7 @@ function isEmitForwardSpread(lowerer: Lowerer, method: ts.MethodDeclaration, id:
 function isWriteTarget(id: ts.Identifier): boolean {
   let n: ts.Node = id;
   for (;;) {
-    const p: ts.Node = n.parent;
+    const p: ts.Node | undefined = n.parent;
     if (ts.isBinaryExpression(p)) {
       const k = p.operatorToken.kind;
       return p.left === n && k >= ts.SyntaxKind.FirstAssignment && k <= ts.SyntaxKind.LastAssignment;

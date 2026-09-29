@@ -1,9 +1,7 @@
 import { InternalCompilerError } from "../../errors.js";
-/* comptime(fn) lowering: run the closed callback under node:vm at compile
+/* comptime(fn) lowering: run the closed callback through the host at compile
  * time (with a timeout), then bake the produced VALUE into the IR as
  * literals — records/arrays/unions included, subject to comptimeBakeable. */
-import vm from "node:vm";
-import ts5 from "typescript5";
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { IrExpr, IrType } from "../../ir/ir.js";
@@ -81,39 +79,30 @@ function describeComptimeValue(v: unknown): string {
           `(only number, string, boolean, arrays, and records lower to literals)`,
       );
     }
-    // 5. Evaluate. Types are stripped first (the extracted text is
-    // TypeScript; vm runs JavaScript), then the IIFE runs in a FRESH vm
-    // context: JS intrinsics (JSON, Object, ...) exist, the compiler's own
-    // globals and the shipped declarations' Node-isms (console, process,
-    // fs, setTimeout) do not — so a comptime island cannot leak side effects
-    // into the build, and the vm timeout bounds runaway loops.
-    // The TRANSPILE ISLAND: typescript@7.0.2 ships no client-side
-    // transpiler, so this one call keeps 5.9.3 (adapter.ts's two-world
-    // rules — only TEXT crosses this boundary, never AST/checker objects).
-    const js = ts5.transpileModule(`(${cb.getText()})()`, {
-      compilerOptions: { target: ts5.ScriptTarget.ESNext },
-    }).outputText;
+    // 5. The host executes the extracted callback under a finite budget.
+    // Shared lowering stays independent of the host's execution engine;
+    // capture checks and result validation apply to every evaluator.
     let result: unknown;
     try {
-      // `console: undefined` shadows V8's built-in per-context console (a
-      // silent inspector hook) so no code path can log into the void — the
-      // capture walk already rejects direct uses with a better message.
-      result = vm.runInNewContext(js, { console: undefined }, { timeout: COMPTIME_TIMEOUT_MS });
+      if (lowerer.frontendServices === undefined) throw new Error("compile-time evaluation requires frontend services");
+      result = lowerer.frontendServices.evaluateComptime(cb.getText(), COMPTIME_TIMEOUT_MS);
     } catch (e) {
-      // Errors born inside the vm context (and the timeout error itself) are
-      // CROSS-REALM objects — `instanceof Error` is false — so the code and
-      // message are read structurally.
-      const err = typeof e === "object" && e !== null ? (e as { code?: unknown; message?: unknown }) : null;
-      const detail =
-        err?.code === "ERR_SCRIPT_EXECUTION_TIMEOUT"
-          ? `evaluation exceeded the ${COMPTIME_TIMEOUT_MS}ms compile-time budget`
-          : `the callback threw: ${err && typeof err.message === "string" ? err.message : String(e)}`;
+      const detail = comptimeFailureDetail(e);
       lowerer.pushDiag(comptimeFailedDiag(detail, locOf(cb)));
       throw new PoisonError();
     }
     // 6. Result → literal IR, checked against T.
     return lowerer.comptimeValueToIr(result, target, "$", cb);
   }
+
+/** VM errors may come from another realm; read their public error fields
+ * structurally rather than relying on the host Error constructor. */
+function comptimeFailureDetail(error: unknown): string {
+  const err = typeof error === "object" && error !== null ? (error as { code?: unknown; message?: unknown }) : null;
+  return err?.code === "ERR_SCRIPT_EXECUTION_TIMEOUT"
+    ? `evaluation exceeded the ${COMPTIME_TIMEOUT_MS}ms compile-time budget`
+    : `the callback threw: ${err && typeof err.message === "string" ? err.message : String(error)}`;
+}
 
 /** True when a comptime result of this type can be written as a literal
    * expression: number/string/boolean, arrays and record shapes of those,
@@ -220,7 +209,7 @@ function describeComptimeValue(v: unknown): string {
     path: string,
     blame: ts.Node,): IrExpr {
     const loc = locOf(blame);
-    const fail = (got: string): never => {
+    const fail: (got: string) => never = (got) => {
       lowerer.pushDiag(
         comptimeFailedDiag(`expected '${lowerer.fmt(expected)}' at ${path}, got ${got}`, loc),
       );
@@ -228,22 +217,22 @@ function describeComptimeValue(v: unknown): string {
     };
     switch (expected.kind) {
       case "f64": {
-        if (typeof value !== "number") return fail(describeComptimeValue(value));
+        if (typeof value !== "number") fail(describeComptimeValue(value));
         if (!Number.isFinite(value)) {
-          return fail(`${String(value)} (only finite numbers can be written as literals)`);
+          fail(`${String(value)} (only finite numbers can be written as literals)`);
         }
         return { kind: "numLit", value, type: expected, loc };
       }
       case "string": {
-        if (typeof value !== "string") return fail(describeComptimeValue(value));
+        if (typeof value !== "string") fail(describeComptimeValue(value));
         return { kind: "strLit", value, type: expected, loc };
       }
       case "bool": {
-        if (typeof value !== "boolean") return fail(describeComptimeValue(value));
+        if (typeof value !== "boolean") fail(describeComptimeValue(value));
         return { kind: "boolLit", value, type: expected, loc };
       }
       case "array": {
-        if (!Array.isArray(value)) return fail(describeComptimeValue(value));
+        if (!Array.isArray(value)) fail(describeComptimeValue(value));
         const elems = (value as unknown[]).map((el, i) =>
           lowerer.comptimeValueToIr(el, expected.elem, `${path}[${i}]`, blame),
         );
@@ -251,7 +240,7 @@ function describeComptimeValue(v: unknown): string {
       }
       case "record": {
         if (typeof value !== "object" || value === null || Array.isArray(value)) {
-          return fail(describeComptimeValue(value));
+          fail(describeComptimeValue(value));
         }
         const shape = lowerer.shapes.get(expected.shapeId)!; // bakeable-checked
         const obj = value as Record<string, unknown>;

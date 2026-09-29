@@ -82,7 +82,7 @@ export function isRequireMainFilename(lowerer: Lowerer, expr: ts.Expression): bo
   const main = expr.expression;
   if (!ts.isPropertyAccessExpression(main) || main.name.text !== "main") return false;
   if (!lowerer.isStdlibGlobal(main.expression, "require")) return false;
-  return !isNodeEsmFile(expr.getSourceFile());
+  return !isNodeEsmFile(expr.getSourceFile(), lowerer.program);
 }
 
 /** True when `expr` is the tail of an optional chain that must short-circuit
@@ -316,7 +316,7 @@ export function lowerOptionalChain(lowerer: Lowerer, expr: ts.CallExpression | t
   }
   const narrowed = rest.length === 1
     ? rest[0]!
-    : { kind: "union" as const, unionId: lowerer.unions.intern(rest) };
+    : { kind: "union" as const, unionId: lowerer.unions.transform(def, rest) };
   const id = `chain.${lowerer.chainCounter++}`;
   // A single present arm binds its payload. Multiple present arms bind
   // the original tagged value, then retag inside the guarded body. The

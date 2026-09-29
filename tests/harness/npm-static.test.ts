@@ -99,6 +99,100 @@ async function buildStatic(entry: string, npmStatic: string[] | "auto"): Promise
 }
 
 describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
+  test.each(["c", "llvm"] as const)("renderer values and callbacks compile from shipped JavaScript (%s)", async (backend) => {
+    const dir = mkdtempSync(join(tmpdir(), "scriptc-renderer-values-"));
+    try {
+      const pkg = join(dir, "node_modules", "renderer-values");
+      mkdirSync(pkg, { recursive: true });
+      writeFileSync(join(dir, "package.json"), '{"type":"module"}');
+      writeFileSync(join(pkg, "package.json"), '{"name":"renderer-values","version":"1.0.0","type":"module","main":"index.js","types":"index.d.ts"}');
+      writeFileSync(join(pkg, "index.d.ts"), "export {};\n");
+      const cases = ["native-factory-records.js", "native-method-values.js", "error-cause-writes.js", "renderer-null-state.js"];
+      for (const name of cases) cpSync(join(repoRoot, "tests/corpus", name), join(pkg, name));
+      cpSync(join(repoRoot, "tests/corpus/module-fallback-functions"), join(pkg, "module-fallback-functions"), { recursive: true });
+      writeFileSync(join(pkg, "index.js"), [...cases.map((name) => `import "./${name}";`), 'import "./module-fallback-functions/main.js";'].join("\n"));
+      const entry = join(dir, "main.js");
+      writeFileSync(entry, 'import "renderer-values";');
+      const { coverage } = analyze(entry, { npmStatic: "auto" });
+      expect(coverage.npmStatic).toEqual([{ package: "renderer-values", status: "static" }]);
+      expect(coverage.diagnostics).toHaveLength(0);
+      expect(coverage.runtimeFences ?? [], JSON.stringify(coverage.runtimeFences, null, 2)).toHaveLength(0);
+      const result = await compile(entry, { backend, dynamic: false, npmStatic: "auto", sanitize, outDir: join(dir, "out"), outPath: join(dir, "program") });
+      if (!result.ok) throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+      const [nodeRes, nativeRes] = await Promise.all([runBinary(process.execPath, [entry]), runBinary(result.binaryPath, [])]);
+      expect(nativeRes.stdout.toString("utf8")).toBe(nodeRes.stdout.toString("utf8"));
+      expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
+      expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["stored-native-builtins.js", "stored-object-helpers.js", "renderer-specializations.js", "renderer-export-dictionaries.js",
+    "fresh-array-union-layout.js", "async-backend-factory.mjs", "destructure-inferred-row-defaults.js", "object-from-checked-entries.js", "regex-checked-storage.js", "set-checked-methods.js", "frozen-checked-dictionaries.mjs", "checked-renderer-defaults.js"].flatMap((name) =>
+    (["c", "llvm"] as const).map((backend) => ({ name, backend })),
+  ))("renderer startup $name compiles from shipped JavaScript ($backend)", async ({ name, backend }) => {
+    const dir = mkdtempSync(join(tmpdir(), "scriptc-renderer-startup-"));
+    try {
+      const pkg = join(dir, "node_modules", "renderer-startup");
+      mkdirSync(pkg, { recursive: true });
+      writeFileSync(join(dir, "package.json"), '{"type":"module"}');
+      writeFileSync(join(pkg, "package.json"), '{"name":"renderer-startup","type":"module","main":"index.js","types":"index.d.ts"}');
+      writeFileSync(join(pkg, "index.d.ts"), "export {};\n");
+      cpSync(join(repoRoot, "tests/corpus", name), join(pkg, "index.js"));
+      const entry = join(dir, "main.js");
+      writeFileSync(entry, 'import "renderer-startup";');
+      const { coverage } = analyze(entry, { npmStatic: "auto" });
+      expect(coverage.diagnostics).toEqual([]);
+      expect(coverage.runtimeFences ?? [], JSON.stringify(coverage.runtimeFences)).toEqual([]);
+      const result = await compile(entry, { backend, dynamic: false, npmStatic: "auto", sanitize, outDir: dir, outPath: join(dir, "program") });
+      expect(result.ok, JSON.stringify(result.diagnostics)).toBe(true);
+      if (!result.ok) return;
+      const [nodeRes, nativeRes] = await Promise.all([runBinary(process.execPath, [entry]), runBinary(result.binaryPath, [])]);
+      expect(nativeRes.stdout.toString()).toEqual(nodeRes.stdout.toString());
+      expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
+      expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["c", "llvm"] as const)("bundled class aliases preserve declared methods and callback fields (%s)", async (backend) => {
+    const entry = join(pilotRoot, "bundled-methods-cli.ts");
+    const { coverage } = analyze(entry, { npmStatic: "auto" });
+    expect(coverage.npmStatic).toEqual([{ package: "bundled-methods", status: "static" }]);
+    expect(coverage.diagnostics).toHaveLength(0);
+    expect(coverage.runtimeFences ?? []).toHaveLength(0);
+    const outDir = join(cacheDir, "bundled-methods", sanitize ? "san" : "plain", backend);
+    const result = await compile(entry, { backend, dynamic: false, npmStatic: "auto", sanitize, outDir, outPath: join(outDir, "program") });
+    if (!result.ok) throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+    const [nodeRes, nativeRes] = await Promise.all([runBinary(process.execPath, [entry]), runBinary(result.binaryPath, [])]);
+    expect(nativeRes.stdout).toEqual(nodeRes.stdout);
+    expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  });
+
+  test("conflicting public class aliases keep the JavaScript return inference", () => {
+    const dir = mkdtempSync(join(tmpdir(), "scriptc-class-alias-conflict-"));
+    try {
+      const pkg = join(dir, "node_modules", "alias-conflict");
+      mkdirSync(pkg, { recursive: true });
+      writeFileSync(join(dir, "package.json"), '{"type":"module"}');
+      writeFileSync(join(pkg, "package.json"), '{"name":"alias-conflict","type":"module","main":"index.js","types":"index.d.ts"}');
+      writeFileSync(join(pkg, "index.d.ts"), 'export class Text { read(): string; } export class Count { read(): number; }');
+      writeFileSync(join(pkg, "index.js"), 'export { Value as Text } from "./chunk.js"; export { Value as Count } from "././chunk.js";');
+      writeFileSync(join(pkg, "chunk.js"), 'export class Value { read() { return "unchanged"; } }');
+      const entry = join(dir, "main.ts");
+      writeFileSync(entry, 'import { Text, Count } from "alias-conflict"; const first: string = new Text().read(); const second: string = new Count().read(); console.log(first, second);');
+      const { coverage } = analyze(entry, { npmStatic: ["alias-conflict"] });
+      expect(coverage.npmStatic).toEqual([{ package: "alias-conflict", status: "static" }]);
+      expect(coverage.diagnostics).toHaveLength(0);
+      expect(coverage.runtimeFences ?? []).toHaveLength(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test.each(["c", "llvm"] as const)("untyped package methods preserve virtual overrides (%s)", async (backend) => {
     const entry = join(pilotRoot, "virtual-classes-cli.ts");
     const { coverage } = analyze(entry, { npmStatic: "auto" });

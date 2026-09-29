@@ -12,8 +12,9 @@
  * a declaration is a CLAIM about the body, and the compiled artifact must
  * be built from what the body provably is, not from declaration-only
  * values. One bounded part of that claim survives: complete non-generic
- * overload groups over representation-safe types project as JSDoc onto
- * their matching exported runtime class. Calls retain authored overload
+ * overload groups over representation-safe types and zero-argument
+ * string/number/boolean return contracts project as JSDoc onto their
+ * matching exported runtime class. Calls retain authored overload
  * precision while the implementation body, its union ABI, and every
  * runtime fence still come from JavaScript.
  *
@@ -29,7 +30,8 @@
  *   - Before that shadow is enabled, the package's own declaration entry
  *     and relative declaration barrels are scanned for safe overload groups.
  *     The runtime entry binds each class to its direct or one-hop re-export
- *     file; only that file receives the generated JSDoc projection.
+ *     file, including named ESM aliases; only that class in that file
+ *     receives the generated JSDoc projection.
  *   - scriptc's own resolver (resolve.ts) mirrors the same answer: for an
  *     opted-in package the types pass is skipped, the "types" export
  *     condition is dropped, and the @types mangling never runs.
@@ -59,9 +61,8 @@
  * slate. */
 
 import { dirname } from "node:path";
-import { rewriteBundlerCjsExports } from "./npm-static-rewrite.js";
-import { applyNpmStaticDeclarationOverloads, applyNpmStaticDeclarationProperties, applyNpmStaticFindReturnWidening } from "./npm-static-declarations.js";
-import type { NpmStaticDeclarationOverloads, NpmStaticDeclarationProperties } from "./npm-static-declarations.js";
+import type { FrontendServices } from "./services.js";
+import type { NpmStaticDeclarationOverloads, NpmStaticDeclarationProperties } from "./npm-static-declaration-syntax.js";
 import { npmPackageNameOf, registerWorkspacePackage, workspacePackageOfPath } from "./workspace-registry.js";
 import { trackedExists, trackedReadFile, trackedRealpath } from "./input-tracker.js";
 
@@ -78,7 +79,7 @@ const offenders = new Map<string, string>();
  * the host probes the same file many times, and the rewrite parses. */
 const rewriteCache = new Map<string, string | null>();
 
-export function setNpmStaticPackages(packages: Iterable<string>): void {
+export function setNpmStaticPackages<T extends Iterable<string>>(packages: T): void {
   activePackages = new Set(packages);
   declarationOverloads = new Map();
   declarationProperties = new Map();
@@ -341,7 +342,7 @@ export interface NpmStaticFsShadow {
 
 /** The virtual-FS shadow loadProgram hands the tsgo host — null when the
  * flag is off, so flagless compiles keep the exact host behavior. */
-export function npmStaticFsShadow(): NpmStaticFsShadow | null {
+export function npmStaticFsShadow(services: FrontendServices): NpmStaticFsShadow | null {
   if (!npmStaticActive()) return null;
   return {
     readFile: (path) => {
@@ -392,22 +393,23 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
         try {
           const source = trackedReadFile(path);
           if (source !== null) {
-            const findWidened = applyNpmStaticFindReturnWidening(path, source);
-            const propertyProjected = applyNpmStaticDeclarationProperties(
+            const classFields = services.nullableClassFields(path, source);
+            const findWidened = services.findReturnWidening(path, classFields?.text ?? source);
+            const propertyProjected = services.declarationProperties(
               path,
-              findWidened?.text ?? source,
+              findWidened?.text ?? classFields?.text ?? source,
               declarationProperties.get(path.split("\\").join("/")) ?? new Map(),
             );
-            const projected = applyNpmStaticDeclarationOverloads(
+            const projected = services.declarationOverloads(
               path,
-              propertyProjected?.text ?? findWidened?.text ?? source,
+              propertyProjected?.text ?? findWidened?.text ?? classFields?.text ?? source,
               declarationOverloads.get(path.split("\\").join("/")) ?? new Map(),
             );
-            const answer = rewriteBundlerCjsExports(projected?.text ?? propertyProjected?.text ?? findWidened?.text ?? source, path);
+            const answer = services.rewriteCjs(projected?.text ?? propertyProjected?.text ?? findWidened?.text ?? classFields?.text ?? source, path);
             if (answer !== null && typeof answer === "object") {
               reportNpmStaticOffender(target.pkg, answer.degrade);
             } else {
-              rewritten = answer ?? projected?.text ?? propertyProjected?.text ?? findWidened?.text ?? null;
+              rewritten = answer ?? projected?.text ?? propertyProjected?.text ?? findWidened?.text ?? classFields?.text ?? null;
             }
           }
         } catch {

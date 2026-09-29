@@ -3,7 +3,7 @@ import { InternalCompilerError } from "../../errors.js";
 import { newValueMayThrow } from "../../ir/analysis.js";
 import { isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isRefCounted } from "../../ir/ir.js";
 import { collectFfiRetainedOps, parseFfiCallbackKey } from "../ffi-callbacks.js";
-import { mangleClassNew, mangleClassRetain, mangleFnClosure, mangleFunction, mangleLocal, mangleVtStruct } from "../mangle.js";
+import { mangleClassNew, mangleClassRetain, mangleClassStruct, mangleFnClosure, mangleFunction, mangleLocal, mangleVtStruct } from "../mangle.js";
 import { classStructSym } from "./classes.js";
 import { LlvmUnsupportedError } from "./unsupported.js";
 import type { LlvmEmitterContext, ExprOf, LlValue } from "./expr-context.js";
@@ -419,6 +419,7 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
         const ft = e.callee.type;
         if (e.args.length !== ft.params.length) throw new LlvmUnsupportedError("callValue:arity", e.loc);
         const callee = host.emitExpr(e.callee);
+        const receiver = e.receiver === undefined ? null : host.emitExpr(e.receiver);
         const args = e.args.map((a) => host.emitExpr(a));
         for (const a of args) host.moveTemp(a);
         const fnp = B.tmp();
@@ -429,13 +430,18 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
           `ptr ${callee.name}`,
           ...args.map((a, i) => `${host.llType(ft.params[i]!)} ${a.name}`),
         ].join(", ");
+        host.declare("declare void @scr_dyn_this_push_dyn(ptr)");
+        host.declare("declare void @scr_dyn_this_pop()");
+        B.line(`call void @scr_dyn_this_push_dyn(ptr ${receiver?.name ?? "null"})`);
         if (e.type.kind === "void") {
           B.line(`call void ${fn}(${argList})`);
+          B.line("call void @scr_dyn_this_pop()");
           if (host.indirectMayThrow) host.emitPendingCheck();
           return { name: "", type: e.type };
         }
         const t = B.tmp();
         B.line(`${t} = call ${host.llType(e.type)} ${fn}(${argList})`);
+        B.line("call void @scr_dyn_this_pop()");
         // The check runs AFTER the result temp joins the frame: an unwind
         // releases it (the dummy is NULL for refcounted returns).
         const out = host.own({ name: t, type: e.type });
@@ -473,6 +479,21 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
         // address. The +1 retain is a no-op on immortals but keeps the
         // owned-temps discipline uniform (the regexLit pattern).
         const sym = host.classObjSym(e.className);
+        if (e.captures !== undefined) {
+          host.declare(`declare ptr @scr_classobj_new(ptr, ${host.sizeType})`);
+          const value = B.tmp();
+          B.line(`${value} = call ptr @scr_classobj_new(ptr @${sym}, ${host.sizeType} ${e.captures.length})`);
+          e.captures.forEach((id, index) => {
+            const box = host.loadBox(`%${mangleLocal(id)}`);
+            const owned = host.retainBox(box);
+            const caps = B.tmp();
+            const slot = B.tmp();
+            B.line(`${caps} = getelementptr inbounds %ScrClassObj, ptr ${value}, i64 1`);
+            B.line(`${slot} = getelementptr inbounds ptr, ptr ${caps}, ${host.sizeType} ${index}`);
+            B.line(`store ptr ${owned}, ptr ${slot}`);
+          });
+          return host.own({ name: value, type: e.type });
+        }
         return host.own({ name: host.retainValue(`@${sym}`, e.type), type: e.type });
       }
       case "newValue": {
@@ -494,7 +515,7 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
           .map((a, i) => `${host.llType(ctor.params[i + 1]!.type)} ${a.name}`)
           .join(", ");
         const t = B.tmp();
-        B.line(`${t} = call ptr ${thunk}(${argList})`);
+        B.line(`${t} = call ptr ${thunk}(ptr ${callee.name}${argList ? ", " + argList : ""})`);
         const out = host.own({ name: t, type: e.type });
         if (newValueMayThrow(cls, host.classMeta.get(cls), host.mayThrow)) host.emitPendingCheck();
         return out;
@@ -506,6 +527,15 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
         if (e.value.type.kind !== "object") throw new InternalCompilerError("llvm emitter bug: instanceOfValue on a non-object");
         const v = host.emitExpr(e.value);
         const target = host.emitExpr(e.classValue);
+        if (host.classMeta.get(e.value.type.className)?.def.localCaptures !== undefined) {
+          const slot = B.tmp();
+          const actual = B.tmp();
+          const result = B.tmp();
+          B.line(`${slot} = getelementptr inbounds %${mangleClassStruct(e.value.type.className)}, ptr ${v.name}, i64 0, i32 1`);
+          B.line(`${actual} = load ptr, ptr ${slot}`);
+          B.line(`${result} = icmp eq ptr ${actual}, ${target.name}`);
+          return { name: result, type: e.type };
+        }
         const pre = host.loadVtPre(v.name, e.value.type.className);
         const tprep = B.tmp();
         const tpre = B.tmp();

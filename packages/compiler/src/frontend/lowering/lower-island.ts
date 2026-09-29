@@ -56,8 +56,8 @@ import {
    * invoked — building the value compiles; only a call through the
    * island stops the run. Null (caller rethrows) outside the JS deferral
    * gate: TypeScript sources, probe mode, ICEs. */
-  export function islandFuncValueFence(lowerer: Lowerer, err: unknown, diagsBefore: number, node: ts.Node): IrExpr | null {
-    if (!(err instanceof PoisonError) || !isJsSourceFile(node.getSourceFile())) return null;
+  export function islandFuncValueFence(lowerer: Lowerer, diagsBefore: number, node: ts.Node): IrExpr | null {
+    if (!isJsSourceFile(node.getSourceFile())) return null;
     const fence = lowerer.deferToRuntimeFence(diagsBefore, node, {
       kind: "closure",
       name: () => `%fn${lowerer.lambdaCounter++}_islfence`,
@@ -123,7 +123,8 @@ import {
         // diagnostic when INVOKED (the withPlugins aggregation shape —
         // wrappers built at module init around functions the smoke path
         // never calls). TypeScript and probe mode keep the poison.
-        const fence = islandFuncValueFence(lowerer, err, diagsBefore, node);
+        if (!(err instanceof PoisonError)) throw err;
+        const fence = islandFuncValueFence(lowerer, diagsBefore, node);
         if (fence) return fence;
         throw err;
       }
@@ -262,11 +263,8 @@ function requestInitStaticBoolean(lowerer: Lowerer, value: ts.Expression): boole
  * after `init.cache = undefined` would diagnose the stale literal instead of
  * the value fetch actually observes. Built lazily and diagnostic-free. */
 function requestInitPropMutatedSymbols(lowerer: Lowerer): Set<ts.Symbol> {
-  const holder = lowerer as unknown as {
-    requestInitPropMutatedSyms?: Set<ts.Symbol>;
-  };
-  if (holder.requestInitPropMutatedSyms) {
-    return holder.requestInitPropMutatedSyms;
+  if (lowerer.requestInitPropMutatedSyms) {
+    return lowerer.requestInitPropMutatedSyms;
   }
   const symbols = new Set<ts.Symbol>();
   const noteBase = (target: ts.Expression): void => {
@@ -312,7 +310,7 @@ function requestInitPropMutatedSymbols(lowerer: Lowerer): Set<ts.Symbol> {
     };
     walk(source);
   }
-  holder.requestInitPropMutatedSyms = symbols;
+  lowerer.requestInitPropMutatedSyms = symbols;
   return symbols;
 }
 
@@ -878,14 +876,6 @@ export function lowerStaticResponseCall(lowerer: Lowerer, call: ts.CallExpressio
   const recvType = lowerer.checker.getBaseTypeOfLiteralType(lowerer.typeOf(access.expression));
   const sym = recvType.getAliasSymbol() ?? recvType.getSymbol();
   if (!sym || sym.name !== "Response" || !lowerer.isStdlibSymbol(sym)) return null;
-  if (member === "arrayBuffer") {
-    lowerer.noLowering(
-      "Response.arrayBuffer() in a static build",
-      call,
-      "use Response.bytes() for the native Uint8Array body; free-standing ArrayBuffer values have no static representation",
-      sym,
-    );
-  }
   const recv = lowerer.lowerExpr(access.expression);
   if (recv.type.kind !== "dyn") return null;
   return lowerStaticFixedFetchMethodCall(
@@ -909,7 +899,7 @@ export function lowerStaticResponseCall(lowerer: Lowerer, call: ts.CallExpressio
           }
         : {
             kind: "libCall",
-            fn: "fetch.responseJson",
+            fn: member === "arrayBuffer" ? "fetch.responseArrayBuffer" : "fetch.responseJson",
             args: [receiver],
             type: { kind: "promise", inner: DYN },
             loc: locOf(call),
@@ -1016,7 +1006,7 @@ function lowerStaticFixedFetchMethodCall(
         },
         loc,
       },
-      ...argumentValues.map<IrStmt>((argument, index) => ({
+      ...argumentValues.map((argument, index): IrStmt => ({
         kind: "varDecl",
         localId: argumentLocals[index]!.id,
         init: argument,
@@ -1215,7 +1205,7 @@ export function fenceStaticResponseMember(
   lowerer.noLowering(
     `Response.${member} in a static build`,
     access,
-    "the native static Response surface is status/ok/statusText/url/redirected/headers/body/bodyUsed plus json(), text(), and bytes(); use --dynamic for the wider Web API",
+    "the native static Response surface is status/ok/statusText/url/redirected/headers/body/bodyUsed plus json(), text(), bytes(), and arrayBuffer(); use --dynamic for the wider Web API",
     sym,
   );
 }
@@ -1790,7 +1780,7 @@ export function lowerFetchElementMethodCall(
       { kind: "varDecl", localId: receiverLocal.id, init: receiver, loc },
       { kind: "varDecl", localId: keyLocal.id, init: key, loc },
       memberReadStmt,
-      ...argumentValues.map<IrStmt>((argument, index) => ({
+      ...argumentValues.map((argument, index): IrStmt => ({
         kind: "varDecl",
         localId: argumentLocals[index]!.id,
         init: argument,
@@ -2497,7 +2487,7 @@ export function lowerResponseNew(
     if (what === "an init value" && value.type.kind === "object") {
       const sourceType = lowerer.typeOf(node);
       const fields: { name: string; type: IrType }[] = [];
-      for (const name of ["headers", "status", "statusText"] as const) {
+      for (const name of ["headers", "status", "statusText"]) {
         const property = lowerer.checker.getPropertyOfType(sourceType, name);
         if (!property) continue;
         const propertyType = lowerer.checker.getTypeOfSymbolAtLocation(property, node);
@@ -2776,7 +2766,7 @@ export function lowerStaticReadableStreamReaderCall(
         break;
       }
     }
-    if (dep !== null && (dep.fileName.endsWith(".cts") || isCjsJsFile(dep))) {
+    if (dep !== null && (dep.fileName.endsWith(".cts") || isCjsJsFile(dep, lowerer.program))) {
       lowerer.unsupported(
         "SC1090",
         call,
@@ -2832,7 +2822,7 @@ export function lowerStaticReadableStreamReaderCall(
     arg: ts.StringLiteralLike,
   ): IrExpr {
     const dep = programImportTarget(lowerer, arg);
-    if (dep !== null && (dep.fileName.endsWith(".cts") || isCjsJsFile(dep))) {
+    if (dep !== null && (dep.fileName.endsWith(".cts") || isCjsJsFile(dep, lowerer.program))) {
       lowerer.unsupported(
         "SC1090",
         call,
@@ -3116,11 +3106,11 @@ export function lowerStaticReadableStreamReaderCall(
       // `export type { x }` / `export { type x }`: erased at runtime.
       for (const d of lowerer.checker.declarationsOf(sym)) {
         if (ts.isExportSpecifier(d)) {
-          const exportDecl = d.parent.parent;
+          const exportDecl = d.parent?.parent;
           if (d.isTypeOnly || (ts.isExportDeclaration(exportDecl) && exportDecl.isTypeOnly)) return null;
         }
         if (ts.isImportSpecifier(d)) {
-          const clause = d.parent.parent;
+          const clause = d.parent?.parent;
           if (d.isTypeOnly || (ts.isImportClause(clause) && clause.phaseModifier === ts.SyntaxKind.TypeKeyword)) return null;
         }
       }
@@ -3145,7 +3135,7 @@ export function lowerStaticReadableStreamReaderCall(
     }
     const sig = lowerer.fnSigsBySymbol.get(resolved);
     const decl0 = lowerer.checker.declarationsOf(resolved).find(
-      (d) => ts.isFunctionDeclaration(d) && (ts.isSourceFile(d.parent) || lowerer.nsBlocks.get(d.parent) === "flattened"),
+      (d) => ts.isFunctionDeclaration(d) && (ts.isSourceFile(d.parent) || (d.parent !== undefined && lowerer.nsBlocks.get(d.parent) === "flattened")),
     );
     if (sig && decl0) {
       if (!sig.params.every((p) => p.mode === "required")) {

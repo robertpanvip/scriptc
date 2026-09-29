@@ -2570,7 +2570,7 @@ function lowerHttpServerOptions(lowerer: Lowerer, node: ts.Expression, what: str
  * interned option-setting helper. */
 function lowerHttpCreateServerForms(lowerer: Lowerer, expr: ts.CallExpression | ts.NewExpression,
   what: string, loc: SrcLoc,): IrExpr {
-  const args = expr.arguments ?? ([] as unknown as ts.NodeArray<ts.Expression>);
+  const args: readonly ts.Expression[] = expr.arguments ?? [];
   if (args.length > 2) {
     lowerer.noLowering(
       `${what} with ${args.length} arguments`,
@@ -3219,10 +3219,8 @@ export interface HttpClientFnBinding {
   member: "request" | "get";
 }
 
-const httpClientFnBindings = new WeakMap<Lowerer, Map<ts.Symbol, HttpClientFnBinding>>();
-
 export function httpClientFnBindingOf(lowerer: Lowerer, sym: ts.Symbol): HttpClientFnBinding | undefined {
-  return httpClientFnBindings.get(lowerer)?.get(sym);
+  return lowerer.httpClientFnBindings.get(sym);
 }
 
 /** The { module, member } of an http/https client-function REFERENCE
@@ -3256,8 +3254,9 @@ function neverReassigned(lowerer: Lowerer, sym: ts.Symbol): boolean {
   // source file for module-level bindings. Writes anywhere inside
   // (nested closures included) disqualify.
   let scope: ts.Node = decl;
-  while (!ts.isFunctionLike(scope.parent) && !ts.isSourceFile(scope.parent)) scope = scope.parent;
-  const root: ts.Node = ts.isFunctionLike(scope.parent) ? scope.parent : scope.parent;
+  while (scope.parent !== undefined && !ts.isFunctionLike(scope.parent) && !ts.isSourceFile(scope.parent)) scope = scope.parent;
+  const root = scope.parent;
+  if (root === undefined) return false;
   let written = false;
   const hitsSym = (n: ts.Node): boolean => {
     if (ts.isIdentifier(n) && lowerer.checker.getSymbolAtLocation(n) === sym) return true;
@@ -3327,12 +3326,7 @@ export function registerHttpClientFnBinding(lowerer: Lowerer, nameNode: ts.Node,
   }
   const symbol = lowerer.checker.getSymbolAtLocation(nameNode);
   if (symbol) {
-    let map = httpClientFnBindings.get(lowerer);
-    if (!map) {
-      map = new Map();
-      httpClientFnBindings.set(lowerer, map);
-    }
-    map.set(symbol, { cond, trueSecure: t.module === "https", member: t.member });
+    lowerer.httpClientFnBindings.set(symbol, { cond, trueSecure: t.module === "https", member: t.member });
   }
   return true;
 }

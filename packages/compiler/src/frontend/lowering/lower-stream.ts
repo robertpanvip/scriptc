@@ -36,10 +36,10 @@ import { newFnCtx, own } from "./lowerer.js";
 import { appendImplicitUndefinedReturn } from "./lower-calls.js";
 import { bufEncoding, knownBufEncoding } from "./containers/bytes.js";
 import { tryLowerExpression } from "./expressions/try-lower-expression.js";
-import { BOOL, DYN, F64, IrExpr, IrFunction, IrLibFn, IrStmt, IrType, RUNTIME_STREAM_CLASSES, STRING, SrcLoc, VOID, arrayOf, bytesOf, canBoxFuncIntoDyn, funcOf, typeEquals, typeKey } from "../../ir/ir.js";
+import { BOOL, DYN, F64, IrExpr, IrFunction, IrLibFn, IrStmt, IrType, RUNTIME_STREAM_CLASSES, STRING, SrcLoc, VOID, arrayOf, BYTES_U8, canBoxFuncIntoDyn, funcOf, typeEquals, typeKey } from "../../ir/ir.js";
 import { boolLit, numLit, strLit } from "../../ir/build.js";
 
-const BYTES = bytesOf("u8");
+const BYTES = BYTES_U8;
 
 /** The stream sides of a receiver class: the nearest stream-class
  * ancestor's, or null off the stream hierarchy. */
@@ -302,8 +302,7 @@ function errorOrNull(lowerer: Lowerer): IrType {
  * record and the compile-time walk would split-brain. Built once, lazily
  * (the emitterEvents pre-pass precedent); the scan is diagnostic-free. */
 function propMutatedSymbols(lowerer: Lowerer): Set<ts.Symbol> {
-  const holder = lowerer as unknown as { streamPropMutatedSyms?: Set<ts.Symbol> };
-  if (holder.streamPropMutatedSyms) return holder.streamPropMutatedSyms;
+  if (lowerer.streamPropMutatedSyms) return lowerer.streamPropMutatedSyms;
   const set = new Set<ts.Symbol>();
   const noteBase = (target: ts.Expression): void => {
     let base = target;
@@ -333,7 +332,7 @@ function propMutatedSymbols(lowerer: Lowerer): Set<ts.Symbol> {
     };
     walk(sf);
   }
-  holder.streamPropMutatedSyms = set;
+  lowerer.streamPropMutatedSyms = set;
   return set;
 }
 
@@ -410,14 +409,19 @@ function lowerStreamCallbackValue(
     cbDyn = v.type.kind === "dyn" ? v : { kind: "dynFrom", value: v, type: DYN, loc };
   } else if (t?.kind === "func") {
     const cb = lowerer.lowerExpr(node);
-    if (cb.type.kind !== "func" || !canBoxFuncIntoDyn(cb.type, getRecord, getUnion)) {
+    // JavaScript globals may keep callable values in checked storage even
+    // when the checker can describe their function signature.
+    if (cb.type.kind === "dyn") {
+      cbDyn = cb;
+    } else if (cb.type.kind === "func" && canBoxFuncIntoDyn(cb.type, getRecord, getUnion)) {
+      cbDyn = { kind: "dynFrom", value: cb, type: DYN, loc };
+    } else {
       lowerer.noLowering(
         `the ${ctorName} option '${which}' with a function value of this signature`,
         node,
         "a callback value's own parameters and return must cross the checked-dynamic boundary — write the callback inline to keep it fully static",
       );
     }
-    cbDyn = { kind: "dynFrom", value: cb, type: DYN, loc };
   } else {
     lowerer.noLowering(
       `the ${ctorName} option '${which}' with a non-function value`,
@@ -968,7 +972,8 @@ export function lowerStreamUnderscoreAssign(lowerer: Lowerer, expr: ts.BinaryExp
   if (!ts.isPropertyAccessExpression(expr.left) || expr.left.questionDotToken) return null;
   const methodName = expr.left.name.text;
   if (!methodName.startsWith("_")) return null;
-  const optionByMethod = new Map(Array.from(UNDERSCORE_METHODS, ([o, m]) => [m, o] as const));
+  const optionByMethod = new Map<string, string>();
+  for (const [option, method] of UNDERSCORE_METHODS) optionByMethod.set(method, option);
   if (!optionByMethod.has(methodName) && methodName !== "_writev" && methodName !== "_construct") return null;
   const recv = tryLowerExpression(lowerer, expr.left.expression);
   if (!recv || recv.type.kind !== "object") return null;
@@ -1201,8 +1206,8 @@ function lowerStreamArg(lowerer: Lowerer, node: ts.Expression, what: "finished" 
  * and answers the throw as the whole call's value (Node throws before
  * registering anything, so the other arguments never evaluate their
  * effects; listener arguments are effect-free in practice). */
-class StreamArgTypeThrow {
-  constructor(readonly expr: IrExpr) {}
+class StreamArgTypeThrow extends Error {
+  constructor(readonly expr: IrExpr) { super("stream argument is not a stream"); }
 }
 
 /** The finished/pipeline completion callback: an inline function lowers

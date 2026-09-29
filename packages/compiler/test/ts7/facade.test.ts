@@ -1,19 +1,21 @@
+import { Ts7Host } from "../../src/frontend/ts7/program-adapter.js";
 /* The checker facade's mechanics: memoization and batch prefetch must be
  * REAL — measured as raw-client call counts through a counting proxy, not
  * inferred from timings — and the client-side fast paths must agree with
  * the raw checker's answers on the same objects. */
 
-import { afterAll, expect, test } from "vitest";
+import { afterAll, expect, test, vi } from "vitest";
 import { lowerToIr } from "../../src/frontend/lowering/lowerer.js";
 import { clearWorkspacePackages, registerWorkspacePackage } from "../../src/frontend/workspace-registry.js";
 import { CheckerFacade } from "../../src/frontend/ts7/checker.js";
-import type { Node } from "typescript/unstable/ast";
-import type { Checker, Type } from "typescript/unstable/sync";
+import type { SemanticChecker as Checker } from "../../src/frontend/ts7/semantic-checker.js";
+import type { Node } from "../../src/frontend/ts7/ast-types.js";
+import type { Type } from "../../src/frontend/ts7/semantic-types.js";
 import { ad, buildTwoWorlds } from "./harness.js";
 import type { TwoWorlds } from "./harness.js";
 import { RICH_TS } from "./fixtures.js";
 
-const host = new ad.Ts7Host();
+const host = new Ts7Host();
 const worlds: TwoWorlds[] = [];
 afterAll(() => {
   for (const w of worlds) w.dispose();
@@ -279,8 +281,6 @@ test("isArrayType agrees with the raw checker and skips visibly non-object types
 test("union and intersection constituents are fetched once per immutable type", () => {
   const { w } = build();
   const raw = w.p7.project.checker;
-  const calls = new Map<Type, number>();
-  const originals = new Map<Type, () => readonly Type[] | undefined>();
   const compound = new Set<Type>();
   for (const node of collectNodes(w)) {
     const type = raw.getTypeAtLocation(node);
@@ -288,25 +288,16 @@ test("union and intersection constituents are fetched once per immutable type", 
     compound.add(type);
   }
   expect(compound.size).toBeGreaterThan(0);
+  const fetch = vi.spyOn(raw.project, "fetchTypes");
   try {
-    for (const type of compound) {
-      const withConstituents = type as Type & { getTypes(): readonly Type[] | undefined };
-      const original = withConstituents.getTypes.bind(withConstituents);
-      originals.set(type, original);
-      withConstituents.getTypes = () => {
-        calls.set(type, (calls.get(type) ?? 0) + 1);
-        return original();
-      };
-    }
     for (const type of compound) {
       const first = ad.constituentTypes(type);
       expect(ad.constituentTypes(type)).toBe(first);
-      expect(calls.get(type)).toBe(1);
+      expect(type.getTypes()).toBe(first);
+      expect(fetch.mock.calls.filter(([id, method]) => id === type.id && method === "getTypesOfType")).toHaveLength(1);
     }
   } finally {
-    for (const [type, original] of originals) {
-      (type as Type & { getTypes(): readonly Type[] | undefined }).getTypes = original;
-    }
+    fetch.mockRestore();
   }
 });
 
@@ -489,7 +480,7 @@ console.log("ok");
   }, host);
   worlds.push(w);
   const { proxy, calls } = countingChecker(w.p7.project.checker);
-  const facade = new CheckerFacade(proxy, { project: w.p7.project });
+  const facade = new CheckerFacade(proxy, { project: w.p7.project.checker.project });
   (w.p7 as unknown as { checkerFacade: CheckerFacade | null }).checkerFacade = facade;
   const sf = w.p7.getSourceFile(w.files[0]!)!;
   const cls = sf.statements.find(ad.isClassDeclaration)!;
@@ -519,7 +510,7 @@ test("signature collection batches exact types of deferred function defaults", (
   const w = buildTwoWorlds({ "defaults.ts": `${defaults}\nconsole.log("ok");\n` }, host);
   worlds.push(w);
   const { proxy, calls } = countingChecker(w.p7.project.checker);
-  const facade = new CheckerFacade(proxy, { project: w.p7.project });
+  const facade = new CheckerFacade(proxy, { project: w.p7.project.checker.project });
   (w.p7 as unknown as { checkerFacade: CheckerFacade | null }).checkerFacade = facade;
   const sf = w.p7.getSourceFile(w.files[0]!)!;
   const initializers = sf.statements
@@ -548,7 +539,7 @@ test("class-shape collection batches deferred method default types", () => {
   }, host);
   worlds.push(w);
   const { proxy, calls } = countingChecker(w.p7.project.checker);
-  const facade = new CheckerFacade(proxy, { project: w.p7.project });
+  const facade = new CheckerFacade(proxy, { project: w.p7.project.checker.project });
   (w.p7 as unknown as { checkerFacade: CheckerFacade | null }).checkerFacade = facade;
   const sf = w.p7.getSourceFile(w.files[0]!)!;
   const cls = sf.statements.find(ad.isClassDeclaration)!;
@@ -579,7 +570,7 @@ console.log(pick(42));
   }, host);
   worlds.push(w);
   const { proxy, calls } = countingChecker(w.p7.project.checker);
-  const facade = new CheckerFacade(proxy, { project: w.p7.project });
+  const facade = new CheckerFacade(proxy, { project: w.p7.project.checker.project });
   (w.p7 as unknown as { checkerFacade: CheckerFacade | null }).checkerFacade = facade;
   const sf = w.p7.getSourceFile(w.files[0]!)!;
   const fn = sf.statements.find(ad.isFunctionDeclaration)!;
@@ -620,7 +611,7 @@ console.log(reached(1));
   }, host);
   worlds.push(w);
   const { proxy, calls } = countingChecker(w.p7.project.checker);
-  const facade = new CheckerFacade(proxy, { project: w.p7.project });
+  const facade = new CheckerFacade(proxy, { project: w.p7.project.checker.project });
   // Ts7Program owns one shared facade; install the counting instance so
   // lowering and this assertion observe the same memo/batch traffic.
   (w.p7 as unknown as { checkerFacade: CheckerFacade | null }).checkerFacade = facade;

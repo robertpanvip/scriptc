@@ -222,6 +222,69 @@ void scr_regex_release_v(void *re) { scr_regex_release(re); }
 
 ScrStr *scr_regex_source(ScrRegex *re) { return scr_str_retain(re->source); }
 ScrStr *scr_regex_flags(ScrRegex *re) { return scr_str_retain(re->flags); }
+ScrStr *scr_regex_to_string(ScrRegex *re) {
+  const char *source = re->source->data;
+  size_t len = re->source->len;
+  size_t escaped = 0;
+  bool in_class = false;
+  bool quoted = false;
+  for (size_t i = 0; i < len; i++) {
+    char c = source[i];
+    bool line_separator = i + 2 < len && (unsigned char)c == 0xE2 &&
+                          (unsigned char)source[i + 1] == 0x80 &&
+                          ((unsigned char)source[i + 2] == 0xA8 ||
+                           (unsigned char)source[i + 2] == 0xA9);
+    if (!quoted && c == '/' && !in_class) escaped++;
+    if (!quoted && (c == '\n' || c == '\r')) escaped++;
+    if (!quoted && line_separator) escaped += 3;
+    if (!quoted && c == '[') in_class = true;
+    else if (!quoted && c == ']') in_class = false;
+    if (c == '\\') quoted = !quoted;
+    else quoted = false;
+  }
+  size_t total = 2 + len + escaped + re->flags->len;
+  char *buf = malloc(total + 1);
+  if (!buf) scr_regex_oom();
+  size_t pos = 0;
+  buf[pos++] = '/';
+  in_class = false;
+  quoted = false;
+  for (size_t i = 0; i < len; i++) {
+    char c = source[i];
+    bool line_separator = i + 2 < len && (unsigned char)c == 0xE2 &&
+                          (unsigned char)source[i + 1] == 0x80 &&
+                          ((unsigned char)source[i + 2] == 0xA8 ||
+                           (unsigned char)source[i + 2] == 0xA9);
+    if (!quoted && c == '/' && !in_class) buf[pos++] = '\\';
+    if (!quoted && line_separator) {
+      buf[pos++] = '\\';
+      buf[pos++] = 'u';
+      buf[pos++] = '2';
+      buf[pos++] = '0';
+      buf[pos++] = '2';
+      buf[pos++] = source[i + 2] == (char)0xA8 ? '8' : '9';
+      i += 2;
+      quoted = false;
+      continue;
+    }
+    if (!quoted && (c == '\n' || c == '\r')) {
+      buf[pos++] = '\\';
+      c = c == '\n' ? 'n' : 'r';
+    }
+    buf[pos++] = c;
+    if (!quoted && c == '[') in_class = true;
+    else if (!quoted && c == ']') in_class = false;
+    if (source[i] == '\\') quoted = !quoted;
+    else quoted = false;
+  }
+  buf[pos++] = '/';
+  memcpy(buf + pos, re->flags->data, re->flags->len);
+  pos += re->flags->len;
+  buf[pos] = '\0';
+  ScrStr *out = scr_str_new(buf, pos);
+  free(buf);
+  return out;
+}
 
 /* ── UTF-8 ⇄ UTF-16 (the exec buffer strategy) ──────────────────────── */
 
@@ -628,17 +691,7 @@ ScrArr *scr_regex_split_limit(ScrStr *s, ScrRegex *re, double limit_num) {
   uint8_t *bc = scr_regex_bc(re);
   uint32_t limit = scr_to_uint32(limit_num);
   if (limit == 0) return scr_arr_new(SCR_ELEM_STR, 0);
-  if (lre_get_capture_count(bc) > 1) {
-    /* JS splices every capture group's value into the result between the
-     * pieces, changing the array's SHAPE per match — not modeled this
-     * slice. Catchable, scriptc-specific. */
-    static const char msg[] =
-        "split() with capture groups in the pattern is not "
-        "supported (JS splices the captured values into the result); use a "
-        "non-capturing group (?:...)";
-    scr_throw_error_msg(SCR_ERR_TYPE, msg, sizeof msg - 1);
-    return NULL; /* callers are compiler-emitted pending checks */
-  }
+  int capture_count = lre_get_capture_count(bc);
   int re_flags = lre_get_flags(bc);
   bool unicode = (re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0;
   bool sticky = (re_flags & LRE_FLAG_STICKY) != 0;
@@ -648,7 +701,7 @@ ScrArr *scr_regex_split_limit(ScrStr *s, ScrRegex *re, double limit_num) {
   const uint8_t *ubase = (const uint8_t *)u;
   ScrArr *out = scr_arr_new(SCR_ELEM_STR, 0);
 
-  /* ECMA-262 22.2.6.14 (Symbol.split, no limit). The spec probes every
+  /* ECMA-262 22.2.6.14 (Symbol.split). The spec probes every
    * position with a sticky matcher; for non-sticky patterns a forward
    * SEARCH from q is equivalent (the earliest match position >= q is the
    * first probe that would succeed) and one exec replaces the per-position
@@ -671,22 +724,35 @@ ScrArr *scr_regex_split_limit(ScrStr *s, ScrRegex *re, double limit_num) {
     }
     int start = (int)((capture[0] - ubase) >> 1);
     int end = (int)((capture[1] - ubase) >> 1);
+    /* The sticky algorithm never probes the position after the subject.
+     * A forward search can find a zero-width match there; exclude it. */
+    if (start == len) break;
     if (end == p) {
       /* Zero-length match adjacent to the previous split point: advance
        * (start == q == p here — the search cannot skip a match). */
       q = scr_advance(u, len, start, unicode);
     } else {
       scr_arr_push_ref(out, scr_str_from_utf16(u, p, start));
-      if (out->len == limit) {
-        free(capture);
-        free(u);
-        return out;
+      if (out->len == limit) goto done;
+      for (int group = 1; group < capture_count; group++) {
+        const uint8_t *from = capture[2 * group];
+        const uint8_t *to = capture[2 * group + 1];
+        if (from == NULL || to == NULL) {
+          // Nonparticipating captures are present undefined elements,
+          // distinct from both empty strings and holes.
+          scr_arr_set_undefined(out, (double)out->len);
+        } else {
+          scr_arr_push_ref(out, scr_str_from_utf16(u,
+              (int)((from - ubase) >> 1), (int)((to - ubase) >> 1)));
+        }
+        if (out->len == limit) goto done;
       }
       p = end;
       q = p;
     }
   }
   scr_arr_push_ref(out, scr_str_from_utf16(u, p, len));
+done:
   free(capture);
   free(u);
   return out;
@@ -944,11 +1010,19 @@ void scr_assert_shape_re(int key, ScrRegex *re) {
  * "Invalid flags supplied to RegExp constructor 'x'". An empty pattern
  * stores the spec's "(?:)" source, like Node. Borrows both; +1. */
 ScrRegex *scr_regex_new(ScrStr *pattern, ScrStr *flags) {
+  unsigned seen_flags = 0;
   for (size_t i = 0; i < flags->len; i++) {
+    unsigned flag = 0;
     switch (flags->data[i]) {
-    case 'g': case 'i': case 'm': case 's': case 'u': case 'y':
-      break;
-    default: {
+    case 'g': flag = 1u << 0; break;
+    case 'i': flag = 1u << 1; break;
+    case 'm': flag = 1u << 2; break;
+    case 's': flag = 1u << 3; break;
+    case 'u': flag = 1u << 4; break;
+    case 'y': flag = 1u << 5; break;
+    default: break;
+    }
+    if (!flag || (seen_flags & flag)) {
       char msg[80];
       int n = snprintf(msg, sizeof msg,
                        "Invalid flags supplied to RegExp constructor '%.20s'",
@@ -956,7 +1030,7 @@ ScrRegex *scr_regex_new(ScrStr *pattern, ScrStr *flags) {
       scr_throw_error_msg(SCR_ERR_SYNTAX, msg, (size_t)n);
       return NULL;
     }
-    }
+    seen_flags |= flag;
   }
   ScrRegex *re = calloc(1, sizeof *re);
   if (!re) {
@@ -1112,4 +1186,89 @@ ScrStr *scr_regexp_escape(ScrStr *s) {
   out->len = out_len;
   out->data[out_len] = '\0';
   return out;
+}
+
+/* Checked storage retains the native pattern; no JavaScript engine is needed. */
+bool scr_dyn_native_regex_is(const ScrDyn *value) {
+  return value && value->kind == SCR_DYN_HANDLE && value->v.handle.tag == SCR_DYNH_REGEXP;
+}
+
+ScrRegex *scr_dyn_native_regex_check(const ScrDyn *value, const ScrDynPath *path) {
+  if (!scr_dyn_native_regex_is(value)) { scr_dyn_check_fail(path, "RegExp", value); return NULL; }
+  return scr_regex_retain(value->v.handle.ptr);
+}
+
+static ScrDyn *scr_native_regex_string(ScrStr *text) {
+  if (!text) return NULL;
+  ScrDyn *out = scr_dyn_new_str(text);
+  scr_str_release(text);
+  return out;
+}
+
+static ScrDyn *scr_native_regex_get(void *ptr, const char *key, size_t len) {
+  ScrRegex *re = ptr;
+  if (len == 6 && memcmp(key, "source", 6) == 0) return scr_native_regex_string(scr_regex_source(re));
+  if (len == 5 && memcmp(key, "flags", 5) == 0) return scr_native_regex_string(scr_regex_flags(re));
+  static const struct { const char *name; char flag; } flags[] = {
+    {"global", 'g'}, {"ignoreCase", 'i'}, {"multiline", 'm'}, {"dotAll", 's'},
+    {"unicode", 'u'}, {"sticky", 'y'}, {"hasIndices", 'd'}, {"unicodeSets", 'v'},
+  };
+  for (size_t i = 0; i < sizeof flags / sizeof flags[0]; i++) {
+    if (strlen(flags[i].name) == len && memcmp(key, flags[i].name, len) == 0)
+      return scr_dyn_new_bool(memchr(re->flags->data, flags[i].flag, re->flags->len) != NULL);
+  }
+  static const char *const methods[] = {"test", "exec", "toString", "compile", "lastIndex"};
+  for (size_t i = 0; i < sizeof methods / sizeof methods[0]; i++) {
+    if (strlen(methods[i]) == len && memcmp(key, methods[i], len) == 0) {
+      static const char message[] = "Native RegExp method values and lastIndex have no lowering";
+      scr_throw_error_msg_code(SCR_ERR_ERROR, message, sizeof message - 1, "SC2020");
+      break;
+    }
+  }
+  return NULL;
+}
+
+static bool scr_native_regex_set(void *ptr, const char *key, size_t len, const ScrDyn *value) {
+  (void)ptr; (void)key; (void)len; (void)value;
+  return false;
+}
+
+static ScrDyn *scr_native_regex_invoke(void *ptr, ScrDyn *self, const char *method,
+                                     ScrDyn *const *args, size_t argc, const char *what) {
+  (void)self; (void)what;
+  ScrRegex *re = ptr;
+  if (strcmp(method, "toString") == 0) return scr_native_regex_string(scr_regex_to_string(re));
+  if (strcmp(method, "test") == 0) {
+    ScrStr *subject = scr_dyn_string_coerce_js(argc ? args[0] : scr_dyn_undefined());
+    if (!subject) return NULL;
+    bool matches = scr_regex_test(re, subject);
+    scr_str_release(subject);
+    return scr_exc_pending() ? NULL : scr_dyn_new_bool(matches);
+  }
+  static const char message[] = "Native RegExp method has no lowering";
+  scr_throw_error_msg_code(SCR_ERR_ERROR, message, sizeof message - 1, "SC2020");
+  return NULL;
+}
+
+ScrDyn *scr_dyn_native_regex(ScrRegex *value) {
+  static const ScrDynHandleOps ops = {
+    "RegExp", &scr_regex_retain_v, &scr_regex_release_v, &scr_native_regex_invoke,
+    &scr_native_regex_get, &scr_native_regex_set, NULL, NULL,
+  };
+  scr_dyn_handle_install(SCR_DYNH_REGEXP, &ops);
+  return scr_dyn_new_handle(value, SCR_DYNH_REGEXP);
+}
+
+ScrRegex *scr_regex_new_checked(const ScrDyn *pattern, const ScrDyn *flags) {
+  ScrRegex *original = scr_dyn_native_regex_is(pattern) ? pattern->v.handle.ptr : NULL;
+  ScrStr *source = original ? scr_regex_source(original)
+    : pattern->kind == SCR_DYN_UNDEF ? scr_str_new("", 0) : scr_dyn_string_coerce_js(pattern);
+  if (!source) return NULL;
+  ScrStr *options = flags->kind == SCR_DYN_UNDEF
+    ? original ? scr_regex_flags(original) : scr_str_new("", 0)
+    : scr_dyn_string_coerce_js(flags);
+  ScrRegex *result = options ? scr_regex_new(source, options) : NULL;
+  scr_str_release(source);
+  scr_str_release(options);
+  return result;
 }

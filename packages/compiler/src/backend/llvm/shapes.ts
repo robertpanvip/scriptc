@@ -94,8 +94,7 @@ export function retainSym(host: ShapeHost, t: IrType): string {
 export function releaseSym(host: ShapeHost, t: IrType): string {
   const stem = runtimeRcStem(t);
   if (stem !== null) {
-    // scr_classobj_release is header-inline only; LLVM calls its exported
-    // `_v` wrapper. Every other runtime family exports the typed release.
+    // Class objects share the container adapter at direct release sites.
     const suffix = t.kind === "classval" ? "_release_v" : "_release";
     const release = `@${stem}${suffix}`;
     host.declare(`declare void ${release}(ptr)`);
@@ -117,6 +116,12 @@ export function releaseSym(host: ShapeHost, t: IrType): string {
  * their RC rows refuse first). */
 export function traceAdapter(host: ShapeHost, t: IrType): string | null {
   switch (t.kind) {
+    case "dyn":
+      host.declare(`declare void @scr_dyn_trace_v(ptr, ptr, ptr)`);
+      return "@scr_dyn_trace_v";
+    case "classval":
+      host.declare(`declare void @scr_classobj_trace_v(ptr, ptr, ptr)`);
+      return "@scr_classobj_trace_v";
     case "func":
       host.declare(`declare void @scr_closure_trace_v(ptr, ptr, ptr)`);
       return "@scr_closure_trace_v";
@@ -205,14 +210,15 @@ function elemKindNum(elem: IrType): number {
 export function arrNewCall(host: ShapeHost, elem: IrType, capText: string): string {
   const useRef =
     elem.kind === "record" || elem.kind === "object" || elem.kind === "union" || elem.kind === "func" ||
+    elem.kind === "map" || elem.kind === "set" || // scr_map_* adapters and typed key/value tracing
     elem.kind === "symbol" || // symbol identities: scr_sym_* adapters, no trace
     elem.kind === "bigint" || // immutable numeric values: scr_bigint_* adapters
-    elem.kind === "classval" || // class objects: no-op adapters, no trace (immortal statics)
+    elem.kind === "classval" || // local class objects own traced capture boxes
     elem.kind === "promise" || // promise entries (Promise.all inputs): full REF story
     elem.kind === "child" || // spawned child handles: scr_child_* adapters, no trace
     elem.kind === "netServer" || // server handles ([...set] drains): REF, no trace
     elem.kind === "jsval" || // island handles (`any[]` under --dynamic): REF, no trace
-    elem.kind === "dyn" || // native collection seeds/drains: REF, no trace
+    elem.kind === "dyn" || // native collection seeds/drains: traced REF
     elem.kind === "regex" || // RegExp values: scr_regex_* adapters, no trace (no refs inside)
     (elem.kind === "array" && traceAdapter(host, elem) !== null);
   if (!useRef) {
@@ -253,9 +259,7 @@ export function boxNewCall(host: ShapeHost, t: IrType): string {
     // Island handles: the box carries scr_jsval_retain_v/release_v and
     // no trace — the same stance as jsval array elements.
     t.kind === "jsval" ||
-    // Checked-dynamic captures (the mustCall wrapper closing over its
-    // implicit-any `fn` param): the box carries scr_dyn_retain_v/release_v
-    // and NO trace — cycles through dyn never collect (SEMANTICS.md).
+    // Checked values trace native objects, arrays and captured closures.
     t.kind === "dyn" ||
     t.kind === "fsWatcher"
   ) {

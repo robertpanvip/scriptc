@@ -11,6 +11,7 @@ export const pin = JSON.parse(readFileSync(join(directory, "upstream.json"), "ut
 export const completion = "__scriptc_test262_complete__";
 export const harnessSource = readFileSync(join(directory, "harness.ts"), "utf8");
 export const assertThrowsSource = readFileSync(join(directory, "assert-throws.js"), "utf8");
+export const propertyHelperSource = readFileSync(join(directory, "property-helper.js"), "utf8");
 export const expectations = JSON.parse(readFileSync(join(directory, "expectations.json"), "utf8"));
 export const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
@@ -52,6 +53,21 @@ const knownFlags = new Set([
   "onlyStrict", "noStrict", "module", "raw", "async", "generated",
   "CanBlockIsFalse", "CanBlockIsTrue", "non-deterministic",
 ]);
+
+const unsupportedPropertyHelpers = new Set([
+  "verifyCallableProperty", "verifyAccessorProperty", "verifyEqualTo", "verifyWritable", "verifyNotWritable",
+  "verifyEnumerable", "verifyNotEnumerable", "verifyConfigurable", "verifyNotConfigurable",
+  "verifyPrimordialProperty", "verifyPrimordialCallableProperty", "verifyPrimordialAccessorProperty",
+  "isWritable", "isEnumerable", "isConfigurable", "isSameValue",
+]);
+const descriptorFields = new Set(["value", "writable", "enumerable", "configurable", "get", "set"]);
+
+function inlinePropertyDescriptor(node) {
+  if (!node) return false;
+  if (ts.isIdentifier(node) && node.text === "undefined") return true;
+  return ts.isObjectLiteralExpression(node) && node.properties.every((field) =>
+    ts.isPropertyAssignment(field) && ts.isIdentifier(field.name) && descriptorFields.has(field.name.text));
+}
 
 export function metadata(source, path = "test.js") {
   const match = /\/\*---([\s\S]*?)---\*\//.exec(source);
@@ -95,6 +111,14 @@ function hasOwnThisBinding(node) {
   return false;
 }
 
+function argumentsOwner(node) {
+  for (let parent = node.parent; parent; parent = parent.parent) {
+    if (ts.isArrowFunction(parent)) continue;
+    if (ts.isFunctionLike(parent) && parent.body) return parent;
+  }
+  return undefined;
+}
+
 // The first static profile adapts scripts to standalone strict modules. Be
 // conservative about observable global-script semantics and helper reflection.
 // Exclusions are runner limitations, never implementation support claims.
@@ -107,11 +131,12 @@ export function exclusion(source, meta, variant) {
   }
   if (variant !== "strict" && variant !== "sloppy") return `execution:${variant}`;
   if (meta.flags.some((flag) => flag.startsWith("CanBlock"))) return "host:agents";
-  const unsupportedIncludes = meta.includes.filter((name) => name !== "compareArray.js");
+  const unsupportedIncludes = meta.includes.filter((name) => name !== "compareArray.js" && name !== "propertyHelper.js");
   if (unsupportedIncludes.length) return `harness-includes:${unsupportedIncludes.join(",")}`;
   const sf = ts.createSourceFile("test.js", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   let reason;
-  const forbidden = new Set(["$262", "$DONE", "$DONOTEVALUATE", "globalThis", "eval", "Function", "print", "process", "require", "arguments"]);
+  const propertyHelper = meta.includes.includes("propertyHelper.js");
+  const forbidden = new Set(["$262", "$DONE", "$DONOTEVALUATE", "globalThis", "eval", "Function", "print", "process", "require"]);
   if (variant === "sloppy") for (const name of ["module", "exports", "__dirname", "__filename"]) forbidden.add(name);
   if (meta.flags.includes("async")) forbidden.delete("$DONE");
   const visit = (node) => {
@@ -121,6 +146,11 @@ export function exclusion(source, meta, variant) {
       reason = "host:script-environment";
     } else if (ts.isIdentifier(node) && forbidden.has(node.text)) {
       reason = `host:${node.text}`;
+    } else if (ts.isIdentifier(node) && node.text === "arguments" &&
+      (!argumentsOwner(node) ||
+        !(ts.isPropertyAccessExpression(node.parent) && node.parent.expression === node && node.parent.name.text === "length") &&
+        !(ts.isElementAccessExpression(node.parent) && node.parent.expression === node))) {
+      reason = "host:arguments";
     } else if (ts.isIdentifier(node) && node.text === "assert") {
       const parent = node.parent;
       if (ts.isCallExpression(parent) && parent.expression === node) {
@@ -140,6 +170,14 @@ export function exclusion(source, meta, variant) {
       reason = "harness:compareArray-surface";
     } else if (ts.isIdentifier(node) && node.text === "Test262Error") {
       if (!ts.isNewExpression(node.parent) || node.parent.expression !== node) reason = "harness:Test262Error-surface";
+    } else if (propertyHelper && ts.isIdentifier(node)) {
+      if (unsupportedPropertyHelpers.has(node.text)) reason = "harness:propertyHelper-surface";
+      else if (node.text === "verifyProperty") {
+        const call = node.parent;
+        if (!ts.isCallExpression(call) || call.expression !== node || call.arguments.length < 3 || !inlinePropertyDescriptor(call.arguments[2])) {
+          reason = "harness:propertyHelper-surface";
+        }
+      }
     }
     ts.forEachChild(node, visit);
   };
@@ -147,11 +185,12 @@ export function exclusion(source, meta, variant) {
   return reason;
 }
 
-export function prepare(source, asyncTest = false, marker = completion, variant = "strict") {
+export function prepare(source, asyncTest = false, marker = completion, variant = "strict", includes = []) {
   const names = asyncTest ? "assert, Test262Error, $DONE" : "assert, Test262Error";
   const end = asyncTest ? "" : `;console.log(${JSON.stringify(marker)});\n`;
-  if (variant === "sloppy") return `const { ${names} } = require("./harness.ts");\n${source}\n${end}`;
-  return `"use strict";\nimport { ${names} } from "./harness.ts";\n${source}\n${end}`;
+  const helpers = includes.includes("propertyHelper.js") ? `${propertyHelperSource}\n` : "";
+  if (variant === "sloppy") return `const { ${names} } = require("./harness.ts");\n${helpers}${source}\n${end}`;
+  return `"use strict";\nimport { ${names} } from "./harness.ts";\n${helpers}${source}\n${end}`;
 }
 
 function parseDiagnostics(source, variant) {

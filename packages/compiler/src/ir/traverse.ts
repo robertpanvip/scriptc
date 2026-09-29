@@ -101,7 +101,7 @@ export function everyExprChild(node: IrExpr, expr: (expr: IrExpr) => boolean, st
     case "closure":
       return true;
     case "callValue":
-      return expr(node.callee) && node.args.every((child) => expr(child));
+      return expr(node.callee) && (node.receiver === undefined || expr(node.receiver)) && node.args.every((child) => expr(child));
     case "selfRef":
       return true;
     case "yieldExpr":
@@ -149,7 +149,7 @@ export function everyExprChild(node: IrExpr, expr: (expr: IrExpr) => boolean, st
     case "dynFromJsval":
       return expr(node.value);
     case "dynCall":
-      return expr(node.callee) && node.args.every((child) => expr(child));
+      return expr(node.callee) && (node.receiver === undefined || expr(node.receiver)) && node.args.every((child) => expr(child));
     case "dynInvoke":
       return expr(node.recv) && node.args.every((child) => expr(child));
     case "dynArrLit":
@@ -362,8 +362,11 @@ export function mapExprChildren(node: IrExpr, expr: (expr: IrExpr) => IrExpr, st
       return { ...node, args: node.args.map((child) => expr(child)) };
     case "closure":
       return node;
-    case "callValue":
-      return { ...node, callee: expr(node.callee), args: node.args.map((child) => expr(child)) };
+    case "callValue": {
+      const callee = expr(node.callee);
+      if (node.receiver === undefined) return { ...node, callee, args: node.args.map((child) => expr(child)) };
+      return { ...node, callee, receiver: expr(node.receiver), args: node.args.map((child) => expr(child)) };
+    }
     case "selfRef":
       return node;
     case "yieldExpr":
@@ -410,8 +413,11 @@ export function mapExprChildren(node: IrExpr, expr: (expr: IrExpr) => IrExpr, st
       return { ...node, value: expr(node.value) };
     case "dynFromJsval":
       return { ...node, value: expr(node.value) };
-    case "dynCall":
-      return { ...node, callee: expr(node.callee), args: node.args.map((child) => expr(child)) };
+    case "dynCall": {
+      const callee = expr(node.callee);
+      if (node.receiver === undefined) return { ...node, callee, args: node.args.map((child) => expr(child)) };
+      return { ...node, callee, receiver: expr(node.receiver), args: node.args.map((child) => expr(child)) };
+    }
     case "dynInvoke":
       return { ...node, recv: expr(node.recv), args: node.args.map((child) => expr(child)) };
     case "dynArrLit":

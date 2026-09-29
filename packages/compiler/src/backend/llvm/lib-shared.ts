@@ -24,6 +24,28 @@ export function emitAlwaysThrowLibCall(
 }
 
 export const LIB_FN_SYMS: Record<string, string> = {
+  "intl.segmenterNew": "scr_intl_segmenter_new",
+  "weakMap.is": "scr_weak_map_is",
+  "weakSet.is": "scr_weak_set_is",
+  "weakMap.new": "scr_weak_map_new",
+  "weakSet.new": "scr_weak_set_new",
+  "dyn.fromEntries": "scr_dyn_from_entries",
+  "arrayBuffer.new": "scr_array_buffer_new",
+  "arrayBuffer.is": "scr_array_buffer_is",
+  "arrayBuffer.isView": "scr_array_buffer_is_view",
+  "arrayBuffer.byteLengthGetter": "scr_array_buffer_byte_length_getter",
+  "arrayBuffer.byteLengthDescriptor": "scr_array_buffer_byte_length_descriptor",
+  "arrayBuffer.viewU8C": "scr_array_buffer_view_u8c",
+  "arrayBuffer.viewI8": "scr_array_buffer_view_i8",
+  "arrayBuffer.viewU16": "scr_array_buffer_view_u16",
+  "arrayBuffer.viewI16": "scr_array_buffer_view_i16",
+  "arrayBuffer.viewU8": "scr_array_buffer_view_u8",
+  "arrayBuffer.viewU32": "scr_array_buffer_view_u32",
+  "arrayBuffer.viewI32": "scr_array_buffer_view_i32",
+  "arrayBuffer.viewF32": "scr_array_buffer_view_f32",
+  "arrayBuffer.viewF64": "scr_array_buffer_view_f64",
+  "arrayBuffer.viewDV": "scr_array_buffer_view_dv",
+
   "util.parseArgs": "scr_util_parse_args",
   "math.maxArr": "scr_math_max_arr",
   "math.minArr": "scr_math_min_arr",
@@ -61,6 +83,8 @@ export const LIB_FN_SYMS: Record<string, string> = {
   // refuses by name like the rest of the throwing tier.
   "str.encodeUriComponent": "scr_str_encode_uri_component",
   "error.cause": "scr_error_cause",
+  "error.setCause": "scr_error_set_cause",
+  "error.deleteCause": "scr_error_delete_cause",
   "error.hasCause": "scr_error_has_cause",
   // DOMException: construction and the read surface never throw; the
   // WebIDL clone's option validation throws (may-throw pending check).
@@ -117,6 +141,11 @@ export const LIB_FN_SYMS: Record<string, string> = {
   "process.execPath": "scr_process_exec_path",
   "process.arch": "scr_process_arch",
   "process.versionsNode": "scr_process_versions_node",
+  "process.versions": "scr_process_versions",
+  "process.builtinId": "scr_process_builtin_id",
+  "global.native": "scr_global_native",
+  "process.builtinModule": "scr_process_builtin_module",
+  "process.builtinUnsupported": "scr_process_builtin_unsupported",
   "process.versionsOpenssl": "scr_process_versions_openssl",
   "process.umask": "scr_process_umask",
   "process.uptime": "scr_process_uptime",
@@ -157,6 +186,7 @@ export const LIB_FN_SYMS: Record<string, string> = {
   "process.envUnset": "scr_env_unset",
   "process.envPairs": "scr_env_pairs",
   "process.stdoutWrite": "scr_process_stdout_write",
+  "process.stdio": "scr_process_stdio",
   "process.stderrWrite": "scr_process_stderr_write",
   "process.isTTY": "scr_process_is_tty",
   "date.now": "scr_date_now",
@@ -203,6 +233,7 @@ export const LIB_FN_SYMS: Record<string, string> = {
   "fs.rmdirSync": "scr_fs_rmdir",
   "fs.readdirSync": "scr_fs_readdir",
   "fs.realpathSync": "scr_fs_realpath",
+  "fs.realpathNativeSync": "scr_fs_realpath_promise",
   "fs.unlinkSync": "scr_fs_unlink",
   "fs.chmodSync": "scr_fs_chmod",
   "fs.copyFileSync": "scr_fs_copyfile",
@@ -244,6 +275,8 @@ export const LIB_FN_SYMS: Record<string, string> = {
   // leniently (never throws), concat copies its borrowed list; the sync
   // fs Buffer pair and zlib.inflateSync ride the may-throw check.
   "buffer.fromStr": "scr_bytes_from_str",
+  "buffer.brand": "scr_bytes_as_buffer",
+  "buffer.fromDyn": "scr_buffer_from_dyn",
   "buffer.concat": "scr_bytes_concat",
   "buffer.concatLen": "scr_bytes_concat_len",
   "buffer.byteLenStr": "scr_bytes_byte_length_str",
@@ -251,7 +284,10 @@ export const LIB_FN_SYMS: Record<string, string> = {
   // The checked-dynamic compare/equals validators (scr_bytes_io.c):
   // Node's argument ladders throw catchably (MAY_THROW_LIB_FNS).
   "dyn.toStringCoerce": "scr_dyn_string_coerce_js",
+  "dyn.numberConstructor": "scr_dyn_number_constructor",
   "dyn.toNumberCoerce": "scr_dyn_number_coerce",
+  "dyn.add": "scr_dyn_add",
+  "dyn.proxyNew": "scr_dyn_proxy_new",
   "buffer.compareChk": "scr_buffer_compare_chk",
   "bytes.equalsChk": "scr_bytes_equals_chk",
   "bytes.compareChk": "scr_bytes_compare_chk",
@@ -265,6 +301,7 @@ export const LIB_FN_SYMS: Record<string, string> = {
   "fs.readFileSyncBuf": "scr_fs_read_file_bytes",
   "fs.readFileSyncBytes": "scr_fs_read_file_bytes",
   "fs.writeFileSyncBytes": "scr_fs_write_file_bytes",
+  "fs.appendFileSyncBytes": "scr_fs_append_file_bytes",
   "fs.readFdSyncBytes": "scr_fs_read_fd_bytes",
   // Stats snapshots (scr_lib.c): statSync/lstatSync throw like the other
   // sync fs calls; the getters are pure reads.
@@ -354,6 +391,7 @@ export const LIB_FN_SYMS: Record<string, string> = {
   // constructions +1; url.new, the fileURLToPath pair, the win32
   // pathToFileURL flavor, and sp.fromPairs throw catchably (may-throw).
   "url.new": "scr_url_new",
+  "url.newBase": "scr_url_new_base",
   "url.protocol": "scr_url_protocol",
   "url.origin": "scr_url_origin",
   "url.username": "scr_url_username",
@@ -369,6 +407,7 @@ export const LIB_FN_SYMS: Record<string, string> = {
   "url.fileURLToPathUrl": "scr_url_to_path",
   "url.fileURLToPathStr": "scr_url_str_to_path",
   "url.pathToFileURL": "scr_url_from_path",
+  "url.pathToFileURLPlatform": "scr_url_from_path_platform",
   "url.pathToFileURLWin32": "scr_url_from_path",
   "sp.new": "scr_sp_new",
   "sp.parse": "scr_sp_parse",
@@ -490,6 +529,7 @@ export const LIB_FN_SYMS: Record<string, string> = {
   // ambient-this read never throw. The fs dyn read is the sync-fs story.
   "fetch.start": "scr_fetch_static",
   "fetch.responseNew": "scr_fetch_response_new",
+  "fetch.responseArrayBuffer": "scr_fetch_response_array_buffer",
   "fetch.responseJson": "scr_fetch_response_json",
   "fetch.responseText": "scr_fetch_response_text",
   "fetch.responseBytes": "scr_fetch_response_bytes",
@@ -504,14 +544,30 @@ export const LIB_FN_SYMS: Record<string, string> = {
   "json.parseReviver": "scr_json_parse_reviver",
   "json.stringifyReplacer": "scr_json_stringify_replacer",
   "dyn.keySet": "scr_dyn_key_set",
+  "dyn.keySetComputed": "scr_dyn_key_set_computed",
+  "dyn.keyDelete": "scr_dyn_key_delete",
+  "dyn.globalSymbolGet": "scr_dyn_global_symbol_get",
+  "dyn.globalSymbolSet": "scr_dyn_global_symbol_set",
+  "dyn.globalSymbolHas": "scr_dyn_global_symbol_has",
+  "dyn.globalSymbolDelete": "scr_dyn_global_symbol_delete",
+  "dyn.typedRefIs": "scr_dyn_typed_ref_is_key",
   "dyn.iterPack": "scr_dyn_iter_pack",
+  "dyn.mapSeedEntries": "scr_dyn_map_seed_entries",
+  "dyn.mapSeedEntry": "scr_dyn_map_seed_entry",
   "dyn.arrLen": "scr_dyn_arr_len",
   "dyn.arrAt": "scr_dyn_arr_at",
   "dyn.hasKey": "scr_dyn_has_key",
   "dyn.defineProps": "scr_dyn_define_props",
+  "dyn.defineProperty": "scr_dyn_define_property",
+  "dyn.getOwnPropertyDescriptor": "scr_dyn_get_own_property_descriptor",
+  "dyn.arrayProtoCall": "scr_dyn_array_proto_call",
   "dyn.typeof": "scr_dyn_typeof",
   "dyn.objectTag": "scr_dyn_object_tag",
-  "dyn.toString": "scr_dyn_to_string_method",
+  "dyn.freeze": "scr_dyn_freeze",
+  "dyn.isFrozen": "scr_dyn_is_frozen",
+  "dyn.nativeSetIs": "scr_dyn_native_set_is",
+  "dyn.nativeRegexIs": "scr_dyn_native_regex_is",
+  "dyn.toString": "scr_dyn_to_string_argument",
   "dyn.this": "scr_dyn_this_get",
   "insp.dyn": "scr_insp_dyn",
   "insp.dynS": "scr_insp_dyn_s",
@@ -551,6 +607,7 @@ export const LIB_FN_SYMS: Record<string, string> = {
   "emitter.emitError": "scr_emitter_emit_error",
   "emitter.count": "scr_emitter_listener_count",
   "emitter.countFn": "scr_emitter_listener_count_fn",
+  "emitter.countDyn": "scr_emitter_listener_count_dyn",
   "emitter.names": "scr_emitter_event_names",
   "emitter.listeners": "scr_emitter_listeners",
   "emitter.setMax": "scr_emitter_set_max",
@@ -807,6 +864,7 @@ export const LIB_FN_SYMS: Record<string, string> = {
   // (option/DataClone/cycle errors), and new RegExp's eager compile
   // (catchable SyntaxError) — all may-throw generics over the checked-dynamic tree.
   "dyn.objKeys": "scr_dyn_obj_keys",
+  "dyn.forInKeys": "scr_dyn_for_in_keys",
   "dyn.hasOwn": "scr_dyn_has_own",
   "dyn.assign": "scr_dyn_assign",
   // variadic Object.assign: the source pack (push never throws; the
@@ -823,6 +881,7 @@ export const LIB_FN_SYMS: Record<string, string> = {
   "dyn.cloneMissing": "scr_structured_clone_missing",
   "dyn.cloneTransferFail": "scr_structured_clone_transfer_fail",
   "regex.new": "scr_regex_new",
+  "regex.newChecked": "scr_regex_new_checked",
   // queueMicrotask's checked-dynamic form (borrowed dyn; a non-function
   // throws synchronously), the minted setImmediate value, and the
   // timers/promises immediate — all mark the loop live.
@@ -832,6 +891,7 @@ export const LIB_FN_SYMS: Record<string, string> = {
 };
 
 export const USES_TIMERS_LIB_FNS = new Set<string>([
+  "process.stdio",
   "fetch.start",
   "fetch.abortTimeout", "fetch.streamNew", "fetch.streamFrom",
   "readable.new", "writable.new", "duplex.new", "transform.new", "passthrough.new",

@@ -33,7 +33,7 @@ export function emitFunction(emitter: CEmitter, fn: IrFunction): void {
     emitter.currentGenerator = fn.generator ?? null;
     emitter.labelCounter = 0;
     emitter.currentLocals = new Map(fn.locals.map((l) => [l.id, l]));
-    emitter.captureIds = new Set((fn.captures ?? []).map((c) => c.localId));
+    emitter.captureIds = new Set([...(fn.captures ?? []), ...(fn.classCaptures ?? [])].map((c) => c.localId));
     emitter.integerLoopBindings.clear();
     emitter.integerRanges = analyzeIntegerRanges(fn);
 
@@ -54,6 +54,12 @@ export function emitFunction(emitter: CEmitter, fn: IrFunction): void {
     // whole call (the closure owns them): bound here, never released here.
     (fn.captures ?? []).forEach((c, i) => {
       emitter.line(`ScrBox *${mangleLocal(c.localId)} = sc_env->caps[${i}]; /* captured ${c.name} */`);
+    });
+    (fn.classCaptures ?? []).forEach((c) => {
+      const self = fn.params[0]!;
+      const local = emitter.currentLocals.get(self.localId)!;
+      const receiver = local.boxed ? mangleRawParam(self.localId) : mangleLocal(self.localId);
+      emitter.line(`ScrBox *${mangleLocal(c.localId)} = ${receiver}->sc_class->caps[${c.slot}]; /* captured ${c.name} */`);
     });
 
     const paramIds = new Set(fn.params.map((p) => p.localId));
@@ -654,7 +660,12 @@ function emitStmtBody(emitter: CEmitter, s: IrStmt): void {
         // value and remove the slot from this return's own unwind path.
         let pendingEntry: { index: number; entry: (typeof emitter.scopes)[number][number] } | null = null;
         let value: ReturnType<typeof emitter.emitExpr> | null = null;
-        if (s.value) value = emitter.emitExpr(s.value);
+        if (s.value) {
+          const emitted = emitter.emitExpr(s.value);
+          // A void expression still runs before finally, but has no C value
+          // to park in the pending-return slot (or return from the function).
+          if (s.value.type.kind !== "void") value = emitted;
+        }
         const pendingIndex = emitter.pendingReturnScopeIndex;
         if (pendingIndex !== null && isRefCounted(emitter.currentReturnType)) {
           const scope = emitter.scopes[pendingIndex]!;
@@ -716,9 +727,11 @@ function emitStmtBody(emitter: CEmitter, s: IrStmt): void {
         } else if (t.kind === "symbol" || t.kind === "bigint" || t.kind === "func" || t.kind === "classval") {
           const rc = vAdapters(t);
           emitter.line(`scr_throw_primitive_ref(${v.name}, &${rc.retain}, &${rc.release}, NULL);${emitter.srcComment(s.loc)}`);
-        } else if (t.kind === "dyn" || t.kind === "jsval") {
+        } else if (t.kind === "dyn") {
+          emitter.line(`scr_dyn_throw(${v.name});${emitter.srcComment(s.loc)}`);
+        } else if (t.kind === "jsval") {
           const rc = vAdapters(t);
-          const test = t.kind === "dyn" ? "scr_dyn_is_object" : "scr_jsval_is_object";
+          const test = "scr_jsval_is_object";
           emitter.line(`scr_throw_ref_classified(${v.name}, &${rc.retain}, &${rc.release}, ${emitter.traceArgC(t)}, ${test}(${v.name}));${emitter.srcComment(s.loc)}`);
         } else {
           const rc = vAdapters(t);

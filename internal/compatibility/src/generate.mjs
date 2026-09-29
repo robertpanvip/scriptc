@@ -598,6 +598,12 @@ function publicDetail(tier) {
   if (source.startsWith("surface-manifest:")) return "Implemented for the call shapes accepted by the compiler lowering.";
   if (source.startsWith("compiler-dedicated:")) return "Implemented by a dedicated static compiler/runtime path.";
   if (source.startsWith("compiler-feature:")) {
+    if (/^compiler-feature:process\.std(?:in|out|err)$/.test(source)) {
+      return "Stored JavaScript process streams support native input listeners, pause/resume and buffered reads, synchronous output writes, and output write replacement; other stream operations remain unsupported.";
+    }
+    if (source === "compiler-feature:url.URL") {
+      return "Supports absolute inputs and relative inputs with string or URL bases; setters and some WHATWG parsing behavior remain unsupported.";
+    }
     if (/^compiler-feature:(?:globals\.Text(?:Encoder|Decoder)|util\.(?:util\.Text(?:Encoder|Decoder)|text(?:Encoder\.encode|Decoder\.decode)))$/.test(source)) {
       return "Native codec values support UTF-8 encoding and whole-buffer decoding with recognized literal labels and default options.";
     }

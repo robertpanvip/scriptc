@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { generateAstViews } from "./generate-ts7-ast-views.mjs";
 
 // The binary AST is an unstable TypeScript protocol. Generate its constants
 // from the installed, pinned package; never translate TypeScript 5 numbers.
@@ -15,6 +16,44 @@ const protocol = require(join(packageRoot, "dist/api/node/protocol.js"));
 const { SyntaxKind } = require(join(packageRoot, "dist/enums/syntaxKind.js"));
 const { NodeFlags } = require(join(packageRoot, "dist/enums/nodeFlags.js"));
 const { ModifierFlags } = require(join(packageRoot, "dist/enums/modifierFlags.js"));
+
+// The frontend's runtime enum surface is part of the same pinned protocol.
+// Emit real enum declarations so member types retain the TS7/TS5 fence and
+// reverse lookups keep the SDK's last-alias spelling.
+const enumNames = [
+  "InternalSymbolName", "ModifierFlags", "NodeFlags", "ScriptKind", "ScriptTarget", "SyntaxKind", "TokenFlags",
+  "DiagnosticCategory", "ElementFlags", "ModuleKind", "NodeBuilderFlags", "ObjectFlags", "SignatureFlags",
+  "SignatureKind", "SymbolFlags", "TypeFlags", "TypePredicateKind", "ModuleResolutionKind", "ModuleDetectionKind", "OuterExpressionKinds", "LanguageVariant",
+];
+const enumLines = [
+  "/* eslint-disable @typescript-eslint/no-duplicate-enum-values -- TypeScript aliases are part of the protocol. */",
+  `// Generated from typescript@${version} by scripts/generate-ts7-ast-schema.mjs.`,
+  "// TypeScript is Copyright Microsoft Corporation, licensed under Apache-2.0.",
+  "// Regenerate when changing the TypeScript pin; do not edit by hand.",
+];
+for (const name of enumNames) {
+  const basename = name[0].toLowerCase() + name.slice(1);
+  const declaration = readFileSync(join(packageRoot, "dist/enums", `${basename}.enum.d.ts`), "utf8");
+  const match = declaration.match(new RegExp(`export declare enum ${name} \\{[\\s\\S]*?\\n\\}`));
+  if (!match) throw new Error(`Missing TypeScript enum: ${name}`);
+  enumLines.push("", match[0].replace("export declare enum", "export enum"));
+  if (["SyntaxKind", "ScriptTarget", "ModuleKind", "ModuleResolutionKind", "ModuleDetectionKind"].includes(name)) {
+    const values = require(join(packageRoot, "dist/enums", `${basename}.js`))[name];
+    enumLines.push("", `/** Numeric lookup with the SDK's aliases and undefined for unknown values. */`,
+      `export function ${basename}Name(value: number): string | undefined {`, "  switch (value) {");
+    for (const [key, value] of Object.entries(values)) {
+      if (typeof value === "string" && Number.isFinite(Number(key))) enumLines.push(`    case ${key}: return ${JSON.stringify(value)};`);
+    }
+    enumLines.push("    default: return undefined;", "  }", "}");
+  }
+}
+const enumOutput = enumLines.join("\n") + "\n";
+const enumTarget = join(root, "packages/compiler/src/frontend/ts7/enums.generated.ts");
+if (process.argv.includes("--check")) {
+  if (readFileSync(enumTarget, "utf8") !== enumOutput) throw new Error("TypeScript enums are stale; run node scripts/generate-ts7-ast-schema.mjs");
+} else {
+  writeFileSync(enumTarget, enumOutput);
+}
 
 const lines = [
   `// Generated from typescript@${version} by scripts/generate-ts7-ast-schema.mjs.`,
@@ -84,15 +123,54 @@ if (process.argv.includes("--check")) {
   writeFileSync(semanticTarget, semanticOutput);
 }
 
+// Session metadata travels as ordinary JSON records. Generate its complete
+// pinned shape too: parsing options or diagnostics must not pull SDK values
+// into a statically compiled client through their type declarations.
+const sessionTypes = new Map([
+  ["CompilerOptions", "Ts7CompilerOptionsData"],
+  ["InitializeResponse", "Ts7InitializeData"],
+  ["ConfigResponse", "Ts7ConfigData"],
+  ["UpdateSnapshotResponse", "Ts7SnapshotData"],
+  ["ProjectResponse", "Ts7ProjectData"],
+  ["SourceFileMetadata", "Ts7SourceMetadata"],
+  ["SnapshotChanges", "Ts7SnapshotChangeData"],
+  ["ProjectFileChanges", "Ts7ProjectChangeData"],
+  ["Diagnostic", "Ts7DiagnosticData"],
+]);
+const sessionDeclarations = protoDeclarations + "\n" +
+  readFileSync(join(packageRoot, "dist/api/compilerOptions.d.ts"), "utf8") + "\n" +
+  readFileSync(join(packageRoot, "dist/api/sync/types.d.ts"), "utf8");
+const sessionLines = semanticLines.slice(0, 3);
+for (const [name] of sessionTypes) {
+  const declaration = sessionDeclarations.match(new RegExp(`export interface ${name} \\{[\\s\\S]*?\\n\\}`));
+  if (!declaration) throw new Error(`Missing TypeScript session response: ${name}`);
+  const text = declaration[0].replace(/\/\*[\s\S]*?\*\/|[A-Za-z_][A-Za-z0-9_]*/g, (word) => {
+    if (word === "Path") return "string";
+    if (["JsxEmit", "ModuleDetectionKind", "ModuleKind", "ModuleResolutionKind", "NewLineKind", "ScriptTarget", "DiagnosticCategory"].includes(word)) return "number";
+    return sessionTypes.get(word) ?? word;
+  });
+  sessionLines.push("", text);
+}
+const sessionOutput = sessionLines.join("\n") + "\n";
+const sessionTarget = join(root, "packages/compiler/src/frontend/ts7/session-schema.generated.ts");
+if (process.argv.includes("--check")) {
+  if (readFileSync(sessionTarget, "utf8") !== sessionOutput) throw new Error("TypeScript session schema is stale; run node scripts/generate-ts7-ast-schema.mjs");
+} else {
+  writeFileSync(sessionTarget, sessionOutput);
+}
+
 // Child names alone cannot distinguish arrays from nodes (attributes and
 // children can be either). Read that distinction from the pinned client's
 // declarations, and require every wire property to have a declared getter.
 const declarations = readFileSync(join(packageRoot, "dist/api/node/node.generated.d.ts"), "utf8");
 const names = [...new Set(Object.values(protocol.childProperties).flat())].sort();
-const getters = names.map((name) => {
+// These views adapt TS7's shared postfix slot and reparsed JSDoc bodies.
+// Their implementations live outside the generated region in AstNode.
+const adaptedGetters = new Set(["body", "questionToken"]);
+const getters = names.filter((name) => !adaptedGetters.has(name)).map((name) => {
   const match = declarations.match(new RegExp(`get ${name}\\(\\): ([^;]+);`));
   if (!match) throw new Error(`Missing AST child declaration: ${name}`);
-  const type = match[1].replaceAll("RemoteNodeList", "AstNode[]").replaceAll("RemoteNode", "AstNode");
+  const type = match[1].replaceAll("RemoteNodeList", "readonly AstNode[]").replaceAll("RemoteNode", "AstNode");
   const method = type.includes("AstNode |") && type.includes("AstNode[]") ? "child" : type.includes("AstNode[]") ? "childList" : "childNode";
   return `  get ${name}(): ${type} { return this.${method}(${JSON.stringify(name)}); }`;
 });
@@ -110,3 +188,4 @@ if (process.argv.includes("--check")) {
 } else {
   writeFileSync(nodeTarget, after);
 }
+generateAstViews(root, packageRoot, version, process.argv.includes("--check"));

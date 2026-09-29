@@ -96,6 +96,7 @@ export class SemanticSnapshot {
     this.disposed = true;
     for (const project of this.projects.values()) project.dispose();
     this.projects.clear();
+    for (const symbol of this.symbols.values()) symbol.dispose();
     this.symbols.clear();
   }
 }
@@ -103,6 +104,7 @@ export class SemanticSnapshot {
 export class SemanticProject {
   private readonly types = new Map<number, SemanticType>();
   private readonly signatures = new Map<number, SemanticSignature>();
+  private readonly cleanups: (() => void)[] = [];
   private disposed = false;
 
   constructor(readonly id: string, readonly snapshot: SemanticSnapshot, readonly program: SemanticProgram) {}
@@ -110,6 +112,13 @@ export class SemanticProject {
   ensureActive(): void {
     this.snapshot.ensureActive();
     if (this.disposed) throw new Error("TypeScript semantic project is disposed");
+  }
+
+  /** Project-local consumers register cleanup without adding a global root.
+   * Registration after disposal is rejected just like semantic queries. */
+  onDispose(cleanup: () => void): void {
+    this.ensureActive();
+    this.cleanups.push(cleanup);
   }
 
   request<T>(method: string, query: SemanticQuery = {}): T {
@@ -216,8 +225,13 @@ export class SemanticProject {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    for (const type of this.types.values()) type.dispose();
     this.types.clear();
     this.signatures.clear();
+    // Detach before invoking callbacks so reentrant disposal is harmless.
+    const cleanups = this.cleanups.slice();
+    this.cleanups.length = 0;
+    for (const cleanup of cleanups) cleanup();
   }
 }
 
@@ -292,13 +306,32 @@ export class SemanticSymbol {
     if (this.exportsCache === undefined) this.exportsCache = this.table("getExportsOfSymbol");
     return this.exportsCache;
   }
+  dispose(): void {
+    this.membersCache?.clear();
+    this.exportsCache?.clear();
+    this.membersCache = undefined;
+    this.exportsCache = undefined;
+  }
   getJsDocTags(checker: SemanticChecker): SemanticJsDocTag[] { return checker.getJsDocTagsOfSymbol(this); }
   getDocumentationComment(checker: SemanticChecker): string { return checker.getDocumentationCommentOfSymbol(this); }
 }
 
-/** Kind-specific accessors share one nominal layout. The legacy frontend
- * still narrows its type-only SDK interfaces at the boundary; native code
- * uses this concrete class and tests the same flag predicates. */
+/** Type refinements keep the same native object, including its project and
+ * lazy handle caches. Narrowed fields are read from their original storage. */
+export interface SemanticObjectType extends SemanticType { readonly objectFlags: number; }
+export interface SemanticIntrinsicType extends SemanticType { readonly intrinsicName: string; }
+export interface SemanticLiteralType extends SemanticType { readonly value: string | number | boolean | bigint; }
+export interface SemanticStringLiteralType extends SemanticLiteralType { readonly value: string; }
+export interface SemanticNumberLiteralType extends SemanticLiteralType { readonly value: number; }
+export interface SemanticBigIntLiteralType extends SemanticLiteralType { readonly value: bigint; }
+export interface SemanticBooleanLiteralType extends SemanticLiteralType { readonly value: boolean; }
+export interface SemanticTupleType extends SemanticObjectType {
+  readonly elementFlags: number[];
+  readonly fixedLength: number;
+  readonly readonly: boolean;
+}
+
+/** Kind-specific accessors share one nominal layout. */
 export class SemanticType {
   readonly id: number;
   readonly flags: number;
@@ -312,6 +345,7 @@ export class SemanticType {
   readonly texts: string[] | undefined;
   private trueType: number | false = false;
   private falseType: number | false = false;
+  private constituents: SemanticType[] | undefined;
 
   constructor(private readonly data: TypeResponse, readonly project: SemanticProject) {
     this.id = data.id;
@@ -350,8 +384,10 @@ export class SemanticType {
   getTypes(): SemanticType[] | undefined {
     this.project.ensureActive();
     if ((this.flags & (TypeFlags.UnionOrIntersection | TypeFlags.TemplateLiteral)) === 0) return undefined;
-    return this.project.fetchTypes(this.id, "getTypesOfType");
+    if (this.constituents === undefined) this.constituents = this.project.fetchTypes(this.id, "getTypesOfType");
+    return this.constituents;
   }
+  dispose(): void { this.constituents = undefined; }
   getBaseTypes(): SemanticType[] | undefined {
     this.project.ensureActive();
     if (!this.isClassOrInterface()) return undefined;
@@ -373,14 +409,14 @@ export class SemanticType {
   isClassOrInterface(): boolean { return this.isObjectType() && ((this.objectFlags ?? 0) & ObjectFlags.ClassOrInterface) !== 0; }
   isUnionType(): boolean { return (this.flags & TypeFlags.Union) !== 0; }
   isIntersectionType(): boolean { return (this.flags & TypeFlags.Intersection) !== 0; }
-  isObjectType(): boolean { return (this.flags & TypeFlags.Object) !== 0; }
-  isIntrinsicType(): boolean { return (this.flags & TypeFlags.Intrinsic) !== 0; }
+  isObjectType(): this is SemanticObjectType { return (this.flags & TypeFlags.Object) !== 0; }
+  isIntrinsicType(): this is SemanticIntrinsicType { return (this.flags & TypeFlags.Intrinsic) !== 0; }
   isErrorType(): boolean { return this.isIntrinsicType() && this.intrinsicName === "error"; }
-  isLiteralType(): boolean { return (this.flags & TypeFlags.Literal) !== 0; }
-  isStringLiteralType(): boolean { return (this.flags & TypeFlags.StringLiteral) !== 0; }
-  isNumberLiteralType(): boolean { return (this.flags & TypeFlags.NumberLiteral) !== 0; }
-  isBigIntLiteralType(): boolean { return (this.flags & TypeFlags.BigIntLiteral) !== 0; }
-  isBooleanLiteralType(): boolean { return (this.flags & TypeFlags.BooleanLiteral) !== 0; }
+  isLiteralType(): this is SemanticLiteralType { return (this.flags & TypeFlags.Literal) !== 0; }
+  isStringLiteralType(): this is SemanticStringLiteralType { return (this.flags & TypeFlags.StringLiteral) !== 0; }
+  isNumberLiteralType(): this is SemanticNumberLiteralType { return (this.flags & TypeFlags.NumberLiteral) !== 0; }
+  isBigIntLiteralType(): this is SemanticBigIntLiteralType { return (this.flags & TypeFlags.BigIntLiteral) !== 0; }
+  isBooleanLiteralType(): this is SemanticBooleanLiteralType { return (this.flags & TypeFlags.BooleanLiteral) !== 0; }
   isTypeReference(): boolean { return this.isObjectType() && ((this.objectFlags ?? 0) & ObjectFlags.Reference) !== 0; }
   isTupleType(): boolean { return this.isObjectType() && ((this.objectFlags ?? 0) & ObjectFlags.Tuple) !== 0; }
   isIndexType(): boolean { return (this.flags & TypeFlags.Index) !== 0; }
