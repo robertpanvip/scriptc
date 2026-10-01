@@ -13,7 +13,7 @@
  *     "profile_format": 1,
  *     "name": "<embedder identity string>",
  *     "entry": "src/lib.ts",                  // ONE module, profile-relative
- *     "emission": "llvm" | "c",                // pins the emission; no fallback
+ *     "emission": "llvm",                // pins the emission; no fallback
  *     "optimization": "release" | "dev",       // optional; default release
  *     "abi": {
  *       "prefix": "<prefix>_",
@@ -370,10 +370,12 @@ export interface LibraryProfile {
   /** Resolved absolute path of the ONE entry module. */
   entry: string;
   /** The pinned emission — no fallback concept exists on the library path. */
-  emission: "llvm" | "c";
+  emission: "llvm";
   /** Native optimizer posture. release preserves the production -O2 archive;
    * dev uses -O0 for fast iterative embedding builds. */
   optimization: "release" | "dev";
+  /** Explicit source-inference attempts, including packages without declarations. */
+  npmStatic: string[];
   prefix: string;
   initSymbol: string;
   sinkRegisterSymbol: string;
@@ -440,7 +442,7 @@ class ProfileError extends Error {
 }
 
 function req<T>(v: unknown, path: string, kind: "string" | "number" | "boolean"): T {
-  if (typeof v !== kind) {
+  if (!(kind === "string" ? typeof v === "string" : kind === "number" ? typeof v === "number" : typeof v === "boolean")) {
     throw new ProfileError(`'${path}' must be a ${kind}${v === undefined ? " (missing)" : ""}`);
   }
   return v as T;
@@ -498,7 +500,7 @@ export function loadLibraryProfile(
     // the root would otherwise be silently inert — the exact footgun the
     // fence machinery refuses everywhere else.
     for (const k of Object.keys(p)) {
-      if (["profile_format", "name", "entry", "emission", "optimization", "abi", "exports", "callbacks", "sidecar", "determinism"].includes(k)) continue;
+      if (["profile_format", "name", "entry", "emission", "optimization", "npm_static", "abi", "exports", "callbacks", "sidecar", "determinism"].includes(k)) continue;
       if (k === "fences" || k === "teachings" || k === "remediations") {
         throw new ProfileError(
           `'${k}' at the profile root does nothing — the ask-5 determinism surface lives under 'determinism.${k}'; move it there`,
@@ -507,12 +509,17 @@ export function loadLibraryProfile(
       throw new ProfileError(`unknown field '${k}' (root keys are strict: a typo here would silently change the build; remove it)`);
     }
     const name = req<string>(p["name"], "name", "string");
+    const npmStaticRaw = p["npm_static"] === undefined ? [] : p["npm_static"];
+    if (!Array.isArray(npmStaticRaw) || npmStaticRaw.some((name) => typeof name !== "string" || !/^(?:@[a-z0-9_.-]+\/)?[a-z0-9_][a-z0-9_.-]*$/.test(name))) {
+      throw new ProfileError("'npm_static' must be an array of npm package names (not subpath specifiers)");
+    }
+    const npmStatic = [...new Set(npmStaticRaw as string[])];
     if (name === "") throw new ProfileError("'name' must be a non-empty identity string");
     const entryRel = req<string>(p["entry"], "entry", "string");
     if (entryRel === "") throw new ProfileError("'entry' must name the profile's one entry module");
     const emission = req<string>(p["emission"], "emission", "string");
-    if (emission !== "llvm" && emission !== "c") {
-      throw new ProfileError(`'emission' must be "llvm" or "c", got '${emission}'`);
+    if (emission !== "llvm") {
+      throw new ProfileError(`'emission' must be "llvm"; C emission has been removed, got '${emission}'`);
     }
     const optimization = p["optimization"] === undefined
       ? "release"
@@ -861,11 +868,12 @@ export function loadLibraryProfile(
             if (prefix === "") throw new ProfileError(`'${path}.prefix' must be a non-empty manifest id prefix`);
             decl.prefix = prefix;
           }
-          for (const rider of ["teaching", "remediation"] as const) {
+          for (const rider of ["teaching", "remediation"] as ("teaching" | "remediation")[]) {
             if (ff[rider] === undefined) continue;
             const text = req<string>(ff[rider], `${path}.${rider}`, "string");
             checkRiderText(text, `${path}.${rider}`);
-            decl[rider] = text;
+            if (rider === "teaching") decl.teaching = text;
+            else decl.remediation = text;
           }
           return decl;
         });
@@ -885,6 +893,7 @@ export function loadLibraryProfile(
         entry,
         emission,
         optimization,
+        npmStatic,
         prefix,
         initSymbol,
         sinkRegisterSymbol,

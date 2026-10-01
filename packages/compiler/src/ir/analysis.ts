@@ -66,6 +66,7 @@ export function dynDesc(
   switch (t.kind) {
     case "f64": return "number";
     case "bigint": return "bigint";
+    case "symbol": return "symbol";
     case "string": return "string";
     case "bool": return "boolean";
     case "record": return recordsById.get(t.shapeId)?.tuple ? "array" : "object";
@@ -82,9 +83,11 @@ export function dynDesc(
     }
     case "func": return "function";
     case "classval": return "class constructor";
+    case "generator": return t.async ? "AsyncGenerator" : "Generator";
     case "map": return "Map";
     case "set": return "Set";
     case "regex": return "RegExp";
+    case "url": return "URL";
     default: {
       const handle = DYN_HANDLE_KINDS.get(t.kind);
       if (handle) return handle.cls;

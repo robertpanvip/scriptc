@@ -26,6 +26,43 @@ export function validatorCases(): ValidatorCase[] {
     cases.push({ name, module, ...(diagnostic ? { diagnostic } : {}) });
   };
   add("empty module", () => {});
+  for (const direction of ["left", "right", "alternating"]) {
+    for (const invalid of [false, true]) {
+      add(`deep logical ${direction} ${invalid ? "invalid" : "valid"}`, (m) => {
+        let tree: IrExpr = invalid ? { kind: "boolLit", value: true, type: F64, loc } : boolLit(true, loc);
+        for (let depth = 0; depth < 128; depth++) {
+          const leaf = boolLit(depth % 2 === 0, loc);
+          const left = direction === "left" || (direction === "alternating" && depth % 2 === 0);
+          tree = { kind: "logical", op: depth % 2 === 0 ? "&&" : "||",
+            left: left ? tree : leaf, right: left ? leaf : tree, type: BOOL, loc };
+        }
+        m.functions[0]!.body = [expression(tree)];
+      }, invalid ? "boolLit must be bool" : undefined);
+    }
+  }
+  for (const arm of ["cond", "then", "else", "mixed"]) {
+    for (const invalid of [false, true]) {
+      add(`deep conditional ${arm} ${invalid ? "invalid" : "valid"}`, (m) => {
+        const nullable: IrType = { kind: "union", unionId: "optional-bool" };
+        m.unions = [{ id: "optional-bool", arms: [BOOL, { kind: "undefinedT" }] }];
+        let tree: IrExpr = invalid ? { kind: "boolLit", value: true, type: F64, loc } : boolLit(true, loc);
+        for (let depth = 0; depth < 128; depth++) {
+          const leaf = boolLit(depth % 2 === 0, loc);
+          if (arm === "mixed" && depth % 3 === 0) {
+            tree = { kind: "logical", op: "&&", left: leaf, right: tree, type: BOOL, loc };
+          } else if (arm === "mixed" && depth % 3 === 1) {
+            tree = { kind: "nullish", left: { kind: "unionWrap", unionId: "optional-bool", tag: 1,
+              value: { kind: "unitLit", unit: "undefined", type: { kind: "undefinedT" }, loc }, type: nullable, loc },
+              right: tree, type: BOOL, loc };
+          } else {
+            tree = { kind: "ternary", cond: arm === "cond" ? tree : leaf,
+              then: arm === "then" ? tree : leaf, else_: arm === "else" || arm === "mixed" ? tree : leaf, type: BOOL, loc };
+          }
+        }
+        m.functions[0]!.body = [expression(tree)];
+      }, invalid ? "boolLit must be bool" : undefined);
+    }
+  }
   add("duplicate function", (m) => { m.functions.push(structuredClone(m.functions[0]!)); }, "duplicate function");
   add("unknown local", (m) => { m.functions[0]!.body = [expression(varRef("missing", F64, loc))]; }, "missing");
   add("parameter without local", (m) => {
@@ -98,6 +135,37 @@ export function validatorCases(): ValidatorCase[] {
   add("library signature", (m) => {
     m.functions[0]!.body = [expression({ kind: "libCall", fn: "number.isFinite", args: [strLit("wrong", loc)], type: BOOL, loc })];
   }, "expected f64");
+  for (const invalid of [false, true]) {
+    add(`library custom union result ${invalid ? "invalid" : "valid"}`, (m) => {
+      m.unions = [{ id: "env", arms: [STRING, { kind: "undefinedT" }] }];
+      m.functions[0]!.body = [expression({ kind: "libCall", fn: "process.envGet",
+        args: [strLit("PATH", loc)], type: invalid ? F64 : { kind: "union", unionId: "env" }, loc })];
+    }, invalid ? "must return the 'string | undefined' union" : undefined);
+    add(`library custom record result ${invalid ? "invalid" : "valid"}`, (m) => {
+      m.records = [{ id: "dirent", fields: [
+        { name: "%dtype", type: invalid ? STRING : F64 },
+        { name: "name", type: STRING }, { name: "parentPath", type: STRING },
+      ] }];
+      m.functions[0]!.body = [expression({ kind: "libCall", fn: "fs.readdirTypesSync",
+        args: [strLit(".", loc)], type: arrayOf({ kind: "record", shapeId: "dirent" }), loc })];
+    }, invalid ? "must return the Dirent record array" : undefined);
+  }
+  for (const [fn, diagnostic] of [
+    ["net.sockRead", "must return the 'Buffer | null' union"],
+    ["spawnRes.status", "must return the 'number | null' union"],
+    ["error.new", "must return a builtin error class"],
+    ["stream.prop", "receiver must be a stream-hierarchy object"],
+    ["emitter.new", "must return '%EventEmitter'"],
+  ] as const) {
+    add(`library specialized validation ${fn}`, (m) => {
+      m.functions[0]!.body = [expression({ kind: "libCall", fn, args: [], type: F64, loc })];
+    }, diagnostic);
+  }
+  add("library callback validation retains generic result check", (m) => {
+    m.functions[0]!.body = [expression({ kind: "libCall", fn: "cp.execFile", args: [
+      strLit("tool", loc), { kind: "arrayLit", elems: [], type: arrayOf(STRING), loc }, numLit(0, loc),
+    ], type: F64, loc })];
+  }, "must be child");
   add("duplicate records", (m) => { m.records = [{ id: "r", fields: [] }, { id: "r", fields: [] }]; }, "duplicate record");
   add("record ordering", (m) => {
     m.records = [{ id: "r", fields: [{ name: "z", type: F64 }, { name: "a", type: STRING }] }];

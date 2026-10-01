@@ -1,3 +1,4 @@
+import { typedRefConstructor } from "./shapes.js";
 /* Focused LLVM expression emission extracted from emitter.ts. */
 import { InternalCompilerError } from "../../errors.js";
 import { streamTypedRefEligible } from "../../ir/analysis.js";
@@ -36,7 +37,9 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
           isDynTypedRefType(v.type) ||
           (v.type.kind === "union" &&
             (host.unionsById.get(v.type.unionId)?.arms.some(isDynTypedRefType) ?? false));
-        if (e.liveRef || identityRef) {
+        // Bytes already box their shared mutable storage directly. A second
+        // capsule would split identity between checked and native views.
+        if ((e.liveRef && v.type.kind !== "bytes") || identityRef) {
           if (v.type.kind === "union") {
             const adapter = host.liveDynUnionRefAdapter(v.type);
             const boxed = B.tmp();
@@ -47,23 +50,12 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
             throw new InternalCompilerError(`llvm emitter bug: live dyn ref of ${typeKey(v.type)}`);
           }
           const key = typeKey(v.type);
-          let adapter = host.liveDynRefAdapters.get(key);
-          if (!adapter) {
-            const prefix = `sc_ldr_${host.liveDynRefAdapters.size}`;
-            adapter = host.streamTypedRefMaterializeAdapter(
-              v.type,
-              { prefix, adapters: new Map() },
-              `${prefix}_materialize`,
-            );
-            host.liveDynRefAdapters.set(key, adapter);
-          }
+          const adapter = host.liveDynRefAdapter(v.type);
           const rc = vAdapters(host.shapeHost, v.type);
-          host.declare(
-            `declare ptr @scr_dyn_new_typed_ref(ptr, ptr, ptr, ptr, ${host.sizeType}, ptr, ptr)`,
-          );
+
           const boxed = B.tmp();
           B.line(
-            `${boxed} = call ptr @scr_dyn_new_typed_ref(ptr ${v.name}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${host.cstr(key)}, ${host.sizeType} ${Buffer.byteLength(key, "utf8")}, ptr @${adapter.snapshot}, ptr ${adapter.commit})`,
+            `${boxed} = call ptr ${typedRefConstructor(host.shapeHost, v.type)}(ptr ${v.name}, ptr ${rc.retain}, ptr ${rc.release}, ptr ${host.cstr(key)}, ${host.sizeType} ${Buffer.byteLength(key, "utf8")}, ptr @${adapter.snapshot}, ptr ${adapter.commit})`,
           );
           return host.own({ name: boxed, type: e.type });
         }
@@ -207,13 +199,15 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
         // paths are unreachable here.
         host.declare(`declare ptr @scr_dyn_new_obj()`);
         host.declare(`declare void @scr_dyn_key_set(ptr, ptr, ptr)`);
+        host.declare(`declare void @scr_dyn_key_set_computed(ptr, ptr, ptr)`);
         const obj = B.tmp();
         B.line(`${obj} = call ptr @scr_dyn_new_obj()`);
         const out = host.own({ name: obj, type: e.type });
         for (const f of e.fields ?? []) {
           const k = host.emitExpr(f.key);
           const v = host.emitExpr(f.value);
-          B.line(`call void @scr_dyn_key_set(ptr ${obj}, ptr ${k.name}, ptr ${v.name})`);
+          B.line(`call void @${f.key.type.kind === "dyn" ? "scr_dyn_key_set_computed" : "scr_dyn_key_set"}(ptr ${obj}, ptr ${k.name}, ptr ${v.name})`);
+          host.emitPendingCheck();
         }
         return out;
       }
@@ -240,9 +234,8 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
       case "unionNarrow": {
         // Tag-UNCHECKED payload extraction: the frontend emits this only
         // where tsc's control-flow narrowing proved the tag. Ref payloads
-        // come out +1; the union temp itself releases with this
-        // statement's frame as usual.
-        const u = host.emitExpr(e.value);
+        // come out +1. The receiver is consumed before any later expression.
+        const u = host.emitReadReceiver(e.value);
         const arm = e.type;
         if (isUnitType(arm)) throw new InternalCompilerError(`llvm emitter bug: unionNarrow to unit arm ${arm.kind}`);
         const v = host.unionExtract(u.name, arm);
@@ -252,7 +245,7 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
         // Shared-field read `r.kind`: switch on the runtime tag and read
         // the (same-typed) field from the concretely-typed payload.
         // Ref-counted results come out retained (+1), owned by this frame.
-        const u = host.emitExpr(e.value);
+        const u = host.emitReadReceiver(e.value);
         const def = host.unionsById.get(e.unionId);
         if (!def) throw new InternalCompilerError(`llvm emitter bug: unionDisc of unknown union ${e.unionId}`);
         const ty = host.llType(e.type);
@@ -272,7 +265,7 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
           const value = isRefCounted(e.type) ? host.retainValue(v, e.type) : v;
           B.line(`store ${ty} ${value}, ptr ${slot}`);
           B.br(join);
-        });
+        }, host.unionFieldGroups(def, e.field));
         B.startBlock(join);
         const t = B.tmp();
         B.line(`${t} = load ${ty}, ptr ${slot}`);
@@ -401,7 +394,7 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
       }
       case "unionIsTag": {
         // A pure tag compare — the box is borrowed, no payload is touched.
-        const u = host.emitExpr(e.value);
+        const u = host.emitReadReceiver(e.value);
         const tag = host.unionTag(u.name);
         const t = B.tmp();
         B.line(`${t} = icmp ${e.negated ? "ne" : "eq"} i32 ${tag}, ${e.tag}`);
@@ -414,7 +407,7 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
         // property ladder on EITHER form; the result is owned (+1).
         const d = host.emitExpr(e.value);
         const k = host.emitExpr(e.key);
-        const helper = host.dyn.dynKeyGetHelper();
+        const helper = e.key.type.kind === "dyn" ? host.dyn.dynComputedKeyGetHelper() : host.dyn.dynKeyGetHelper();
         const t = B.tmp();
         B.line(`${t} = call ptr @${helper}(ptr ${d.name}, ptr ${k.name}, i1 ${e.optional ? "true" : "false"})`);
         const out = host.own({ name: t, type: e.type });
@@ -559,7 +552,9 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
             B.line(`${o} = or i1 ${acc}, ${c}`);
             return o;
           };
-          if (e.test === "nullish") {
+          if (e.test === "promise") {
+            test = oneOf([DYN_KIND.PROMISE]);
+          } else if (e.test === "nullish") {
             test = oneOf([DYN_KIND.UNDEF, DYN_KIND.NULL]);
           } else if (e.test === "buffer") {
             const bytes = oneOf([DYN_KIND.BYTES]);
@@ -585,6 +580,7 @@ export function emitDynamicExpr(host: LlvmEmitterContext, e: ExprOf<"dynFrom" | 
           } else {
             const kindOf: Record<string, number> = {
               bigint: DYN_KIND.BIGINT,
+              symbol: DYN_KIND.SYMBOL,
               string: DYN_KIND.STR,
               number: DYN_KIND.NUM,
               boolean: DYN_KIND.BOOL,

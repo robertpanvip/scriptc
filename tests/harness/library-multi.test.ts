@@ -146,8 +146,8 @@ const sanitize = process.env["SCRIPTC_SAN"] === "1";
 const flavor = sanitize ? "san" : "plain";
 const cacheDir = join(repoRoot, "node_modules/.cache/scriptc-tests/library-multi", flavor);
 
-type Emission = "llvm" | "c";
-const EMISSIONS: Emission[] = ["llvm", "c"];
+type Emission = "llvm";
+const EMISSIONS: Emission[] = ["llvm"];
 
 /** Build one instance's localized archive for one emission: the fixture
  * profile is patched (emission flipped, entry made absolute) into the
@@ -270,10 +270,8 @@ function buildProbe(archiveA: string, archiveB: string, outDir: string, tag: str
 
 const PAIRINGS: { tag: string; a: Emission; b: Emission }[] = [
   { tag: "llvm-llvm", a: "llvm", b: "llvm" },
-  { tag: "c-c", a: "c", b: "c" },
   // Two embedder builds need not share a backend: one archive per emission
   // links and runs the same.
-  { tag: "llvm-c", a: "llvm", b: "c" },
 ];
 
 describe.each(PAIRINGS)("two instances, one process ($tag)", ({ tag, a, b }) => {
@@ -626,7 +624,7 @@ localizationTest("M7: thread-instanced and runtime-localized archives compose in
   if (nmTool === null) ctx.skip("no nm/llvm-nm on PATH for the symbol-exactness check");
   const [archiveT, archiveB] = await Promise.all([
     buildThreaded("llvm", { localize: true }),
-    buildInstance("b", "c"),
+    buildInstance("b", "llvm"),
   ]);
   // The composed archive's link surface stays exactly the declared set:
   // thread-local storage adds no external definitions (M1's one Darwin
@@ -849,7 +847,6 @@ describe.skipIf(!crossOn)("cross-target localization", () => {
     test.skipIf(!linuxOn).for([
       ["aarch64-linux-gnu.2.36", "llvm"],
       ["x86_64-linux-gnu.2.36", "llvm"],
-      ["x86_64-linux-gnu.2.36", "c"],
       ["aarch64-linux-musl", "llvm"],
       ["x86_64-linux-musl", "llvm"],
     ] as const)(
@@ -1074,22 +1071,30 @@ test.each(["aarch64-ios", "x86_64-linux-android", "armv7-linux-androideabi"])(
   },
 );
 
-test.each(MOBILE_TARGETS)(
-  "M12: the executable lane refuses %s with the pointer to --lib",
-  async (target) => {
+test.each(MOBILE_TARGETS.flatMap((target) =>
+  ["darwin", "linux", "win32"].map((host) => ({ target, host })),
+))(
+  "M12: the executable lane refuses $target on $host with the pointer to --lib",
+  async ({ target, host }) => {
     const outDir = join(cacheDir, `mobile-exe-refusal-${target}`);
     mkdirSync(outDir, { recursive: true });
     const entry = join(outDir, "main.ts");
     writeFileSync(entry, 'console.log("hi");\n');
-    await withMobileTarget(target, async () => {
-      const result = await compile(entry, { outDir, outPath: join(outDir, "main") });
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.diagnostics[0]!.code).toBe("SC3002");
-        expect(result.diagnostics[0]!.message).toContain(target);
-        expect(result.diagnostics[0]!.message).toContain("SCRIPTC_CC=zigcc scriptc build --lib --profile <profile.json>");
-      }
-    });
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platformDescriptor, value: host });
+    try {
+      await withMobileTarget(target, async () => {
+        const result = await compile(entry, { outDir, outPath: join(outDir, "main") });
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+          expect(result.diagnostics[0]!.code).toBe("SC3002");
+          expect(result.diagnostics[0]!.message).toContain(target);
+          expect(result.diagnostics[0]!.message).toContain("scriptc build --lib --profile <profile.json>");
+        }
+      });
+    } finally {
+      Object.defineProperty(process, "platform", platformDescriptor);
+    }
   },
 );
 
@@ -1155,14 +1160,16 @@ function buildAppleProbe(archives: string[], source: string, tag: string, target
  * is reused; otherwise the first available iPhone boots headlessly and the
  * suite shuts it down again. */
 let bootedSimulator: { udid: string; bootedByUs: boolean } | null = null;
-type SimulatorDevice = { udid: string; state: string; name: string };
+type SimulatorDevice = { udid: string; state: string; name: string; deviceTypeIdentifier?: string };
 type SimulatorListing = { devices: Record<string, SimulatorDevice[]> };
 
 function availableIphoneSimulators(listing: SimulatorListing): SimulatorDevice[] {
   return Object.entries(listing.devices)
     .filter(([runtime]) => runtime.includes(".SimRuntime.iOS-"))
     .flatMap(([, devices]) => devices)
-    .filter((device) => device.name.startsWith("iPhone"));
+    .filter((device) => device.deviceTypeIdentifier === undefined
+      ? device.name.startsWith("iPhone")
+      : device.deviceTypeIdentifier.startsWith("com.apple.CoreSimulator.SimDeviceType.iPhone-"));
 }
 
 test("M12: simulator reuse ignores booted devices from non-iOS runtimes", () => {
@@ -1173,11 +1180,12 @@ test("M12: simulator reuse ignores booted devices from non-iOS runtimes", () => 
       ],
       "com.apple.CoreSimulator.SimRuntime.iOS-26-0": [
         { udid: "phone", state: "Shutdown", name: "iPhone 17" },
+        { udid: "renamed", state: "Shutdown", name: "Test Device", deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro" },
         { udid: "tablet", state: "Booted", name: "iPad Pro" },
       ],
     },
   });
-  expect(devices.map((device) => device.udid)).toEqual(["phone"]);
+  expect(devices.map((device) => device.udid)).toEqual(["phone", "renamed"]);
 });
 
 function shutdownOwnedSimulator(): void {

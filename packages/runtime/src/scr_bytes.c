@@ -70,9 +70,23 @@ static ScrBytes *scr_bytes_alloc(ScrBytesElem elem, size_t len) {
   if (!b->data) scr_bytes_oom();
   b->backing = NULL;
   b->is_buffer = false;
+  b->external = false;
 #ifdef SCR_RC_AUDIT
   scr_live_bytes++;
 #endif
+  return b;
+}
+
+ScrBytes *scr_bytes_from_external(void *data, size_t length) {
+  ScrBytes *b = scr_bytes_alloc(SCR_BYTES_U8, 0);
+  /* Keep the owned empty allocation for NULL/zero-length views: existing
+   * view operations may add zero to the data pointer. */
+  if (data) {
+    free(b->data);
+    b->data = data;
+    b->external = true;
+  }
+  b->len = length;
   return b;
 }
 
@@ -131,7 +145,7 @@ void scr_bytes_release(ScrBytes *b) {
     scr_weak_dispose(b);
     if (b->backing) {
       scr_bytes_release(b->backing); /* a view: data points into the owner */
-    } else {
+    } else if (!b->external) {
       free(b->data);
     }
 #ifdef SCR_RC_AUDIT
@@ -158,9 +172,8 @@ double scr_bytes_byte_len(const ScrBytes *b) {
 }
 
 /* ── element access ────────────────────────────────────────────────────
- * JS reads undefined and IGNORES writes out of bounds on typed arrays;
- * both are unrepresentable here, so any invalid index traps — the array
- * runtime's exact discipline (SEMANTICS.md). */
+ * Invalid writes are ignored. Typed numeric reads cannot represent
+ * undefined, so invalid reads trap; checked reads return undefined. */
 
 static size_t scr_bytes_check_index(const ScrBytes *b, double i) {
   if (!(i >= 0) || i != trunc(i) || i >= (double)b->len) {
@@ -227,7 +240,8 @@ double scr_bytes_get(const ScrBytes *b, double i) {
 }
 
 void scr_bytes_set(ScrBytes *b, double i, double v) {
-  size_t idx = scr_bytes_check_index(b, i);
+  if (!(i >= 0) || i != trunc(i) || i >= (double)b->len) return;
+  size_t idx = (size_t)i;
   switch (b->elem) {
     case SCR_BYTES_U8: case SCR_BYTES_I8:
       b->data[idx] = (uint8_t)scr_bytes_to_u32(v);
@@ -327,6 +341,7 @@ ScrBytes *scr_bytes_subarray(ScrBytes *b, double start, double end) {
   v->data = b->data + s * scr_bytes_elem_size(b->elem);
   v->backing = scr_bytes_retain(owner);
   v->is_buffer = b->is_buffer;
+  v->external = false;
 #ifdef SCR_RC_AUDIT
   scr_live_bytes++;
 #endif
@@ -539,6 +554,7 @@ ScrBytes *scr_dataview_new(ScrBytes *src, double byte_off, bool has_len, double 
   v->data = owner->data + (size_t)off;
   v->backing = scr_bytes_retain(owner);
   v->is_buffer = false;
+  v->external = false;
 #ifdef SCR_RC_AUDIT
   scr_live_bytes++;
 #endif

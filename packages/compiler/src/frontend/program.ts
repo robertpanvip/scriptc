@@ -54,6 +54,7 @@ import { isNodeModulesPath, nearestInvalidPackageJsonPath, nearestPackageType, n
 import { probeNodeImportRefusal, probeNodeRequireRefusal } from "./npm.js";
 import { isNpmStaticPackage, npmStaticActive, npmStaticFsShadow, npmStaticPackageOfPath, reportNpmStaticOffender, setNpmStaticDeclarationOverloads, setNpmStaticPackages } from "./npm-static.js";
 import { isPrunedNpmReexport, planNpmStaticReexports } from "./npm-static-prune.js";
+import { isNpmStaticSubclassArgument } from "./npm-static-subtyping.js";
 import { npmStaticDeclarationReexports, npmStaticRuntimeClassTargets, parseNpmStaticDeclarationOverloads, parseNpmStaticDeclarationProperties } from "./npm-static-declaration-syntax.js";
 import type { FrontendServices } from "./services.js";
 import type { NpmStaticDeclarationOverloads, NpmStaticDeclarationProperties, NpmStaticOverloadSignature } from "./npm-static-declaration-syntax.js";
@@ -88,6 +89,7 @@ import {
 } from "./tsc-codes.js";
 import { trackedFileExists, trackedReadFile, trackedRealpath } from "./input-tracker.js";
 import { forkTargetPaths } from "./fork-target.js";
+import { inferredJsDiagnosticSuppressed } from "./inferred-js-diagnostics.js";
 
 const BASE_OPTIONS: ts.Ts7CompilerOptions = {
   strict: true,
@@ -487,7 +489,7 @@ function createRequireProgramRoots7(program: ts.Program): string[] {
       if (canonicalBuiltinModule(spec) !== null) return "skip";
       let target = resolveProjectModule(sf.fileName, spec);
       if (target === null && !spec.startsWith("#")) {
-        const npm = resolveNpmImport7(sf.fileName, spec);
+        const npm = resolveNpmImport7(sf.fileName, spec, "require");
         if (npm !== null && isNpmStaticPackage(npm.packageName) && isJsSourceFileName(npm.typesFile)) {
           target = npm.typesFile;
         }
@@ -1391,10 +1393,12 @@ function nodeEsmSyntaxMarker7(sf: ts.SourceFile): ts.Node | null {
       found = node;
       return "stop";
     }
+    // Only await syntax needs an ancestor walk. Doing this for every node
+    // makes a deeply nested expression take quadratic time to classify.
     if (
-      !insideFunctionLike7(node) &&
       (ts.isAwaitExpression(node) ||
-        (ts.isForOfStatement(node) && node.awaitModifier !== undefined))
+        (ts.isForOfStatement(node) && node.awaitModifier !== undefined)) &&
+      !insideFunctionLike7(node)
     ) {
       found = node;
       return "stop";
@@ -1884,8 +1888,8 @@ function identifierOccurrences7(root: ts.Node, text: string): ts.Identifier[] {
  * of an imported binding are the same alias story, not reads. */
 function backEdgeUseOffence7(
   program: ts.Program,
-  sf: ts.SourceFile,
   stmt: ts.ImportDeclaration | ts.ExportDeclaration,
+  occurrences: ReadonlyMap<string, readonly ts.Identifier[]>,
 ): { name: string; node: ts.Node } | null {
   if (!ts.isImportDeclaration(stmt) || stmt.importClause === undefined) return null;
   const checker = program.getTypeChecker();
@@ -1899,25 +1903,18 @@ function backEdgeUseOffence7(
   for (const bindingName of bindingNames) {
     const sym = checker.getSymbolAtLocation(bindingName);
     if (sym === undefined) continue;
-    checker.prefetchSymbolNodesExact(identifierOccurrences7(sf, bindingName.text));
-    let offence: { name: string; node: ts.Node } | null = null;
-    const visit = (node: ts.Node): void => {
-      if (offence !== null || ts.isImportDeclaration(node)) return;
+    const references = occurrences.get(bindingName.text) ?? [];
+    checker.prefetchSymbolNodesExact(references);
+    for (const node of references) {
       if (
-        ts.isIdentifier(node) &&
-        node.text === bindingName.text &&
         !(node.parent !== undefined && ts.isExportSpecifier(node.parent)) &&
         checker.getSymbolAtLocation(node) === sym &&
         !inTypePosition7(node) &&
         !inDeferredPosition7(node)
       ) {
-        offence = { name: bindingName.text, node };
-        return;
+        return { name: bindingName.text, node };
       }
-      ts.forEachChild(node, visit);
-    };
-    visit(sf);
-    if (offence !== null) return offence;
+    }
   }
   return null;
 }
@@ -1988,6 +1985,26 @@ export function makeCycleAdmission(
   // reason the cluster's cycles stay fenced, or null when its every
   // member passes the inert-top-level bar.
   const sccVerdict = new Map<ts.SourceFile[], string | null>();
+  // A module can close many cycle edges, each importing many bindings.
+  // Index its identifiers once for this admission pass. ASTs are immutable;
+  // the pass owns the index so it cannot retain a disposed program.
+  const bindingUses = new Map<ts.SourceFile, Map<string, ts.Identifier[]>>();
+  const usesOf = (sf: ts.SourceFile): Map<string, ts.Identifier[]> => {
+    const cached = bindingUses.get(sf);
+    if (cached !== undefined) return cached;
+    const uses = new Map<string, ts.Identifier[]>();
+    ts.walkPreorder(sf, (node) => {
+      if (ts.isImportDeclaration(node)) return "skip";
+      if (ts.isIdentifier(node)) {
+        const references = uses.get(node.text);
+        if (references !== undefined) references.push(node);
+        else uses.set(node.text, [node]);
+      }
+      return undefined;
+    });
+    bindingUses.set(sf, uses);
+    return uses;
+  };
   return (importer: ts.SourceFile, e: CycleEdge): string | null => {
     if (e.stmt === undefined) return "the cycle closes through a require() edge";
     // Cheap per-edge admission: nothing readable binds through the edge.
@@ -2026,7 +2043,7 @@ export function makeCycleAdmission(
     const clusterReason = sccVerdict.get(comp);
     if (clusterReason === undefined) throw new Error("missing module-cycle verdict");
     if (clusterReason !== null) return clusterReason;
-    const use = backEdgeUseOffence7(program, importer, e.stmt);
+    const use = backEdgeUseOffence7(program, e.stmt, usesOf(importer));
     if (use !== null) {
       return `the cycle-crossing binding '${use.name}' is read at ${lineOf(use.node)}, outside any function body — a read during the init window observes the partially-initialized module (Node's TDZ ReferenceError / stale var), which is not modeled`;
     }
@@ -2052,6 +2069,7 @@ function resolveImport7(program: ts.Program, from: ts.SourceFile, specifier: str
 function resolveNpmImport7(
   fromFileName: string,
   specifier: string,
+  resolutionKind: "import" | "require" = "import",
 ): { packageName: string; version?: string; typesFile: string } | null {
   if (isRelativeSpecifier(specifier) || specifier.startsWith("node:")) {
     return null;
@@ -2060,7 +2078,7 @@ function resolveNpmImport7(
   // its attested source compiles as program modules (resolveProjectModule
   // answers the entry), so no island embed and no .d.ts type surface.
   if (provenanceEntryFor(specifier) !== null) return null;
-  const resolved = resolveBareModule(fromFileName, specifier);
+  const resolved = resolveBareModule(fromFileName, specifier, undefined, resolutionKind);
   if (!resolved) return null;
   if (!isNodeModulesPath(resolved.typesFile)) {
     // A workspace-linked package (the node_modules entry is a symlink into
@@ -2368,6 +2386,8 @@ function preflight7(load: LoadResult): {
         !npmStaticFileSuppressed(d) &&
         !nodeModulesJsSuppressed(d) &&
         !namespaceCalleeSuppressed(p, d) &&
+        !inferredJsDiagnosticSuppressed(p, d) &&
+        !isNpmStaticSubclassArgument(p, d) &&
         !workspaceImplicitAnySuppressed(p, d) &&
         !jsdocTypeSuppressed(p, d, commentDup),
     );
@@ -2413,7 +2433,7 @@ function preflight7(load: LoadResult): {
         entry,
         programFiles,
         [...createRequireProgramRoots7(program), ...forkTargetPaths(program, program.getSourceFiles())],
-        (sf, spec) => resolveImport7(program, sf, spec) ?? npmStaticDepSf7(program, sf, spec),
+        (sf, spec, resolutionKind) => resolveImport7(program, sf, spec) ?? npmStaticDepSf7(program, sf, spec, resolutionKind),
       )
     : programFiles;
   program.getTypeChecker().prefetchSourceFileStructures(userFiles);
@@ -2876,7 +2896,7 @@ function preflight7(load: LoadResult): {
             // form above (bundle dists require their workspace siblings —
             // the same resolution, the same offender discipline on a
             // miss).
-            const npmReq = !req.spec.startsWith("#") ? resolveNpmImport7(sf.fileName, req.spec) : null;
+            const npmReq = !req.spec.startsWith("#") ? resolveNpmImport7(sf.fileName, req.spec, "require") : null;
             if (npmReq !== null && isNpmStaticPackage(npmReq.packageName)) {
               dep = npmStaticProgramDep(program, npmReq.packageName, npmReq.typesFile);
               if (dep === null) continue; // offender recorded — the fallback loop reloads
@@ -2965,7 +2985,7 @@ function preflight7(load: LoadResult): {
         if (!isRelativeSpecifier(spec)) {
           // --npm-static: opted-in packages ride the program-module edge
           // (the statement-level require branch above).
-          const npmReq = !spec.startsWith("#") ? resolveNpmImport7(sf.fileName, spec) : null;
+          const npmReq = !spec.startsWith("#") ? resolveNpmImport7(sf.fileName, spec, "require") : null;
           if (npmReq !== null && isNpmStaticPackage(npmReq.packageName)) {
             const nDep = npmStaticProgramDep(program, npmReq.packageName, npmReq.typesFile);
             if (nDep !== null) deps.push({ dep: nDep });
@@ -3146,7 +3166,7 @@ function cjsNamedImportLinkCheck(
   // Reexport targets union in only when they resolve to CommonJS program
   // files (Node's cjsPreparseModuleExports rule).
   const resolveCjsDep = (from: ts.SourceFile, spec: string): ts.SourceFile | null => {
-    const dep = resolveEdge(from, spec);
+    const dep = resolveImport7(program, from, spec) ?? npmStaticDepSf7(program, from, spec, "require");
     return dep !== null && isCjsJsFile7(dep, program) ? dep : null;
   };
   const visible = (dep: ts.SourceFile, name: string): boolean =>
@@ -3712,10 +3732,10 @@ export function orderedImportsOf(
  * as a module edge), else null. No offender reporting here — preflight
  * already classified the import; this is the lookup the module-order and
  * lowering paths share. */
-export function npmStaticDepSf7(program: ts.Program, sf: ts.SourceFile, spec: string): ts.SourceFile | null {
+export function npmStaticDepSf7(program: ts.Program, sf: ts.SourceFile, spec: string, resolutionKind: "import" | "require" = "import"): ts.SourceFile | null {
   if (!npmStaticActive() || isRelativeSpecifier(spec)) return null;
   if (spec.startsWith("node:") || spec.startsWith("#")) return null;
-  const npm = resolveNpmImport7(sf.fileName, spec);
+  const npm = resolveNpmImport7(sf.fileName, spec, resolutionKind);
   if (npm === null || !isNpmStaticPackage(npm.packageName)) return null;
   if (!isJsSourceFileName(npm.typesFile)) return null;
   return program.getSourceFile(npm.typesFile) ?? null;

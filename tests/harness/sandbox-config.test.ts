@@ -5,6 +5,7 @@ import {
   sandboxBootstrapCommand,
   sandboxImageConfig,
   sandboxRunnerConfig,
+  sandboxTestSourceConfig,
   sandboxTestWorkerAllocation,
   sandboxVcrConfig,
   sandboxVercelConfig,
@@ -29,6 +30,7 @@ test("runner settings are read after loading the sandbox environment", () => {
     localTestWorkers: "3",
     localCaseShards: "4",
     sandboxTimeout: "90m",
+    sandboxTimeoutMs: 5_400_000,
   });
 });
 
@@ -39,7 +41,17 @@ test("runner settings retain their documented defaults", () => {
     localTestWorkers: "2",
     localCaseShards: "2",
     sandboxTimeout: "45m",
+    sandboxTimeoutMs: 2_700_000,
   });
+});
+
+test("the local command deadline follows the configured Sandbox duration", () => {
+  for (const [duration, milliseconds] of [["120m", 7_200_000], ["2h", 7_200_000], ["30 s", 30_000], ["500ms", 500]] as const) {
+    expect(sandboxRunnerConfig({ SCRIPTC_SANDBOX_TIMEOUT: duration }).sandboxTimeoutMs).toBe(milliseconds);
+  }
+  for (const duration of ["0m", "-1h", "forever", "1.5m", "999999999h"]) {
+    expect(() => sandboxRunnerConfig({ SCRIPTC_SANDBOX_TIMEOUT: duration })).toThrow("positive duration");
+  }
 });
 
 test("the managed Sandbox image is the default", () => {
@@ -92,6 +104,25 @@ test("custom images must be fully qualified VCR references", () => {
   expect(() => sandboxImageConfig({ SCRIPTC_SANDBOX_IMAGE: "scriptc-tests:node24" })).toThrow(
     "fully qualified VCR image",
   );
+});
+
+test("prepared snapshots select the snapshot CLI source without changing project scope", () => {
+  const config = sandboxTestSourceConfig({ SCRIPTC_SANDBOX_SNAPSHOT: " snap_ABC123 " });
+  expect(config).toEqual({
+    prepared: true, reference: "snap_ABC123", description: "prepared snapshot", createArgs: ["--snapshot", "snap_ABC123"],
+  });
+  expect(sandboxBootstrapCommand(config.prepared)).toBeUndefined();
+});
+
+test("test sources retain managed and custom image preparation", () => {
+  expect(sandboxTestSourceConfig({})).toMatchObject({ prepared: false, createArgs: ["--image", defaultSandboxImage] });
+  const image = "vcr.vercel.com/team/project/tests:node24";
+  expect(sandboxTestSourceConfig({ SCRIPTC_SANDBOX_IMAGE: image })).toMatchObject({ prepared: true, createArgs: ["--image", image] });
+});
+
+test("ambiguous or malformed snapshot sources fail before creating workers", () => {
+  expect(() => sandboxTestSourceConfig({ SCRIPTC_SANDBOX_SNAPSHOT: "snap_ABC123", SCRIPTC_SANDBOX_IMAGE: "image" })).toThrow("Set only one");
+  expect(() => sandboxTestSourceConfig({ SCRIPTC_SANDBOX_SNAPSHOT: "wrong-id" })).toThrow("snapshot ID");
 });
 
 test("OIDC authentication wins and supplies its own Sandbox scope", () => {

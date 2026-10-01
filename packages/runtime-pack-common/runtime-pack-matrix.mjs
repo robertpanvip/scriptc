@@ -1,3 +1,5 @@
+import { withLibraryRuntimeFlavors } from "./library-matrix.mjs";
+
 /**
  * Shared release-runtime pack matrix. Platform package scripts provide the
  * target descriptor, then this module fixes feature reachability and the
@@ -17,7 +19,7 @@ const BASE_RUNTIME_SOURCES = [
 const OPTIONAL = [
   ["scr_copying.c", "copying"], ["scr_file_handle.c", "fileHandle"],
   ["scr_regex.c", "regex"], ["scr_assert.c", any("assert", "regex", "symbol")],
-  ["scr_inspect.c", "inspect"], ["scr_dyn_invoke.c", any("dynInvoke", "nativeFetch")],
+  ["scr_inspect.c", "inspect"], ["scr_console_native.c", "inspect"], ["scr_dyn_invoke.c", any("dynInvoke", "nativeFetch")],
   ["scr_dc.c", "dc"], ["scr_async_dyn.c", any("dynAsync", "dynInvoke", "dc", "fileHandle", "nativeFetch")],
   ["scr_zlib.c", "zlib"], ["scr_zlib_island.c", all("zlib", "dynamic")],
   ["scr_events.c", "events"], ["scr_readline.c", "events"],
@@ -67,6 +69,7 @@ export function createRuntimePackMatrix({
   omitRuntimeSources = [],
   omitOptionalSources = [],
   omitArchives = [],
+  libraryOnly = false,
 }) {
   const vendorArchives = [
     { id: "quickjs", predicate: "dynamic" },
@@ -74,7 +77,7 @@ export function createRuntimePackMatrix({
     { id: "zlib", predicate: "zlibEffective" },
     { id: "mbedtls", predicate: "tlsEffective" },
   ];
-  return {
+  const matrix = withLibraryRuntimeFlavors({
     schema: "scriptc.runtime-pack-matrix.v1",
     target,
     flavors: { release: { optimization: "-O2" }, dev: { optimization: "-O0" } },
@@ -90,5 +93,10 @@ export function createRuntimePackMatrix({
     ].map((unit) => ({ ...unit, variants: variantsFor(unit.source) })),
     archives: vendorArchives.filter(({ id }) => !omitArchives.includes(id)),
     system_libraries: systemLibraries,
-  };
+  });
+  if (libraryOnly) {
+    matrix.flavors = Object.fromEntries(Object.entries(matrix.flavors).filter(([name]) => name.startsWith("library-")));
+    matrix.archives = matrix.archives.filter(({ id }) => id === "libregexp" || id === "zlib");
+  }
+  return matrix;
 }

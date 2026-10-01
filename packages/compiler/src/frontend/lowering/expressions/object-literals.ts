@@ -23,7 +23,7 @@ import type { Lowerer } from "../lowerer.js";
 import { lowerIndexMergeHelper } from "../lower-containers.js";
 import type { IndexMergeContributor } from "../lower-containers.js";
 import { isGenericCallableMemberType } from "../../type-mapper.js";
-import { numLit, varRef } from "../../../ir/build.js";
+import { numLit, strLit, varRef } from "../../../ir/build.js";
 import { isSafeToRepeat } from "./evaluation-safety.js";
 import { tryLowerExpression } from "./try-lower-expression.js";
 import { fenceSymbolFieldCopy } from "../symbol-fields.js";
@@ -193,8 +193,8 @@ function propNameText(lowerer: Lowerer, name: ts.PropertyName): string {
  * dyn's String() for dyn operands — `{ [field]: v }` where field is a
  * checked-dynamic param). Values convert through the usual dyn boundary
  * (dynFrom's domain, functions box); a value with no dyn representation
- * fences per property. Spreads copy through dyn.assign in source order;
- * accessors stay fenced. */
+ * fences per property. Spreads create own data properties in source order;
+ * accessors retain their captured getter and setter closures. */
 export function lowerDynObjectLiteral(
   lowerer: Lowerer,
   expr: ts.ObjectLiteralExpression,
@@ -203,8 +203,23 @@ export function lowerDynObjectLiteral(
   const loc = locOf(expr);
   let fields: { key: IrExpr; value: IrExpr }[] = [];
   let acc: IrExpr | null = null;
+  let hasAccessors = false;
   const flushFields = (): void => {
     if (fields.length === 0) return;
+    if (hasAccessors) {
+      for (const field of fields) {
+        const descriptor: IrExpr = { kind: "dynObjLit", type: DYN, loc, fields: [
+          { key: { kind: "strLit", value: "value", type: STRING, loc }, value: field.value },
+          ...["writable", "enumerable", "configurable"].map(name => ({
+            key: strLit(name, loc),
+            value: { kind: "dynFrom", value: { kind: "boolLit", value: true, type: BOOL, loc }, type: DYN, loc } as IrExpr,
+          })),
+        ] };
+        acc = { kind: "libCall", fn: "dyn.defineProperty", args: [acc!, lowerer.coerceToExpected(field.key, DYN), descriptor], type: DYN, loc };
+      }
+      fields = [];
+      return;
+    }
     const chunk: IrExpr = { kind: "dynObjLit", fields, type: DYN, loc };
     acc = acc === null
       ? chunk
@@ -223,19 +238,8 @@ export function lowerDynObjectLiteral(
         lowerer.unsupported("SC1101", prop.expression, `spreading '${lowerer.fmt(source.type)}' into a checked-dynamic object literal`);
       }
       acc ??= { kind: "dynObjLit", fields: [], type: DYN, loc };
-      acc = { kind: "libCall", fn: "dyn.assign", args: [acc, source], type: DYN, loc: locOf(prop) };
+      acc = { kind: "libCall", fn: "dyn.copyDataProperties", args: [acc, source], type: DYN, loc: locOf(prop) };
       continue;
-    }
-    if (
-      !ts.isPropertyAssignment(prop) &&
-      !ts.isShorthandPropertyAssignment(prop) &&
-      !ts.isMethodDeclaration(prop)
-    ) {
-      lowerer.unsupported(
-        "SC1090",
-        prop,
-        "accessors in a runtime-keyed (computed-key) object literal",
-      );
     }
     const name = prop.name;
     let key: IrExpr;
@@ -245,10 +249,12 @@ export function lowerDynObjectLiteral(
         key = { kind: "strLit", value: folded, type: STRING, loc: locOf(name) };
       } else {
         let k = lowerer.lowerExpr(name.expression);
-        if (k.type.kind === "f64" || k.type.kind === "bool" || k.type.kind === "dyn") {
+        if (k.type.kind === "symbol") k = lowerer.coerceToExpected(k, DYN);
+        else if (k.type.kind === "dyn") k = { kind: "libCall", fn: "dyn.propertyKey", args: [k], type: DYN, loc: locOf(name) };
+        else if (k.type.kind === "f64" || k.type.kind === "bool") {
           k = { kind: "toString", operand: k, type: STRING, loc: locOf(name) };
         }
-        if (k.type.kind !== "string") {
+        if (k.type.kind !== "string" && k.type.kind !== "dyn") {
           lowerer.unsupported(
             "SC1090",
             name,
@@ -264,6 +270,24 @@ export function lowerDynObjectLiteral(
     } else {
       lowerer.unsupported("SC1090", prop, "non-identifier property names");
     }
+    if (ts.isGetAccessorDeclaration(prop) || ts.isSetAccessorDeclaration(prop)) {
+      flushFields();
+      hasAccessors = true;
+      acc ??= { kind: "dynObjLit", fields: [], type: DYN, loc };
+      if (!isJsSourceFile(expr.getSourceFile())) lowerer.rejectThisInObjectMethod(prop.body ?? prop);
+      const fn = lowerer.lowerLambda(prop);
+      const descriptor: IrExpr = {
+        kind: "dynObjLit", type: DYN, loc: locOf(prop), fields: [
+          { key: { kind: "strLit", value: ts.isGetAccessorDeclaration(prop) ? "get" : "set", type: STRING, loc }, value: lowerer.coerceToExpected(fn, DYN) },
+          ...["enumerable", "configurable"].map(name => ({
+            key: strLit(name, loc),
+            value: { kind: "dynFrom", value: { kind: "boolLit", value: true, type: BOOL, loc }, type: DYN, loc } as IrExpr,
+          })),
+        ],
+      };
+      acc = { kind: "libCall", fn: "dyn.defineProperty", args: [acc, lowerer.coerceToExpected(key, DYN), descriptor], type: DYN, loc };
+      continue;
+    }
     const valueExpr: ts.Node = ts.isMethodDeclaration(prop)
       ? prop
       : ts.isShorthandPropertyAssignment(prop)
@@ -277,8 +301,10 @@ export function lowerDynObjectLiteral(
     try {
       const lowerValue = (): IrExpr =>
         ts.isMethodDeclaration(prop)
-          ? (lowerer.rejectThisInObjectMethod(prop.body ?? prop), lowerer.lowerLambda(prop))
-          : lowerer.lowerExpr(valueExpr as ts.Expression);
+          ? (isJsSourceFile(expr.getSourceFile()) ? lowerer.lowerLambda(prop) : (lowerer.rejectThisInObjectMethod(prop.body ?? prop), lowerer.lowerLambda(prop)))
+          : !boxValue && ts.isObjectLiteralExpression(valueExpr)
+            ? lowerer.lowerExprExpecting(valueExpr, DYN)
+            : lowerer.lowerExpr(valueExpr as ts.Expression);
       raw =
         fenceClosureProbe(lowerer, valueExpr, undefined, lowerValue) ??
         lowerValue();
@@ -301,6 +327,11 @@ export function lowerDynObjectLiteral(
     let v = boxValue
       ? boxValue(valueExpr as ts.Expression, raw)
       : lowerer.coerceToExpected(raw, DYN);
+    // A JS object's array-valued properties retain the same source array.
+    // Repeated references must compare equal and mutations remain shared.
+    if (!boxValue && isJsSourceFile(prop.getSourceFile()) && v.kind === "dynFrom" && v.value.type.kind === "array") {
+      v = { ...v, liveRef: true };
+    }
     if (v.type.kind !== "dyn") {
       const convDiagsBefore = lowerer.diags.length;
       try {
@@ -541,6 +572,12 @@ export function lowerObjectLiteral(lowerer: Lowerer, expr: ts.ObjectLiteralExpre
   if (isJsSourceFile(expr.getSourceFile()) && ts.isVariableDeclaration(expr.parent) &&
       expr.parent.initializer === expr && ts.isIdentifier(expr.parent.name) &&
       lowerer.globalOf(expr.parent.name)?.type.kind === "dyn") {
+    return lowerDynObjectLiteral(lowerer, expr);
+  }
+  // A checked spread carries runtime symbol keys and receiver-sensitive
+  // methods absent from its inferred record shape. Copy the real properties.
+  if (!expected && isJsSourceFile(expr.getSourceFile()) && expr.properties.some((property) =>
+      ts.isSpreadAssignment(property) && tryLowerExpression(lowerer, property.expression)?.type.kind === "dyn")) {
     return lowerDynObjectLiteral(lowerer, expr);
   }
   const unionClone = lowerUnionRecordClone(lowerer, expr);
@@ -858,6 +895,11 @@ export function lowerObjectLiteral(lowerer: Lowerer, expr: ts.ObjectLiteralExpre
     }
   }
   let shape = lowerer.shapes.get(type.shapeId)!;
+  // JavaScript Dates carry native object identity in checked storage. An
+  // inferred scalar Date field would erase that identity before boxing.
+  if (isJsSourceFile(expr.getSourceFile()) && shape.fields.some((field) => field.type.kind === "date")) {
+    return lowerDynObjectLiteral(lowerer, expr);
+  }
   // ACCESSOR properties, JS literals only (TS accessors fill the shape's
   // %get:/%set: closure slots below): no record storage exists for them,
   // so the literal's shape NARROWS to its plain fields (reads resolve

@@ -1,3 +1,4 @@
+import { objectEnumerationReceiver } from "./object-enumeration-receiver.js";
 import { InternalCompilerError } from "../../errors.js";
 /* Container-surface call lowering: array methods (including the HOF family
  * map/filter/forEach with their synthesized helper functions), Map/Set
@@ -5,7 +6,7 @@ import { InternalCompilerError } from "../../errors.js";
  * record operations. */
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
-import { BOOL, CAUGHT, DYN, F64, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, funcOf, isRefCounted, isSupportedArrayElem, isSupportedIndexValue, isUnitType, typeEquals } from "../../ir/ir.js";
+import { BOOL, CAUGHT, DYN, F64, type IrExpr, type IrFunction, type IrLocal, type IrMapIntrinsicMethod, type IrParam, type IrRecordShape, type IrSetIntrinsicMethod, type IrStmt, type IrType, JSVAL, STRING, type SrcLoc, UNDEFINED_T, VOID, arrayOf, funcOf, isRefCounted, isSupportedArrayElem, isSupportedIndexValue, isUnitType, typeEquals } from "../../ir/ir.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS } from "./surfaces.js";
 import { tryLowerExpression } from "./expressions/try-lower-expression.js";
 import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
@@ -14,7 +15,7 @@ import { islandPrimitiveExit, lowerDynDispatchMethodCall } from "./lower-calls.j
 import { buildArraySortFn } from "./lower-array-sort.js";
 import { arrayIndexPresent, arrayValueRead, arrayValueStore, arrayValueType, currentArrayIndexPresent } from "./array-values.js";
 import { typeKey } from "../type-mapper.js";
-import { WidthLift, nodeThrowExpr } from "./lowerer.js";
+import { type WidthLift, nodeThrowExpr } from "./lowerer.js";
 import { boolLit, countedFor, numLit, strLit, varRef } from "../../ir/build.js";
 import { defaultAfterUndefined, lowerPositionArgument, lowerStaticallyUndefinedArgument, positionNumber } from "./optional-arguments.js";
 import { lowerArrayCopyWithin, lowerArrayFill } from "./array-indexed-mutation.js";
@@ -235,6 +236,18 @@ function fenceProducedArrayElem(lowerer: Lowerer, node: ts.Node, producer: strin
     // static arrIntrinsic over a jsval (the validator ICE).
     {
       const receiver = lowerer.lowerExpr(access.expression);
+      if (receiver.type.kind === "union") {
+        const arms = lowerer.unions.get(receiver.type.unionId)?.arms;
+        const present = arms?.find((arm): boolean => arm.kind === "array");
+        if (present?.kind === "array" && arms?.every((arm) => typeEquals(arm, present) || isUnitType(arm))) {
+          // A predicate can narrow the element type without changing the
+          // original array layout. Extract that stored array before choosing
+          // a helper, then adapt callback arguments at their actual ABI.
+          const array = lowerer.runtimeOptionalPropertyReceiver(access.expression, receiver, present, name) ??
+            lowerer.coerceInto(access.expression, receiver, present);
+          return lowerer.withExpressionOverride(access.expression, array, () => lowerArrayMethodCall(lowerer, call, access));
+        }
+      }
       if (receiver.type.kind === "record" && lowerer.shapes.get(receiver.type.shapeId)?.tuple) {
         return lowerTupleReadMethodCall(lowerer, call, access, receiver);
       }
@@ -268,16 +281,11 @@ function fenceProducedArrayElem(lowerer: Lowerer, node: ts.Node, producer: strin
           "assign it to an array-typed binding first (the validated extraction), then call the method",
         );
       }
-      // An evolving-`any` array binding under --dynamic whose flow type
-      // EVOLVED past `any[]` (`const fns = []; fns.push(() => 1);
-      // fns.map(...)` — the binding lowered array<jsval> at its `any[]`
-      // declaration, while tsc's evolving-array analysis answers the
-      // pushed element type at this site): the VALUE's element type is
-      // the truth — ride the explicit-`any[]` handle-element lowering
-      // (pushes marshal in, HOF callbacks bind the handle, results exit
-      // per the checker type), never a typed intrinsic over a jsval-
-      // element array (the validator ICE).
-      if (receiver.type.kind === "array" && receiver.type.elem.kind === "jsval" && !typeEquals(receiverIr, receiver.type)) {
+      // Flow predicates and evolving-any analysis can refine the checker
+      // element type without changing the array's storage. Helpers and
+      // callback array arguments must retain the original layout and
+      // identity; element conversions happen at the callback boundary.
+      if (receiver.type.kind === "array" && !typeEquals(receiverIr, receiver.type)) {
         receiverIr = receiver.type;
         elem = receiver.type.elem;
       }
@@ -1179,7 +1187,7 @@ function arraySearchHelper(
    * loop passes exactly what it declares (JS passes everything; a callback
    * only sees the parameters it names). Returns the lowered callback and
    * its declared arity. */
-  function hofCallbackArg(lowerer: Lowerer, argNode: ts.Expression, lead: IrType[], arrT: IrType, bindUntyped = false):
+  function hofCallbackArg(lowerer: Lowerer, argNode: ts.Expression, lead: IrType[], arrT: IrType, bindUntyped = false, expectedReturn?: IrType):
     { fnArg: IrExpr & { type: IrType & { kind: "func" } }; arity: number } {
     const full = [...lead, F64, arrT];
     // A DYN-receiver HOF's callback (`parsed.flatMap((value) => ...)`):
@@ -1212,15 +1220,16 @@ function arraySearchHelper(
         lowerer.jsvalParamOverrides.add(p);
       });
     }
-    // A checker-untyped array expression whose lowered value supplies a
-    // concrete static element type still contextually types an inline HOF
-    // callback with any/unknown. Bind only unannotated parameters to the
-    // exact ABI the synthesized loop passes. The override is temporary:
-    // one callback AST may be lowered under several generic instances.
+    // An untyped or flow-refined array can contextually type an inline
+    // callback differently from the stored element and array layout. Bind
+    // unannotated parameters to the helper's ABI when a boundary adapter
+    // cannot carry it. Include the optional-read prepass's parameter type
+    // in this comparison. The override is temporary because one callback
+    // AST can lower under several generic instances.
     const contextual: { symbol: ts.Symbol; previous: IrType | undefined }[] = [];
     const previousImplicit = lowerer.implicitParamTypes;
     let contextualTs: Map<ts.Symbol, ts.Type> | null = null;
-    if (bindUntyped && (ts.isArrowFunction(argNode) || ts.isFunctionExpression(argNode))) {
+    if (ts.isArrowFunction(argNode) || ts.isFunctionExpression(argNode)) {
       argNode.parameters.forEach((param, i) => {
         const expected = full[i];
         if (
@@ -1230,7 +1239,10 @@ function arraySearchHelper(
           return;
         }
         const checkerType = lowerer.checker.getTypeAtLocation(param.name);
-        if ((checkerType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0) return;
+        const untyped = (checkerType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0;
+        const raw = untyped ? null : lowerer.mapTypeOf(checkerType);
+        const mapped = raw ? lowerer.runtimeOptionalBindingType(param.name, raw) : null;
+        if (untyped ? !bindUntyped : mapped === null || lowerer.coercibleValue(expected, mapped)) return;
         const symbol = lowerer.checker.getSymbolAtLocation(param.name);
         if (!symbol) return;
         contextual.push({ symbol, previous: lowerer.runtimeOptionalBindingTypes.get(symbol) });
@@ -1250,6 +1262,10 @@ function arraySearchHelper(
       });
     }
     if (contextualTs !== null) lowerer.implicitParamTypes = contextualTs;
+    const previousReturn = lowerer.contextualFunctionReturns.get(argNode);
+    if (expectedReturn && (ts.isArrowFunction(argNode) || ts.isFunctionExpression(argNode))) {
+      lowerer.contextualFunctionReturns.set(argNode, expectedReturn);
+    }
     let fnArg: IrExpr;
     try {
       fnArg = lowerer.lowerExpr(argNode);
@@ -1260,12 +1276,19 @@ function arraySearchHelper(
         else lowerer.runtimeOptionalBindingTypes.set(symbol, previous);
       }
       lowerer.implicitParamTypes = previousImplicit;
+      if (previousReturn === undefined) lowerer.contextualFunctionReturns.delete(argNode);
+      else lowerer.contextualFunctionReturns.set(argNode, previousReturn);
     }
     // A callback can accept a wider parameter type than the array supplies
     // (a reusable predicate over a union is common). Its closure still has
     // that wider ABI: adapt each actual argument before invoking it, just
     // as assignment to a narrower function slot does. Require a conversion
     // plan so this path never manufactures a stranded callback.
+    if (fnArg.type.kind === "dyn") {
+      const signatures = lowerer.checker.getCallSignatures(lowerer.typeOf(argNode));
+      const ret = expectedReturn ?? (signatures[0] ? lowerer.mapTypeOf(lowerer.checker.getReturnTypeOfSignature(signatures[0])) : null);
+      if (ret && ret.kind !== "void") fnArg = lowerer.coerceToExpected(fnArg, funcOf(full, ret));
+    }
     if (fnArg.type.kind === "func" && fnArg.type.params.length <= full.length &&
       fnArg.type.params.every((param, i) => lowerer.coercibleValue(full[i]!, param))) {
       const callbackType = funcOf(full.slice(0, fnArg.type.params.length), fnArg.type.ret);
@@ -1393,12 +1416,10 @@ function filterResultElem(
   const checkerReceiver = access
     ? lowerer.mapTypeOf(lowerer.typeOf(access.expression))
     : null;
-  // Evolving-any arrays of island handles retain their jsval element ABI,
-  // while the checker later describes both the receiver and unchanged
-  // filter result by the evolved callable type. Equal checker elements mean
-  // no predicate narrowing occurred; preserve the runtime element home.
+  // Equal checker elements mean the filter introduces no new refinement.
+  // Preserve the stored element layout even if an earlier predicate or
+  // evolving-any analysis changed the receiver's flow type.
   if (
-    elem.kind === "jsval" && valueT.kind === "jsval" &&
     result?.kind === "array" && checkerReceiver?.kind === "array" &&
     typeEquals(result.elem, checkerReceiver.elem)
   ) {
@@ -1896,7 +1917,7 @@ export function lowerTupleReadMethodCall(
   ): IrExpr | null {
     if (arr.type.kind !== "array") throw new InternalCompilerError("indexed read requires an array");
     const elem = arr.type.elem;
-    if (elem.kind === "void" || elem.kind === "dyn") return null;
+    if (elem.kind === "void") return null;
     const resultT = arrayValueType(lowerer, elem);
     const key = `idxOr:${typeKey(elem)}`;
     let name = lowerer.arrHofHelpers.get(key);
@@ -2174,24 +2195,29 @@ export function tryLowerNumericIndexRead(lowerer: Lowerer, operand: IrExpr, loc:
       };
     }
     // find visits holes as undefined and can infer a predicate that selects
-    // a subset of the element union. Only an inline, inferred predicate is
-    // evidence for that narrower representation; explicit assertions keep
+    // a subset of the element union. A result matching the receiver's flow
+    // element inherits that earlier refinement. Otherwise only an inline,
+    // inferred predicate proves a new narrowing; explicit assertions keep
     // the same refusal boundary as filter.
-    const resultT = bindUntyped ? arrayValueType(lowerer, elem) : lowerer.irTypeOf(call);
+    const valueT = arrayValueType(lowerer, elem);
+    const checkerReceiver = lowerer.mapTypeOf(lowerer.typeOf(access.expression));
+    const checkerResult = lowerer.irTypeOf(call);
+    const unchangedElement = checkerReceiver?.kind === "array" &&
+      typeEquals(checkerResult, arrayValueType(lowerer, checkerReceiver.elem));
+    const resultT = bindUntyped ? valueT : checkerResult;
     if (resultT.kind !== "union") lowerer.badType(call, lowerer.typeOf(call)); // defensive: T | undefined always maps to a union
     const undefTag = lowerer.armTag(resultT.unionId, UNDEFINED_T);
     if (undefTag < 0) lowerer.badType(call, lowerer.typeOf(call));
-    const valueT = arrayValueType(lowerer, elem);
     let retag: string | null = null;
     if (!lowerer.coercibleValue(valueT, resultT)) {
       const inline = ts.isArrowFunction(argNode) || ts.isFunctionExpression(argNode);
-      if (!inline || argNode.type !== undefined) {
+      if (!unchangedElement && (!inline || argNode.type !== undefined)) {
         lowerer.unsupported("SC1090", argNode,
           `narrowing '.${method}' requires an inline callback with an inferred predicate (annotate the return ': boolean' to keep the receiver's element type)`);
       }
-      const signature = lowerer.checker.getSignatureFromDeclaration(argNode);
+      const signature = inline ? lowerer.checker.getSignatureFromDeclaration(argNode) : undefined;
       const predicate = signature ? lowerer.checker.getTypePredicateOfSignature(signature) : undefined;
-      if (!predicate || predicate.parameterIndex !== 0 || valueT.kind !== "union") {
+      if ((!unchangedElement && (!predicate || predicate.parameterIndex !== 0)) || valueT.kind !== "union") {
         lowerer.unsupported("SC1090", call, `'.${method}' result narrowing without a predicate over its element`);
       }
       retag = lowerer.narrowedRetagHelper(call, valueT.unionId, resultT.unionId, loc);
@@ -2571,7 +2597,7 @@ export function tryLowerNumericIndexRead(lowerer: Lowerer, operand: IrExpr, loc:
     const accT = lowerer.runtimeOptionalReduceTypes.get(call) ??
       (hasInit ? lowerer.irTypeOf(call) : arrayValueType(lowerer, elem));
     if (accT.kind === "void" || accT.kind === "func") lowerer.badType(call, lowerer.typeOf(call));
-    const { fnArg, arity } = hofCallbackArg(lowerer, argNode, [accT, arrayValueType(lowerer, elem)], arrT);
+    const { fnArg, arity } = hofCallbackArg(lowerer, argNode, [accT, arrayValueType(lowerer, elem)], arrT, false, accT);
     const helper = reduceHelper(lowerer, method, elem, accT, fnArg.type.ret, arity, hasInit, loc);
     const args: IrExpr[] = [receiver, fnArg];
     if (hasInit) args.push(lowerer.lowerExprExpecting(call.arguments[1]!, accT));
@@ -2726,7 +2752,17 @@ export function tryLowerNumericIndexRead(lowerer: Lowerer, operand: IrExpr, loc:
     }
     const receiver = lowerer.lowerExpr(access.expression);
     const argNode = call.arguments[0]!;
-    const fnArg = lowerer.lowerExpr(argNode);
+    let fnArg = lowerer.lowerExpr(argNode);
+    // Reusable JS comparators often accept checked values. Adapt the array's
+    // element ABI just as other array callbacks do before sorting.
+    if (fnArg.type.kind === "func" && fnArg.type.params.length <= 2 &&
+        fnArg.type.params.every((param) => lowerer.coercibleValue(elem, param))) {
+      // Arithmetic on inferred JS values retains a checked result because
+      // it can produce BigInt. The sort callback still requires a number.
+      const result = fnArg.type.ret.kind === "dyn" && isJsSourceFile(argNode.getSourceFile()) ? F64 : fnArg.type.ret;
+      const expected = funcOf(fnArg.type.params.map(() => elem), result);
+      if (!typeEquals(fnArg.type, expected)) fnArg = lowerer.coerceToExpected(fnArg, expected);
+    }
     // The comparator receives exactly (a, b); declaring a prefix is
     // ordinary TS. Its result must be number (the spec coerces arbitrary
     // results — no lowering for that).
@@ -2991,10 +3027,24 @@ export function lowerArrayConstructor(lowerer: Lowerer,
     const contextual = lowerer.checker.getContextualType(expr);
     if (contextual) result = lowerer.mapTypeOf(contextual);
   }
+  if (isJsSourceFile(expr.getSourceFile()) && (result === null || result.kind === "dyn")) result = arrayOf(DYN);
   if (result?.kind !== "array" || !isSupportedArrayElem(result.elem)) {
     lowerer.badType(expr, lowerer.typeOf(expr));
   }
   const argType = args.length === 1 ? lowerer.mapTypeOf(lowerer.typeOf(args[0]!)) : null;
+  if (args.length === 1 && result.elem.kind === "dyn" && (argType === null || argType.kind === "dyn")) {
+    const input = lowerer.declareHiddenLocal("%arrayCtorValue", DYN);
+    const value = varRef(input.id, DYN, loc);
+    const local = lowerer.declareHiddenLocal("%arrayCtor", result);
+    const array = varRef(local.id, result, loc);
+    return { kind: "seqExpr", stmts: [
+      { kind: "varDecl", localId: input.id, init: lowerer.lowerExprExpecting(args[0]!, DYN), loc },
+      { kind: "varDecl", localId: local.id, init: { kind: "arrayLit", elems: [], type: result, loc }, loc },
+      { kind: "if", cond: { kind: "dynTest", test: "number", value, type: BOOL, loc },
+        then: [{ kind: "arraySetLength", arr: array, length: { kind: "dynCheck", value, type: F64, loc }, loc }],
+        else_: [arrayValueStore(lowerer, array, numLit(0, loc), value, DYN, loc)], loc },
+    ], result: array, type: result, loc };
+  }
   if (argType?.kind === "dyn" || argType?.kind === "jsval") {
     lowerer.noLowering("Array constructor with a dynamically typed sole argument", args[0]!);
   }
@@ -3056,6 +3106,34 @@ export function lowerArrayOfCall(lowerer: Lowerer, call: ts.CallExpression,
     type: result,
     loc: locOf(call),
   };
+}
+
+/** Mapper-less checked Array.from: acquire once, then step through emitted
+ * property and call dispatch so native class iterators retain their methods. */
+function lowerCheckedArrayFrom(lowerer: Lowerer, source: IrExpr, loc: SrcLoc): IrExpr {
+  const iterator = lowerer.declareHiddenLocal("%fromIterator", DYN);
+  const next = lowerer.declareHiddenLocal("%fromNext", DYN);
+  const step = lowerer.declareHiddenLocal("%fromStep", DYN);
+  const out = lowerer.declareHiddenLocal("%fromArray", DYN);
+  const done = lowerer.declareHiddenLocal("%fromDone", BOOL);
+  done.mutable = true;
+  const get = (value: IrExpr, key: string): IrExpr => ({ kind: "dynKeyGet", value, key: strLit(key, loc), type: DYN, loc });
+  const stmts: IrStmt[] = [
+    { kind: "varDecl", localId: iterator.id, init: { kind: "libCall", fn: "dyn.iteratorResult", args: [{ kind: "libCall", fn: "dyn.arrayFromIterator", args: [source], type: DYN, loc }], type: DYN, loc }, loc },
+    { kind: "varDecl", localId: next.id, init: get(varRef(iterator.id, DYN, loc), "next"), loc },
+    { kind: "varDecl", localId: out.id, init: { kind: "dynArrLit", elems: [], type: DYN, loc }, loc },
+    { kind: "varDecl", localId: done.id, init: boolLit(false, loc), loc },
+    { kind: "while", cond: { kind: "unary", op: "!", operand: varRef(done.id, BOOL, loc), type: BOOL, loc }, body: [
+      { kind: "varDecl", localId: step.id, init: { kind: "libCall", fn: "dyn.iteratorResult", args: [{
+        kind: "dynCall", callee: varRef(next.id, DYN, loc), receiver: varRef(iterator.id, DYN, loc), calleeName: "iterator.next", args: [], type: DYN, loc,
+      }], type: DYN, loc }, loc },
+      { kind: "assign", localId: done.id, value: { kind: "dynTest", test: "truthy", value: get(varRef(step.id, DYN, loc), "done"), type: BOOL, loc }, loc },
+      { kind: "if", cond: { kind: "unary", op: "!", operand: varRef(done.id, BOOL, loc), type: BOOL, loc }, then: [
+        { kind: "exprStmt", expr: { kind: "dynInvoke", recv: varRef(out.id, DYN, loc), method: "push", calleeName: "Array.from", args: [get(varRef(step.id, DYN, loc), "value")], type: DYN, loc }, loc },
+      ], else_: null, loc },
+    ], loc },
+  ];
+  return { kind: "seqExpr", stmts, result: varRef(out.id, DYN, loc), type: DYN, loc };
 }
 
 /** `Array.from({ length: n }, mapfn)` — the counted-generation idiom — on
@@ -3159,6 +3237,9 @@ export function lowerArrayOfCall(lowerer: Lowerer, call: ts.CallExpression,
       // String iteration advances by code point; the same helper serves
       // `[...s]` and both Array.from(s) forms.
       if (src.type.kind === "string" && args.length === 1) return strCharsCall(lowerer, src, loc);
+      if (src.type.kind === "dyn" && args.length === 1) {
+        return lowerCheckedArrayFrom(lowerer, src, loc);
+      }
       lowerer.noLowering(
         "Array.from with this argument shape",
         call,
@@ -5609,6 +5690,9 @@ export function lowerSetSeedNew(lowerer: Lowerer, node: ts.Expression, setT: IrT
       (source.type.kind === "dyn" || source.type.kind === "jsval")) {
     source = lowerer.coerceInto(node, source, STRING);
   }
+  if (source.type.kind === "dyn" && setT.elem.kind === "dyn") {
+    return { kind: "dynCheck", value: { kind: "libCall", fn: "dyn.nativeSetNew", args: [source], type: DYN, loc }, type: setT, loc };
+  }
   if (declared?.kind === "array" && typeEquals(declared.elem, setT.elem)) {
     // Preserve the existing checked scalar-iterable bridge. Reference
     // elements must retain identity and cannot enter via a copying exit.
@@ -5928,7 +6012,8 @@ function mapFromSeedValue(lowerer: Lowerer, seed: IrExpr, mapT: IrType & { kind:
     shape: IrRecordShape,): IrExpr {
     const resultT = lowerer.irTypeOf(call);
     if (resultT.kind !== "array") lowerer.badType(call, lowerer.typeOf(call)); // defensive
-    return objectIterOverIndexShape(lowerer, call, member, argIr, shape, lowerer.lowerExpr(call.arguments[0]!), resultT, locOf(call));
+    return objectIterOverIndexShape(lowerer, call, member, argIr, shape,
+      objectEnumerationReceiver(lowerer, lowerer.lowerExpr(call.arguments[0]!), argIr, locOf(call)), resultT, locOf(call));
   }
 
   /** The construction core, receiver/result pre-resolved — `node` anchors

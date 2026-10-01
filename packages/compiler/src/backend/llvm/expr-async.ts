@@ -201,8 +201,7 @@ export function emitSerializationExpr(host: LlvmEmitterContext, e: ExprOf<"jsonS
         const v = host.emitExpr(e.value);
         let compact: { name: string; type: IrType };
         if (e.value.type.kind === "dyn") {
-          // A dyn root: the runtime's dyn walker (scr_dyn_format_j — the
-          // C backend's dispatch exactly): number/string/bool/null/array/
+          // A dyn root: the runtime's dyn walker (scr_dyn_format_j): number/string/bool/null/array/
           // object exact, dropped members omitted, and a dropped ROOT
           // becomes the TEXT "undefined" (JSON.stringify(undefined) is
           // the undefined value; printing it spells the word — Node's
@@ -228,7 +227,7 @@ export function emitSerializationExpr(host: LlvmEmitterContext, e: ExprOf<"jsonS
           // A cycle-capable root can throw the circular-structure
           // TypeError mid-walk: finish still runs (frees the buffer, the
           // partial string joins the frame and releases on unwind), then
-          // the pending check unwinds — the C emitter's contract exactly.
+          // the pending check unwinds — the runtime ABI’s contract exactly.
           if (traceAdapter(host.shapeHost, e.value.type) !== null) host.emitPendingCheck();
         }
         // A pretty-print form (`stringify(v, null, 2)`): the frontend
@@ -236,7 +235,7 @@ export function emitSerializationExpr(host: LlvmEmitterContext, e: ExprOf<"jsonS
         // clamp/truncate rules); the interned re-indenter rewrites the
         // compact text with Node's gap algorithm. Compact temp stays
         // frame-owned; the pretty string is a fresh +1.
-        const indent = (e as { indent?: string }).indent;
+        const indent = e.indent;
         if (indent === undefined || indent === "") return compact;
         const rewriter = host.walkers.jsonIndentHelper();
         const t2 = B.tmp();
@@ -325,6 +324,15 @@ export function emitAsyncExpr(host: LlvmEmitterContext, e: ExprOf<"yieldExpr" | 
           }
         }
         if (host.wasi) host.emitWasiSuspendPrepared();
+        if (e.captureCompletion) {
+          const converter = (type: IrType): string => isRefCounted(type) ? `@${host.dyn.toDynHelper(type)}` : "null";
+          host.declare(`declare ptr @scr_gen_delegate_resume(ptr, ptr, ptr)`);
+          const resumed = B.tmp();
+          B.line(`${resumed} = call ptr @scr_gen_delegate_resume(ptr ${converter(gen.nextT)}, ptr ${converter(e.captureCompletion.returnType)}, ptr @${host.dyn.caughtToDynHelper()})`);
+          const out = host.own({ name: resumed, type: e.type });
+          host.emitPendingCheck();
+          return out;
+        }
         host.emitPendingCheck();
         if (e.type.kind === "void") {
           // An undefined next-channel: nothing to read (the frontend

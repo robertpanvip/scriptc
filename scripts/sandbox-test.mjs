@@ -9,7 +9,7 @@ import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import {
   sandboxBootstrapCommand,
-  sandboxImageConfig,
+  sandboxTestSourceConfig,
   sandboxRunnerConfig,
   sandboxTestWorkerAllocation,
   sandboxVercelConfig,
@@ -23,7 +23,7 @@ import {
   filterExistingWorktreePaths,
   workspaceResetCommand,
 } from "./worktree-files.mjs";
-import { REMOTE_COMMAND_PENDING, sandboxCommand, sandboxStatusCommand, shellQuote } from "./sandbox-command.mjs";
+import { REMOTE_COMMAND_PENDING, sandboxCommand, sandboxStatusCommand, waitForSandboxCommand } from "./sandbox-command.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const laneCaseShardedFiles = [
@@ -61,7 +61,7 @@ const invariantRemoteFiles = [
   "packages/cli/test/paths.test.ts",
   "packages/compiler/src/library/int-infer.test.ts",
   "packages/compiler/test/cjs-lexer.test.ts",
-  "packages/compiler/test/emit-c.test.ts",
+  "packages/compiler/test/emit-llvm.test.ts",
   "packages/compiler/test/ir.test.ts",
   "packages/compiler/test/llvm-runtime-abi.test.ts",
   "packages/compiler/test/ts7/bench.test.ts",
@@ -187,6 +187,7 @@ Environment:
   VERCEL_OIDC_TOKEN         Preferred project-scoped Sandbox credential
   VERCEL_TOKEN              Access-token fallback; also set VERCEL_TEAM_ID + VERCEL_PROJECT_ID
   SCRIPTC_SANDBOX_IMAGE     Optional fully qualified VCR image (default: vercel/sandbox/universal)
+  SCRIPTC_SANDBOX_SNAPSHOT  Optional prepared snapshot with the pinned toolchain (exclusive with IMAGE)
   SCRIPTC_SANDBOX_VCPUS     vCPUs per sandbox (default: 8)
   SCRIPTC_SANDBOX_TIMEOUT   sandbox and command timeout (default: 45m)
   SCRIPTC_TEST_WORKERS      Vitest workers per sandbox (default: 4)
@@ -195,9 +196,8 @@ Environment:
   process.exit(0);
 }
 
-const imageConfig = sandboxImageConfig();
-const { sandboxImage: image } = imageConfig;
-const bootstrapCommand = sandboxBootstrapCommand(imageConfig.custom);
+const sourceConfig = sandboxTestSourceConfig();
+const bootstrapCommand = sandboxBootstrapCommand(sourceConfig.prepared);
 const vercelConfig = sandboxVercelConfig();
 const vercelProcessEnv = sandboxVercelEnvironment(vercelConfig);
 const {
@@ -206,6 +206,7 @@ const {
   localTestWorkers,
   localCaseShards,
   sandboxTimeout,
+  sandboxTimeoutMs,
 } = sandboxRunnerConfig();
 
 if (!["plain", "san", "both"].includes(values.lane)) {
@@ -382,14 +383,14 @@ const execIn = async (
   args,
   env = {},
   task = "",
-  wallTimeoutMs = 15 * 60_000,
+  wallTimeoutMs = sandboxTimeoutMs,
   workdir = "/workspace",
   idleTimeoutMs = 90_000,
 ) => {
   const envArgs = Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
   const exitMarker = `__SCRIPTC_REMOTE_EXIT_${randomBytes(12).toString("hex")}__`;
   const prepared = sandboxCommand(command, args, exitMarker);
-  const { statusPath } = prepared;
+  const { statusPath, logPath } = prepared;
   const label = task ? `${worker.label} ${task}` : worker.label;
   if (prepared.file) {
     const localScript = join(temp, `${exitMarker}.sh`);
@@ -416,6 +417,11 @@ const execIn = async (
     ...prepared.argv,
   ];
   const deadline = Date.now() + wallTimeoutMs;
+  const recoveredLog = async () => {
+    await vercel(["sandbox", "exec", "--timeout", "1m", "--workdir", workdir, worker.name, "tail", "-n", "160", logPath], {
+      label: `${label} recovered log`, timeoutMs: 60_000, idleTimeoutMs: 30_000,
+    }).catch((error) => console.warn(`[${label}] could not recover ${logPath}: ${error.message}`));
+  };
   try {
     await vercel(commandArgs, {
       exitMarker,
@@ -426,12 +432,10 @@ const execIn = async (
   } catch (error) {
     if (error.remoteExitCode !== undefined) throw error;
     console.warn(`[${label}] CLI completion was not confirmed (${error.message}); checking the remote command status...`);
-    for (;;) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new Error(`${label} did not confirm completion before its timeout`, { cause: error });
-      const probeMarker = `__SCRIPTC_REMOTE_PROBE_${randomBytes(12).toString("hex")}__`;
-      const probeScript = sandboxStatusCommand(statusPath, probeMarker, Math.min(20, Math.floor(remaining / 1000)));
-      try {
+    try {
+      await waitForSandboxCommand(async (remaining) => {
+        const probeMarker = `__SCRIPTC_REMOTE_PROBE_${randomBytes(12).toString("hex")}__`;
+        const probeScript = sandboxStatusCommand(statusPath, probeMarker, Math.min(20, Math.floor(remaining / 1000)));
         await vercel(
           ["sandbox", "exec", "--timeout", "1m", "--workdir", workdir, worker.name, "sh", "-c", probeScript],
           {
@@ -441,21 +445,23 @@ const execIn = async (
             timeoutMs: Math.min(60_000, remaining),
           },
         );
-        return;
-      } catch (probeError) {
-        if (probeError.remoteExitCode !== REMOTE_COMMAND_PENDING) throw probeError;
-        console.log(`[${label}] remote command has not recorded completion; waiting...`);
-      }
+      }, {
+        deadline, label,
+        onPending: (probeError) => console.warn(probeError.remoteExitCode === REMOTE_COMMAND_PENDING
+          ? `[${label}] remote command has not recorded completion; waiting...`
+          : `[${label}] remote status probe was not confirmed (${probeError.message}); retrying...`),
+      });
+    } finally {
+      await recoveredLog();
     }
   }
 };
 
 async function preflight() {
-  const customImage = imageConfig.custom ? "custom VCR image" : "managed fallback image";
   console.log("Sandbox preflight:");
   console.log(`  auth:  ${vercelConfig.authSource}`);
   console.log(`  scope: ${vercelConfig.scopeSource}`);
-  console.log(`  image: ${image} (${customImage})`);
+  console.log(`  source: ${sourceConfig.reference} (${sourceConfig.description})`);
   console.log(`  shape: ${workers.length} sandboxes, ${vcpus} vCPUs each`);
 
   try {
@@ -530,8 +536,7 @@ async function createWorker(worker) {
     "create",
     "--name",
     worker.name,
-    "--image",
-    image,
+    ...sourceConfig.createArgs,
     "--timeout",
     sandboxTimeout,
     "--vcpus",
@@ -665,7 +670,7 @@ let failure;
 try {
   await preflight();
   console.log(
-    `Running ${lanes.join("+")} corpus lanes in ${workers.length} ${vcpus}-vCPU sandboxes from ${image} (${shardCount} shards/lane).`,
+    `Running ${lanes.join("+")} corpus lanes in ${workers.length} ${vcpus}-vCPU sandboxes from ${sourceConfig.reference} (${shardCount} shards/lane).`,
   );
   console.log("Packing the exact tracked + untracked, non-ignored worktree...");
   await createArchive(archive);
@@ -723,7 +728,9 @@ try {
         );
       }
       await execIn(worker, "pnpm", ["install", "--frozen-lockfile"], {}, "", 2 * 60_000);
-      await execIn(worker, "pnpm", ["build"], {}, "", 2 * 60_000);
+      // Resetting the source tree removes dist but preserves node_modules,
+      // including TypeScript's incremental metadata. Rebuild both together.
+      await execIn(worker, "pnpm", ["build:fresh"], {}, "", 2 * 60_000);
       // Workspace builds deliberately do not rebuild packaged native artifacts.
       // Every remote lane needs the Linux helper and runtime from this worktree.
       await execIn(worker, "pnpm", ["--filter", "@scriptc/llvm-linux-x64-gnu", "build:native"], {}, "LLVM helper", 5 * 60_000);
@@ -749,7 +756,7 @@ try {
         "runtime toolchain cleanup",
         60_000,
       );
-    }, imageConfig.custom ? workers.length : 8);
+    }, sourceConfig.prepared ? workers.length : 8);
 
     await allWorkers("Testing", async (worker) => {
       const sharedTestEnv = {

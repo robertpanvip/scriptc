@@ -8,7 +8,7 @@ import { expect, test } from "vitest";
 const root = join(import.meta.dirname, "../..");
 const entry = join(root, "tests/fixtures/self-hosting/frontend-metadata.ts");
 
-for (const backend of ["c", "llvm"] as const) {
+for (const backend of ["llvm"] as const) {
   test(`production package transforms and TS7 options execute natively (${backend})`, async () => {
     const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "scriptc-frontend-metadata-"));
     try {
@@ -33,8 +33,8 @@ for (const backend of ["c", "llvm"] as const) {
       expect(actual.status, actual.stderr).toBe(expected.status);
       expect(actual.stderr).toBe(expected.stderr);
       expect(actual.stdout).toBe(expected.stdout);
-      expect(actual.stdout).toContain('"import":"./cjs.js","require":"./cjs.js"');
-      expect(actual.stdout).toContain('./feature/use ./lib/use.js');
+      expect(actual.stdout).toContain('"import":"./esm.js","require":"./cjs.js"');
+      expect(actual.stdout).toContain('./feature/use ./esm/use.js');
       expect(actual.stdout).toContain('false true true 7 99');
       expect(actual.stdout).toContain('true lib.es2023.d.ts');
     } finally {

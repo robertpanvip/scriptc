@@ -4,7 +4,7 @@ import { newValueMayThrow } from "../../ir/analysis.js";
 import { isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isRefCounted } from "../../ir/ir.js";
 import { collectFfiRetainedOps, parseFfiCallbackKey } from "../ffi-callbacks.js";
 import { mangleClassNew, mangleClassRetain, mangleClassStruct, mangleFnClosure, mangleFunction, mangleLocal, mangleVtStruct } from "../mangle.js";
-import { classStructSym } from "./classes.js";
+import { classEnvironmentIndex, classStructSym } from "./classes.js";
 import { LlvmUnsupportedError } from "./unsupported.js";
 import type { LlvmEmitterContext, ExprOf, LlValue } from "./expr-context.js";
 import { f64Lit, ffiNativeTypeLl, ffiNativeParamLl, ffiNativeReturnLl } from "./common.js";
@@ -39,7 +39,8 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
       }
       case "ffiCall": {
         // LIBRARY mode: every ffiCall is a profile-declared host-callback
-        // channel (the library lane loads no native-FFI manifest). Fetch
+        // channel (the library lane loads no native-FFI manifest). Wasm
+        // calls named imports; native libraries fetch
         // the slot's registered pointer — scr_library_cb_require delivers
         // the channel's trap constant through the funnel (SC4025) when the
         // host never registered — then brackets the typed indirect call,
@@ -50,7 +51,7 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
         const libCb = host.mod.lib?.callbacks?.find((c) => c.name === e.import);
         if (libCb !== undefined) {
           const cbArgs = e.args.map((arg) => host.emitExpr(arg));
-          const natTypes: string[] = ["ptr"];
+          const natTypes: string[] = [];
           const natArgs: string[] = [];
           libCb.params.forEach((cls, i) => {
             const arg = cbArgs[i]!;
@@ -99,10 +100,10 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
                 const len = B.tmp();
                 const data = B.tmp();
                 B.line(`${lenPtr} = getelementptr inbounds %ScrStr, ptr ${arg.name}, i64 0, i32 1`);
-                B.line(`${len} = load i64, ptr ${lenPtr}`);
-                B.line(`${data} = getelementptr inbounds i8, ptr ${arg.name}, i64 24`);
-                natTypes.push("ptr", "i64");
-                natArgs.push(`ptr ${data}`, `i64 ${len}`);
+                B.line(`${len} = load ${host.sizeType}, ptr ${lenPtr}`);
+                B.line(`${data} = getelementptr inbounds i8, ptr ${arg.name}, i64 ${host.abiOffset(24, 12)}`);
+                natTypes.push("ptr", host.sizeType);
+                natArgs.push(`ptr ${data}`, `${host.sizeType} ${len}`);
                 break;
               }
               case "bytes": {
@@ -110,26 +111,33 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
                 const len = B.tmp();
                 const dataPtr = B.tmp();
                 const data = B.tmp();
-                B.line(`${lenPtr} = getelementptr inbounds i8, ptr ${arg.name}, i64 8`);
-                B.line(`${len} = load i64, ptr ${lenPtr}`);
-                B.line(`${dataPtr} = getelementptr inbounds i8, ptr ${arg.name}, i64 24`);
+                B.line(`${lenPtr} = getelementptr inbounds i8, ptr ${arg.name}, i64 ${host.abiOffset(8, 4)}`);
+                B.line(`${len} = load ${host.sizeType}, ptr ${lenPtr}`);
+                B.line(`${dataPtr} = getelementptr inbounds i8, ptr ${arg.name}, i64 ${host.abiOffset(24, 12)}`);
                 B.line(`${data} = load ptr, ptr ${dataPtr}`);
-                natTypes.push("ptr", "i64");
-                natArgs.push(`ptr ${data}`, `i64 ${len}`);
+                natTypes.push("ptr", host.sizeType);
+                natArgs.push(`ptr ${data}`, `${host.sizeType} ${len}`);
                 break;
               }
             }
           });
-          host.declare(`declare ptr @scr_library_cb_require(${host.sizeType}, ptr)`);
-          host.declare(`declare ptr @scr_library_cb_ctx(${host.sizeType})`);
           host.declare(`declare void @scr_library_callback_begin()`);
           host.declare(`declare void @scr_library_callback_end()`);
-          const fn = B.tmp();
-          B.line(`${fn} = call ptr @scr_library_cb_require(${host.sizeType} ${libCb.slot}, ptr @sc_lib_cb_trap_${libCb.slot})`);
-          const ctx = B.tmp();
-          B.line(`${ctx} = call ptr @scr_library_cb_ctx(${host.sizeType} ${libCb.slot})`);
           const retTy = ffiNativeTypeLl(libCb.returns);
-          const call = `call ${retTy} ${fn}(${[`ptr ${ctx}`, ...natArgs].join(", ")})`;
+          let fn: string;
+          if (host.wasi) {
+            fn = `@sc_wasm_import_${libCb.slot}`;
+            host.declare(`declare ${retTy} ${fn}(${natTypes.join(", ")}) "wasm-import-module"="scriptc" "wasm-import-name"="${libCb.name}"`);
+          } else {
+            host.declare(`declare ptr @scr_library_cb_require(${host.sizeType}, ptr)`);
+            host.declare(`declare ptr @scr_library_cb_ctx(${host.sizeType})`);
+            fn = B.tmp();
+            B.line(`${fn} = call ptr @scr_library_cb_require(${host.sizeType} ${libCb.slot}, ptr @sc_lib_cb_trap_${libCb.slot})`);
+            const ctx = B.tmp();
+            B.line(`${ctx} = call ptr @scr_library_cb_ctx(${host.sizeType} ${libCb.slot})`);
+            natArgs.unshift(`ptr ${ctx}`);
+          }
+          const call = `call ${retTy} ${fn}(${natArgs.join(", ")})`;
           if (libCb.returns === "void") {
             B.line(`call void @scr_library_callback_begin()`);
             B.line(call);
@@ -153,6 +161,25 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
         }
         const entry = host.ffiByName.get(e.import);
         if (!entry) throw new InternalCompilerError(`llvm emitter bug: unknown FFI import ${e.import}`);
+        if (entry.callbackOperation) {
+          const adapter = host.ffiCallbackAdapter(entry.callbackTarget ?? entry.name, "callback");
+          if (entry.callbackOperation === "release") {
+            host.declare(`declare void @scr_ffi_release_optional(ptr, ptr)`);
+            const callback = B.tmp();
+            B.line(`${callback} = load ptr, ptr @${adapter.global}`);
+            B.line(`call void @scr_ffi_release_optional(ptr @${adapter.table}, ptr ${callback})`);
+            return { name: "", type: e.type };
+          }
+          const callback = host.emitExpr(e.args[0]!);
+          host.declare(`declare void @scr_ffi_retain_slot(ptr, ptr, ptr)`);
+          host.declare(`declare void @scr_ffi_commit_slot(ptr, ptr)`);
+          host.declare(`declare ptr @scr_bigint_from_pointer(ptr)`);
+          B.line(`call void @scr_ffi_retain_slot(ptr @${adapter.table}, ptr @${adapter.global}, ptr ${callback.name})`);
+          B.line(`call void @scr_ffi_commit_slot(ptr @${adapter.table}, ptr ${callback.name})`);
+          const result = B.tmp();
+          B.line(`${result} = call ptr @scr_bigint_from_pointer(ptr @${adapter.symbol})`);
+          return host.own({ name: result, type: e.type });
+        }
         const args = e.args.map((arg) => host.emitExpr(arg));
         const sourceArgs = new Map<number, LlValue>();
         const callbackArgs = new Map<string, LlValue>();
@@ -240,6 +267,17 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
           }
           const arg = sourceArgs.get(i)!;
           switch (param) {
+            case "i64":
+            case "u64":
+            case "pointer": {
+              const ty = ffiNativeTypeLl(param);
+              host.declare(`declare ${ty} @scr_bigint_to_${param}(ptr)`);
+              const raw = B.tmp();
+              B.line(`${raw} = call ${ty} @scr_bigint_to_${param}(ptr ${arg.name})`);
+              nativeParamTypes.push(ty);
+              nativeArgs.push(`${ty} ${raw}`);
+              break;
+            }
             case "f64":
               nativeParamTypes.push("double");
               nativeArgs.push(`double ${arg.name}`);
@@ -362,6 +400,14 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
         B.line(`${raw} = ${call}`);
         restoreRawContexts();
         finishRetainedReleases();
+        if (entry.returns === "i64" || entry.returns === "u64" || entry.returns === "pointer") {
+          host.declare(`declare ptr @scr_bigint_from_${entry.returns}(${retTy})`);
+          const value = B.tmp();
+          B.line(`${value} = call ptr @scr_bigint_from_${entry.returns}(${retTy} ${raw})`);
+          const result = host.own({ name: value, type: e.type });
+          if (callbacksMayThrow) host.emitPendingCheck();
+          return result;
+        }
         if (entry.returns === "f64") {
           const result = { name: raw, type: e.type };
           if (callbacksMayThrow) host.emitPendingCheck();
@@ -400,6 +446,12 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
         const c = B.tmp();
         B.line(`${c} = call ptr @scr_closure_new(ptr @${host.callTarget(e.fnName)}, ${host.sizeType} ${e.captures.length})`);
         const out = host.own({ name: c, type: e.type });
+        const functionKind = (target.generator ? 1 : 0) + (target.async ? 2 : 0) + (target.ownsPrototype ? 4 : 0);
+        if (functionKind) {
+          const kindPtr = B.tmp();
+          B.line(`${kindPtr} = getelementptr inbounds %ScrClosure, ptr ${c}, i64 0, i32 4`);
+          B.line(`store i32 ${functionKind}, ptr ${kindPtr}`);
+        }
         e.captures.forEach((localId, i) => {
           const box = host.loadBox(`%${mangleLocal(localId)}`);
           const retained = host.retainBox(box);
@@ -527,11 +579,12 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
         if (e.value.type.kind !== "object") throw new InternalCompilerError("llvm emitter bug: instanceOfValue on a non-object");
         const v = host.emitExpr(e.value);
         const target = host.emitExpr(e.classValue);
-        if (host.classMeta.get(e.value.type.className)?.def.localCaptures !== undefined) {
+        if (e.classValue.type.kind === "classval" && host.classMeta.get(e.classValue.type.className)?.def.localCaptures !== undefined &&
+            host.classMeta.get(e.value.type.className)?.def.fields.some((field) => field.name === `%classEnvironment:${e.classValue.type.kind === "classval" ? e.classValue.type.className : ""}`)) {
           const slot = B.tmp();
           const actual = B.tmp();
           const result = B.tmp();
-          B.line(`${slot} = getelementptr inbounds %${mangleClassStruct(e.value.type.className)}, ptr ${v.name}, i64 0, i32 1`);
+          B.line(`${slot} = getelementptr inbounds %${mangleClassStruct(e.classValue.type.className)}, ptr ${v.name}, i64 0, i32 ${classEnvironmentIndex(host.classMeta.get(e.classValue.type.className)!)}`);
           B.line(`${actual} = load ptr, ptr ${slot}`);
           B.line(`${result} = icmp eq ptr ${actual}, ${target.name}`);
           return { name: result, type: e.type };
@@ -555,7 +608,7 @@ export function emitCallExpr(host: LlvmEmitterContext, e: ExprOf<"call" | "ffiCa
       }
       case "promiseVoidWiden": {
         // One ScrPromise* either way — ownership transfers, type-only
-        // (the C emitter's rule).
+        //.
         const v = host.emitExpr(e.value);
         host.moveTemp(v);
         return host.own({ name: v.name, type: e.type });

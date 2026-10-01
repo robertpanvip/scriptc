@@ -5,10 +5,30 @@ import { validateModule } from "./validate.js";
 
 const loc = { file: "numeric-read.ts", start: 0, end: 0 };
 
+test("static callback operations validate their complete ABI after serialization", () => {
+  const mod = expressionModule({ kind: "numLit", value: 0, type: F64, loc }, []);
+  mod.ffiImports = [
+    { name: "register", symbol: "register", library: "native", callbackOperation: "register", params: [{ callback: { id: "callback", params: ["pointer"], returns: "void", lifetime: "retained", invoke: "script-thread" } }], returns: "pointer" },
+    { name: "release", symbol: "release", library: "native", callbackOperation: "release", callbackTarget: "register", params: [], returns: "void" },
+  ];
+  expect(validateModule(deserializeModule(serializeModule(mod)))).toEqual([]);
+  for (const variant of ["target", "library", "return", "params", "callback-id"]) {
+    const bad = structuredClone(mod);
+    const registration = bad.ffiImports![0]!;
+    const release = bad.ffiImports![1]!;
+    if (variant === "target") release.callbackTarget = "missing";
+    if (variant === "library") release.library = "different";
+    if (variant === "return") registration.returns = "void";
+    if (variant === "params") release.params = ["pointer"];
+    if (variant === "callback-id") (registration.params[0] as { callback: { id: string } }).callback.id = "wrong";
+    expect(validateModule(bad).some(error => error.message.includes("FFI callback operation"))).toBe(true);
+  }
+});
+
 function localClassModule(): IrModule {
   const self: IrType = { kind: "object", className: "Local" };
   const mod = expressionModule({ kind: "classRef", className: "Local", captures: ["outer"], type: { kind: "classval", className: "Local" }, loc }, []);
-  mod.classes = [{ name: "Local", jsName: "Local", fields: [], localCaptures: [{ localId: "shared", name: "value", type: F64 }], loc }];
+  mod.classes = [{ name: "Local", jsName: "Local", fields: [{ name: "%classEnvironment:Local", type: { kind: "classval", className: "Local" } }], localCaptures: [{ localId: "shared", name: "value", type: F64 }], loc }];
   mod.functions[0]!.locals = [{ id: "outer", name: "value", type: F64, mutable: true, boxed: true }];
   mod.functions.push({
     name: "%Local.constructor", params: [{ localId: "self", name: "this", type: self }],
@@ -18,6 +38,23 @@ function localClassModule(): IrModule {
   });
   return mod;
 }
+
+test("class prototype data helpers retain their ABI after serialization", () => {
+  const mod = expressionModule({ kind: "numLit", value: 0, type: F64, loc }, []);
+  mod.classes = [{ name: "Vector", fields: [], prototypeDataHelper: "%prototype.Vector", loc }];
+  mod.functions.push({ name: "%prototype.Vector", params: [], locals: [], returnType: DYN,
+    body: [{ kind: "return", value: { kind: "dynObjLit", fields: [], type: DYN, loc }, loc }], loc });
+  expect(validateModule(deserializeModule(serializeModule(mod)))).toEqual([]);
+  for (const variant of ["missing", "params", "return", "captures"]) {
+    const bad = structuredClone(mod);
+    const helper = bad.functions[1]!;
+    if (variant === "missing") bad.functions.pop();
+    if (variant === "params") helper.params.push({ localId: "p", name: "p", type: DYN });
+    if (variant === "return") helper.returnType = F64;
+    if (variant === "captures") helper.captures = [];
+    expect(validateModule(bad).some((error) => error.message.includes("prototype data helper"))).toBe(true);
+  }
+});
 
 test("local classes retain serialized capture slots and fresh identity", () => {
   const mod = localClassModule();
@@ -80,6 +117,80 @@ function expressionModule(expr: IrExpr, unions: IrUnionDef[]): IrModule {
     functions: [{ name: "main", params: [], locals: [], returnType: VOID, body: [{ kind: "exprStmt", expr, loc }], loc }],
   };
 }
+
+test("library callbacks retain child, specialized, and generic result diagnostics", () => {
+  const expr: IrExpr = {
+    kind: "libCall", fn: "cp.execFile", type: F64, loc,
+    args: [
+      { kind: "strLit", value: "tool", type: STRING, loc },
+      { kind: "arrayLit", elems: [], type: arrayOf(STRING), loc },
+      { kind: "boolLit", value: true, type: F64, loc },
+    ],
+  };
+  expect(validateModule(expressionModule(expr, [])).map((error) => error.message)).toEqual([
+    "in main: boolLit must be bool",
+    "in main: libCall cp.execFile callback must be a non-rest void function with at most three parameters",
+    "in main: libCall cp.execFile must be child, got f64",
+  ]);
+});
+
+test("nullish chains retain child-before-parent diagnostic order", () => {
+  const at = (start: number) => ({ ...loc, start });
+  const expr: IrExpr = {
+    kind: "nullish", type: F64, loc: at(4),
+    left: {
+      kind: "nullish", type: STRING, loc: at(2),
+      left: { kind: "numLit", value: 0, type: STRING, loc: at(0) },
+      right: { kind: "boolLit", value: true, type: F64, loc: at(1) },
+    },
+    right: { kind: "strLit", value: "wrong", type: F64, loc: at(3) },
+  };
+  expect(validateModule(expressionModule(expr, [])).map((error) => [error.loc.start, error.message])).toEqual([
+    [0, "in main: numLit must be f64"],
+    [1, "in main: boolLit must be bool"],
+    [1, "in main: nullish right operand: expected string, got f64"],
+    [2, "in main: nullish left must be a union, got string"],
+    [3, "in main: strLit must be string"],
+    [4, "in main: nullish left must be a union, got string"],
+  ]);
+});
+
+test("logical trees retain left/right/parent diagnostic order", () => {
+  const at = (start: number) => ({ ...loc, start });
+  const expr: IrExpr = {
+    kind: "logical", op: "&&", type: BOOL, loc: at(4),
+    left: {
+      kind: "logical", op: "||", type: STRING, loc: at(2),
+      left: { kind: "numLit", value: 0, type: STRING, loc: at(0) },
+      right: { kind: "boolLit", value: true, type: F64, loc: at(1) },
+    },
+    right: { kind: "strLit", value: "wrong", type: BOOL, loc: at(3) },
+  };
+  expect(validateModule(expressionModule(expr, [])).map((error) => [error.loc.start, error.message])).toEqual([
+    [0, "in main: numLit must be f64"],
+    [1, "in main: boolLit must be bool"],
+    [1, "in main: logical || right: expected string, got f64"],
+    [3, "in main: strLit must be string"],
+    [2, "in main: logical && left: expected bool, got string"],
+  ]);
+});
+
+test("conditional trees retain condition/then/else/parent diagnostic order", () => {
+  const at = (start: number) => ({ ...loc, start });
+  const expr: IrExpr = {
+    kind: "ternary", type: STRING, loc: at(3),
+    cond: { kind: "numLit", value: 0, type: BOOL, loc: at(0) },
+    then: { kind: "boolLit", value: true, type: F64, loc: at(1) },
+    else_: { kind: "strLit", value: "wrong", type: BOOL, loc: at(2) },
+  };
+  expect(validateModule(expressionModule(expr, [])).map((error) => [error.loc.start, error.message])).toEqual([
+    [0, "in main: numLit must be f64"],
+    [1, "in main: boolLit must be bool"],
+    [2, "in main: strLit must be string"],
+    [1, "in main: ternary then-branch: expected string, got f64"],
+    [2, "in main: ternary else-branch: expected string, got bool"],
+  ]);
+});
 
 test.each(["callValue", "dynCall"] as const)("%s requires a checked-value receiver and preserves it in serialization", (kind) => {
   const funcType: IrType = { kind: "func", params: [], ret: DYN };

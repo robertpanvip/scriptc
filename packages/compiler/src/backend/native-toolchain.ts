@@ -1,3 +1,8 @@
+import { driverTraceCandidates, linkTraceCandidate } from "./link-trace.js";
+import { toolchainEnvironmentCachePolicy, toolchainEnvironmentFingerprint } from "./toolchain-environment.js";
+export { toolchainEnvironmentCachePolicy, toolchainEnvironmentFingerprint, type ToolchainEnvironmentCachePolicy } from "./toolchain-environment.js";
+import { IPHONEOS_MIN_VERSION, ANDROID_MIN_API, isIosTarget, isAndroidTarget, isMobileTarget, mobileLibraryTarget, mobileTargetRefusal, configuredTargetPlatform } from "./target-platform.js";
+export { IPHONEOS_MIN_VERSION, ANDROID_MIN_API, isIosTarget, isAndroidTarget, isMobileTarget, mobileLibraryTarget, mobileTargetRefusal, configuredTargetPlatform } from "./target-platform.js";
 import { InternalCompilerError } from "../errors.js";
 import { execFile, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -123,114 +128,6 @@ export function executableSectionEliminationFlags(platform: string): {
   }
 }
 
-/** Environment variables consumed by clang, its linker/subtools, or the
- * platform SDK selection. They are implicit command-line inputs: changing one
- * must never reuse an artifact produced under the old toolchain posture. */
-const TOOLCHAIN_ENV_KEYS = [
-  "COMPILER_PATH",
-  "GCC_EXEC_PREFIX",
-  "CPATH",
-  "C_INCLUDE_PATH",
-  "CPLUS_INCLUDE_PATH",
-  "OBJC_INCLUDE_PATH",
-  "OBJCPLUS_INCLUDE_PATH",
-  "LIBRARY_PATH",
-  "LD_LIBRARY_PATH",
-  "LD_RUN_PATH",
-  "DYLD_LIBRARY_PATH",
-  "DYLD_FRAMEWORK_PATH",
-  "DYLD_FALLBACK_LIBRARY_PATH",
-  "DYLD_FALLBACK_FRAMEWORK_PATH",
-  "SDKROOT",
-  "DEVELOPER_DIR",
-  "MACOSX_DEPLOYMENT_TARGET",
-  "IPHONEOS_DEPLOYMENT_TARGET",
-  "TVOS_DEPLOYMENT_TARGET",
-  "WATCHOS_DEPLOYMENT_TARGET",
-  "DRIVERKIT_DEPLOYMENT_TARGET",
-  "XROS_DEPLOYMENT_TARGET",
-  "CCC_OVERRIDE_OPTIONS",
-  "CCC_ADD_ARGS",
-  "CLANG_CONFIG_FILE_SYSTEM_DIR",
-  "CLANG_CONFIG_FILE_USER_DIR",
-  "CC",
-  "CFLAGS",
-  "CPPFLAGS",
-  "LDFLAGS",
-  "AR",
-  "RANLIB",
-  "CMAKE_GENERATOR",
-  "CMAKE_TOOLCHAIN_FILE",
-  "ZIG_LIB_DIR",
-  "ZIG_LIBC",
-  "SOURCE_DATE_EPOCH",
-  "ZERO_AR_DATE",
-  "LANG",
-  "LC_ALL",
-  "LC_CTYPE",
-] as const;
-
-/** Toolchain variables whose values name mutable files/directories consumed
- * while compiling a TU (or can inject arbitrary compiler options). Hashing the
- * value is insufficient: a header, SDK, config, compiler helper, or loaded
- * dylib can change in place while the spelling remains stable. In that posture
- * neither complete artifacts nor per-TU runtime objects are safe to reuse. */
-const MUTABLE_COMPILE_ENV_KEYS = [
-  "COMPILER_PATH",
-  "GCC_EXEC_PREFIX",
-  "CPATH",
-  "C_INCLUDE_PATH",
-  "CPLUS_INCLUDE_PATH",
-  "OBJC_INCLUDE_PATH",
-  "OBJCPLUS_INCLUDE_PATH",
-  "LD_LIBRARY_PATH",
-  "DYLD_LIBRARY_PATH",
-  "DYLD_FRAMEWORK_PATH",
-  "DYLD_FALLBACK_LIBRARY_PATH",
-  "DYLD_FALLBACK_FRAMEWORK_PATH",
-  "SDKROOT",
-  "DEVELOPER_DIR",
-  "CCC_OVERRIDE_OPTIONS",
-  "CCC_ADD_ARGS",
-  "CLANG_CONFIG_FILE_SYSTEM_DIR",
-  "CLANG_CONFIG_FILE_USER_DIR",
-  // `zig cc` resolves its bundled headers/runtime through ZIG_LIB_DIR and a
-  // caller-selected native libc description through ZIG_LIBC. Both values name
-  // mutable compiler inputs whose contents can change behind a stable path.
-  "ZIG_LIB_DIR",
-  "ZIG_LIBC",
-] as const;
-
-/** These variables only redirect link-time inputs. Runtime objects remain
- * reusable, but a complete executable could otherwise retain a library that
- * was rebuilt in place behind the same search-path spelling. */
-const MUTABLE_LINK_ENV_KEYS = ["LIBRARY_PATH", "LD_RUN_PATH"] as const;
-
-export interface ToolchainEnvironmentCachePolicy {
-  completeArtifacts: boolean;
-  runtimeObjects: boolean;
-}
-
-export function toolchainEnvironmentCachePolicy(
-  env: NodeJS.ProcessEnv = process.env,
-): ToolchainEnvironmentCachePolicy {
-  const mutableCompileInput = MUTABLE_COMPILE_ENV_KEYS.some((name) => env[name] !== undefined);
-  const mutableLinkInput = MUTABLE_LINK_ENV_KEYS.some((name) => env[name] !== undefined);
-  return {
-    completeArtifacts: !mutableCompileInput && !mutableLinkInput,
-    runtimeObjects: !mutableCompileInput,
-  };
-}
-
-export function toolchainEnvironmentFingerprint(env: NodeJS.ProcessEnv = process.env): string {
-  const hash = createHash("sha256").update("toolchain-env-v1\0");
-  for (const name of TOOLCHAIN_ENV_KEYS) {
-    const value = env[name];
-    hash.update(name).update(value === undefined ? "\0unset\0" : "\0set\0").update(value ?? "").update("\0");
-  }
-  return hash.digest("hex");
-}
-
 /** Inputs that can change which native tool/runtime implementation an
  * executable build selects before compileC has a chance to rediscover it.
  * The early whole-program cache keys this exact posture before restoring a
@@ -280,7 +177,7 @@ export interface CcOptions {
    * when omitted: arbitrary C can depend on same-path edited headers and on
    * compiler-visible source spelling (`__FILE__`), neither of which the
    * top-level bytes alone can safely represent. scriptc's frontend supplies
-   * this for its generated C/LLVM IR; `--from-c` deliberately does not. */
+   * this for its generated LLVM IR; caller-supplied C deliberately does not. */
   cacheIdentity?: string;
   /** Native optimization posture. Release preserves the historical -O2
    * executable lane; dev selects -O0 and may compile a caller-provided LLVM
@@ -309,6 +206,8 @@ export interface CcOptions {
    * their builds bypass the complete-executable cache while still reusing
    * cached runtime objects. */
   systemLibraries?: readonly string[];
+  /** Darwin framework names, emitted as distinct driver arguments. */
+  frameworks?: readonly string[];
   /** Embed the dynamic-island engine (--dynamic): compiles scr_island.c,
    * defines SCR_DYNAMIC, and links the cached libqjs.a. Off retains the
    * static runtime selection; executable section GC may still remove
@@ -643,59 +542,6 @@ export function isZigDriver(driver: Pick<CcDriver, "argv">): boolean {
  * embedder's side of the contract: Xcode links iOS archives against the
  * selected SDK, and Gradle/NDK builds link Android archives against the
  * API-26+ bionic stubs. */
-export const IPHONEOS_MIN_VERSION = "15.0";
-export const ANDROID_MIN_API = 26;
-
-const MOBILE_LIBRARY_TARGETS = [
-  "aarch64-apple-ios",
-  "aarch64-apple-ios-simulator",
-  "aarch64-linux-android",
-] as const;
-
-export function isIosTarget(target: string | null): boolean {
-  return target === "aarch64-apple-ios" || target === "aarch64-apple-ios-simulator";
-}
-
-export function isAndroidTarget(target: string | null): boolean {
-  return target === "aarch64-linux-android";
-}
-
-export function isMobileTarget(target: string | null): boolean {
-  return isIosTarget(target) || isAndroidTarget(target);
-}
-
-/** The canonical mobile triple SCRIPTC_TARGET selects, or null when the
- * environment names none. Pure string inspection — safe to consult before
- * any toolchain discovery runs. */
-export function mobileLibraryTarget(env: NodeJS.ProcessEnv = process.env): string | null {
-  const target = env["SCRIPTC_TARGET"] ?? "";
-  return isMobileTarget(target) ? target : null;
-}
-
-/** The admission verdict for a mobile-family triple: null when the spelling
- * and host pairing are supported, otherwise the refusal text (the same text
- * resolveCc throws and compileLibrary reports as SC3002). Pure string/host
- * inspection — no discovery, no subprocess. */
-export function mobileTargetRefusal(
-  target: string,
-  hostPlatform: NodeJS.Platform = process.platform,
-): string | null {
-  if (isIosTarget(target)) {
-    return hostPlatform === "darwin"
-      ? null
-      : `${target} library archives build on macOS hosts only (the Apple iOS SDK sysroot and Mach-O symbol localization live there); this host is ${hostPlatform}`;
-  }
-  if (isAndroidTarget(target)) return null;
-  // A near-miss mobile spelling must refuse with the supported set named,
-  // never reach zig with no sysroot wired (the compile would fail on the
-  // first libc header) or produce an artifact for an unverified device
-  // class.
-  if (/(?:^|-)(?:ios|tvos|watchos|visionos|android)/.test(target)) {
-    return `unsupported mobile target '${target}' (supported: ${MOBILE_LIBRARY_TARGETS.join(", ")})`;
-  }
-  return null;
-}
-
 /** The Apple SDK root for one mobile platform, discovered through xcrun the
  * way Xcode's own build system selects it. Memoized per SDK name and
  * selection environment: production rediscovers per process, and the two
@@ -904,34 +750,6 @@ function isMuslTarget(driver: Pick<CcDriver, "target">): boolean {
  * analyze(): the FRONTEND consults it too (path.sep / os.EOL literals and
  * the path-module binding follow the target — a win32 triple compiles
  * Node-on-Windows semantics, path.win32 backing the bare module). */
-export function configuredTargetPlatform(
-  env: NodeJS.ProcessEnv = process.env,
-  hostPlatform: NodeJS.Platform = process.platform,
-): string {
-  const target = env["SCRIPTC_TARGET"] ?? "";
-  if (target === "") return hostPlatform;
-  if (target === "wasm32-wasi") return "wasi";
-  if (target.includes("wasi")) {
-    throw new Error(`unsupported WASI target '${target}' (supported: wasm32-wasi)`);
-  }
-  // iOS is a darwin-family target: Mach-O objects, ld64 localization,
-  // POSIX path/EOL semantics. Android falls to the linux arm below —
-  // bionic is a linux libc and its archives are ordinary ELF.
-  if (isIosTarget(target)) return "darwin";
-  if (isAndroidTarget(target)) return "linux";
-  if (/(?:^|-)(?:ios|tvos|watchos|visionos|android)/.test(target)) {
-    throw new Error(
-      `unsupported mobile target '${target}' (supported: ${MOBILE_LIBRARY_TARGETS.join(", ")})`,
-    );
-  }
-  if (target.includes("linux")) return "linux";
-  if (target.includes("windows")) return "win32";
-  if (target.includes("macos") || target.includes("darwin")) return "darwin";
-  throw new Error(
-    `unsupported target '${target}' (supported OS families: linux, windows, macos/darwin, wasm32-wasi)`,
-  );
-}
-
 export function targetPlatform(driver: CcDriver): string {
   if (driver.target === null) return process.platform;
   return configuredTargetPlatform({ SCRIPTC_TARGET: driver.target });
@@ -999,11 +817,11 @@ export interface LibArchiveOptions {
   /** Canonical externally visible definitions retained while the shard merge
    * demotes generated cross-shard linkage back to local symbols. */
   programPublicSymbols?: readonly string[];
-  /** Tiny generated C source carrying volatile library identity getters.
+  /** Tiny LLVM module carrying volatile library identity getters.
    * Its bytes join the complete archive key, but the source itself exists
    * only in the invocation-private build directory and the large program-
    * object cache is keyed independently. */
-  identityCSource?: string;
+  identityLlvmSource?: string;
   /** The archive to produce (<name>.lib.a). */
   outPath: string;
   /** Caller-owned identity for the generated TU's complete non-system
@@ -1037,6 +855,7 @@ export interface LibArchiveOptions {
    * archive, byte-for-byte. */
   threadInstances?: boolean;
   /** IR-detected link gates (the compileC precedent, refusal-narrowed). */
+  dynInvoke?: boolean;
   regex?: boolean;
   assert?: boolean;
   inspect?: boolean;
@@ -1170,11 +989,12 @@ export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> 
     ...(isMuslTarget(driver) ? ["scr_musl.c"] : []),
     ...(regex ? ["scr_regex.c"] : []),
     ...(opts.assert || regex || opts.symbol ? ["scr_assert.c"] : []),
-    ...(opts.inspect ? ["scr_inspect.c"] : []),
+    ...(opts.inspect ? ["scr_inspect.c", "scr_console_native.c"] : []),
     ...(opts.symbol ? ["scr_symbol.c"] : []),
     ...(opts.assert && opts.bigint ? ["scr_bigint_assert.c"] : []),
     ...(opts.searchParams ? ["scr_url_params.c"] : []),
     ...(opts.emitter ? ["scr_events_emitter.c", "scr_dyn_handle.c"] : []),
+    ...(opts.dynInvoke ? ["scr_dyn_invoke.c"] : []),
     ...(opts.zlib ? ["scr_zlib.c"] : []),
     ...(opts.copying ? ["scr_copying.c"] : []),
   ];
@@ -1282,9 +1102,9 @@ export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> 
   let cachedProgramBytes = opts.programSource === undefined
     ? null
     : Buffer.from(opts.programSource, "utf8");
-  const identityBytes = opts.identityCSource === undefined
+  const identityBytes = opts.identityLlvmSource === undefined
     ? null
-    : Buffer.from(opts.identityCSource, "utf8");
+    : Buffer.from(opts.identityLlvmSource, "utf8");
   if (persistentCache !== null) {
     try {
       const [cv, fingerprint, programBytes] = await Promise.all([
@@ -1637,7 +1457,7 @@ export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> 
       const identityObject = identityBytes === null
         ? null
         : await (async () => {
-            const source = join(buildDir, "identity.c");
+            const source = join(buildDir, "identity.ll");
             await writeFile(source, identityBytes);
             return compileOne(source, `${stem}.identity.o`);
           })();
@@ -1846,7 +1666,7 @@ export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> 
  *            mirrors MSVC link.exe; zig's COFF driver refuses multi-object
  *            merges) and llvm-objcopy rejects symbol-scope flags for
  *            COFF, so no tool pairing exists to shell out to. */
-async function localizeLibraryObjects(
+export async function localizeLibraryObjects(
   driver: CcDriver,
   arArgv: readonly string[],
   buildDir: string,
@@ -1854,8 +1674,8 @@ async function localizeLibraryObjects(
   supportObjects: readonly string[],
   keepSymbols: readonly string[],
   stem: string,
+  platform = targetPlatform(driver),
 ): Promise<string> {
-  const platform = targetPlatform(driver);
   const combined = join(buildDir, `${stem}.localized.o`);
   const staging = join(buildDir, `${stem}.localize-staging.a`);
   const keepFile = join(buildDir, "localize-keep.syms");
@@ -1947,9 +1767,9 @@ async function localizeLibraryObjects(
  *                     (every .c/.h in the runtime src dir plus the vendor pin
  *                     QJS_COMMIT), the caller's dependency identity, the
  *                     compiler-visible TU path, Darwin output basename, the
- *                     FULL normalized command line, and the emitted C bytes).
- *                     Emitted C is
- *                     byte-stable by project invariant, so unchanged programs
+ *                     FULL normalized command line, and the emitted LLVM bytes).
+ *                     Emitted LLVM is
+ *                     deterministic, so unchanged programs
  *                     hit; any flag difference — e.g. the sanitized lane's
  *                     -O1/-fsanitize=address/-DSCR_RC_AUDIT — lands in a
  *                     naturally distinct key. On a hit the cached binary is
@@ -1978,7 +1798,7 @@ async function localizeLibraryObjects(
  *   obj/<set>/<f>.o — per-flavor runtime objects for cache-miss builds. The
  *                     historical single invocation recompiles every runtime
  *                     TU per program (~1.3s at -O2); with cached objects a
- *                     miss compiles ONLY the program's C and links (~0.15s).
+ *                     miss compiles only the program's LLVM and links (~0.15s).
  *                     Library-mode -DSCR_LIB objects use a distinct flavor.
  *                     The clang driver hands every input the same option set,
  *                     so per-TU `-c` compiles with those options plus a final
@@ -2974,29 +2794,6 @@ function implicitToolchainFingerprint(
   return implicitToolchainFingerprints(driver, environmentFingerprint).then(
     (fingerprints) => fingerprints.complete,
   );
-}
-
-function linkTraceCandidate(line: string): string[] {
-  const trimmed = line.trim().replace(/^(?:LOAD|load)\s+/, "");
-  if (trimmed === "") return [];
-  const unquoted =
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-      ? trimmed.slice(1, -1)
-      : trimmed;
-  const candidates = [unquoted];
-  const member = unquoted.lastIndexOf("(");
-  if (member > 0 && unquoted.endsWith(")")) candidates.push(unquoted.slice(0, member));
-  return candidates;
-}
-
-function driverTraceCandidates(line: string): string[] {
-  const candidates: string[] = [];
-  for (const match of line.matchAll(/"((?:\\.|[^"\\])*)"|'([^']*)'|(\S+)/g)) {
-    const token = (match[1] ?? match[2] ?? match[3] ?? "").replace(/\\(["\\])/g, "$1");
-    if (token !== "") candidates.push(token);
-  }
-  return candidates;
 }
 
 async function existingDriverTracePaths(
@@ -4034,6 +3831,8 @@ async function compileCInternal(
   const tlsCa = (opts.tlsCa ?? false) || tls;
   const driver = resolveCc();
   const darwinDebugSymbols = needsDarwinDebugSymbols(targetPlatform(driver), optimization, opts.strip);
+  if (opts.frameworks?.length && targetPlatform(driver) !== "darwin") throw new Error("FFI frameworks require a Darwin target");
+  if (opts.frameworks?.some(name => !/^[A-Za-z][A-Za-z0-9_]*$/.test(name))) throw new Error("Invalid FFI framework name");
   const debugFlags = optimization === "dev" && !opts.strip
     ? ["-gline-tables-only", ...(opts.cPath.endsWith(".ll") ? [] : ["-gno-column-info"])]
     : [];
@@ -4129,7 +3928,7 @@ async function compileCInternal(
     cachePolicy.runtimeObjects &&
     configuredCacheRoot !== null &&
     await compilerDriverSupportsPersistentCache(driver, toolchainEnv);
-  // Only compiler-generated TUs opt in. Arbitrary `compileC` / `--from-c`
+  // Only compiler-generated TUs opt in. Arbitrary `compileC` inputs
   // inputs may include caller-owned headers whose contents are not otherwise
   // represented in this key, so they retain the fully uncached historical
   // path unless the caller supplies its own complete dependency identity.
@@ -4176,6 +3975,7 @@ async function compileCInternal(
     cachePolicy.completeArtifacts &&
     persistentCache.identity === "scriptc-generated-v1" &&
     (opts.linkInputs?.length ?? 0) === 0 &&
+    (opts.frameworks?.length ?? 0) === 0 &&
     (opts.systemLibraries?.length ?? 0) === 0 &&
     process.env["SCRIPTC_TEST_TRUST_COMPILER_WRAPPER"] !== "1"
   ) {
@@ -4447,15 +4247,15 @@ async function compileCInternal(
     ...executableSectionFlags.compile,
     ...(opts.textDecoderLegacy ? ["-DSCR_TEXT_DECODER_LEGACY"] : []),
     "-fno-math-errno",
-    // The emitted object model is deliberately type-punned C: a hierarchy
+    // The runtime object model uses type-punned C: a hierarchy
     // upcast is a raw pointer cast, so one object's header (rc, vt) and
     // fields are read and written through BOTH the base and derived struct
     // types (sc_retain_Derived vs sc_release_Base on the same object).
     // C's effective-type rule calls that UB, and clang's TBAA at -O2
     // reorders/elides the rc updates once everything inlines — an upcast
     // identity compare frees the object while a global still owns it.
-    // The LLVM backend emits no TBAA metadata, so this flag is also what
-    // keeps the two backends' memory semantics identical. Mirrored in the
+    // The LLVM backend emits no TBAA metadata; this flag preserves
+    // matching memory semantics in the runtime. Mirrored in the
     // cache-miss cflags below and compileLibArchive — the three option
     // sets must stay in lockstep.
     "-fno-strict-aliasing",
@@ -4481,7 +4281,7 @@ async function compileCInternal(
       ? ["-I", vendorEngineDir(), rt(join(rtDir, "scr_regex.c")), ...lreObjects]
       : []),
     ...(opts.assert || regex || opts.symbol ? [rt(join(rtDir, "scr_assert.c"))] : []),
-    ...(opts.inspect ? [rt(join(rtDir, "scr_inspect.c"))] : []),
+    ...(opts.inspect ? [rt(join(rtDir, "scr_inspect.c")), rt(join(rtDir, "scr_console_native.c"))] : []),
     ...((opts.dynInvoke || nativeFetch) ? [rt(join(rtDir, "scr_dyn_invoke.c"))] : []),
     ...(opts.dc ? [rt(join(rtDir, "scr_dc.c"))] : []),
     ...(opts.dynAsync || opts.dynInvoke || opts.dc || opts.fileHandle || nativeFetch ? [rt(join(rtDir, "scr_async_dyn.c"))] : []),
@@ -4612,6 +4412,7 @@ async function compileCInternal(
     build.programPath ?? opts.cPath,
     ...(opts.linkInputs ?? []),
     ...(opts.systemLibraries ?? []).map((name) => `-l${name}`),
+    ...(opts.frameworks ?? []).flatMap(name => ["-framework", name]),
     // GNU ld resolves libraries from left to right and commonly enables
     // --as-needed: host-clang libz must follow scr_zlib.c/scr_fetch.c and every
     // generated/native input that references inflate symbols. Cross
@@ -4661,11 +4462,11 @@ async function compileCInternal(
       const stderr = subprocessFailureDetail(err);
       const guidance =
         (opts.linkInputs?.length ?? 0) > 0 ||
+        (opts.frameworks?.length ?? 0) > 0 ||
         (opts.systemLibraries?.length ?? 0) > 0
           ? "This build includes native FFI link inputs. Check that every symbol and system library exists, " +
             "that archive/object ordering is correct, and that each input matches the selected target."
-          : `This is a scriptc bug (generated C should always compile) unless ` +
-            `${ccName} itself is missing/broken.`;
+          : `Check the supplied native source and the selected ${ccName} toolchain.`;
       throw new CcCompileError(
         ccName,
         stderr,
@@ -4808,6 +4609,7 @@ async function compileCInternal(
     !cacheWarmOnly &&
     cachePolicy.completeArtifacts &&
     (opts.linkInputs?.length ?? 0) === 0 &&
+    (opts.frameworks?.length ?? 0) === 0 &&
     (opts.systemLibraries?.length ?? 0) === 0;
   let programDependencies: string | null = null;
   const linkProbeArgs = [

@@ -5,8 +5,8 @@ import { InternalCompilerError } from "../../errors.js";
  * package boundary fences for node_modules-declared symbols. */
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
-import { arrayOf, BOOL, BYTES_U8, DYN, F64, IrExpr, IrStmt, IrType, JSVAL, MAX_ISLAND_CALLBACK_ARITY, STRING, VOID, canConvertToDyn, canMarshalTypedFuncIntoIsland, islandPromisePayloadTag, isUnitType } from "../../ir/ir.js";
-import { ISLAND_SURFACE, IslandFnEntry, STATIC_MATH_FNS, STATIC_MATH_PROPS, boundaryIntoIslandMsg } from "./surfaces.js";
+import { arrayOf, BOOL, BYTES_U8, DYN, F64, type IrExpr, type IrStmt, type IrType, JSVAL, MAX_ISLAND_CALLBACK_ARITY, STRING, VOID, canConvertToDyn, canMarshalTypedFuncIntoIsland, islandPromisePayloadTag, isUnitType } from "../../ir/ir.js";
+import { ISLAND_SURFACE, type IslandFnEntry, STATIC_MATH_FNS, STATIC_MATH_PROPS, boundaryIntoIslandMsg } from "./surfaces.js";
 import { requiresDynamicApiDiag, requiresDynamicPackageDiag } from "../../diagnostics/diagnostic.js";
 import { esmNamedImportLinkCrash, isCjsJsFile, isJsSourceFile, locOf, npmPackageNameOf } from "../program.js";
 import { foldedStringKeyOf, lowerDynObjectLiteral } from "./expressions/object-literals.js";
@@ -3395,7 +3395,15 @@ export function lowerStaticReadableStreamReaderCall(
       ts.isSpreadElement(call.arguments[0]!)
     ) {
       const spread = call.arguments[0]! as ts.SpreadElement;
-      const src = lowerer.lowerExpr(spread.expression);
+      let src = lowerer.lowerExpr(spread.expression);
+      // JavaScript array call results retain checked storage so aliases stay
+      // shared. This read-only fold can extract the inferred numeric array.
+      if (src.type.kind === "dyn") {
+        const inferred = lowerer.mapTypeOf(lowerer.typeOf(spread.expression));
+        if (inferred?.kind === "array" && inferred.elem.kind === "f64") {
+          src = lowerer.coerceInto(spread.expression, src, inferred);
+        }
+      }
       if (src.type.kind !== "array" || src.type.elem.kind !== "f64") {
         lowerer.unsupported(
           "SC1090",
@@ -3435,11 +3443,8 @@ export function lowerStaticReadableStreamReaderCall(
     return finish(lowerer.jsvalIn(lowerer.lowerExpr(access.expression), access.expression), entry);
   }
 
-/** Canonical Math constant property reads become typed numeric
-   * literals. Remaining Math properties retain the island/fence path. Math
-   * methods referenced without a call are rejected specifically (no value form
-   * exists, --dynamic or not). Null for non-Math receivers (the property chain
-   * keeps trying). */
+/** Math constants and fixed-arity numeric functions have native value forms.
+ * Remaining properties retain the island/fence path. */
   export function lowerMathProperty(lowerer: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
     const member = lowerer.stdlibGlobalMember(expr, "Math");
     if (member === null) return null;
@@ -3447,6 +3452,14 @@ export function lowerStaticReadableStreamReaderCall(
     const staticValue = own(STATIC_MATH_PROPS, member);
     if (staticValue !== undefined) {
       return { kind: "numLit", value: staticValue, type: F64, loc };
+    }
+    const native = own(STATIC_MATH_FNS, member);
+    if (native && member !== "min" && member !== "max" && member !== "hypot") {
+      const params = Array.from({ length: native.arity }, () => F64);
+      return lowerer.lowerNativeCallableValue({
+        fn: native.fn, params, result: F64,
+        valueParams: params.map((type) => ({ mode: "required", type })),
+      }, `Math.${member}`, loc);
     }
     const propType = own(ISLAND_SURFACE.math.props, member);
     if (propType !== undefined) {

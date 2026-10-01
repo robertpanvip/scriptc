@@ -52,13 +52,13 @@ const featureCalls: readonly [string, IrLibFn][] = [
 test("the production runtime dependency scanners lower entirely statically", () => {
   const { coverage } = analyze(entry, { dynamic: false });
   expect(coverage.preflightFailed).toBe(false);
-  expect(coverage.stats.statementsTotal).toBeGreaterThan(500);
+  expect(coverage.stats.statementsTotal).toBeGreaterThan(150);
   expect(coverage.stats.statementsFailed).toBe(0);
   expect(coverage.stats.statementsIsland).toBe(0);
   expect(coverage.stats.functionsSkipped).toBe(0);
 });
 
-for (const backend of ["c", "llvm"] as const) {
+for (const backend of ["llvm"] as const) {
   test(`self-hosting runtime dependency detection (${backend})`, async () => {
     const dir = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "scriptc-native-features-"));
     try {

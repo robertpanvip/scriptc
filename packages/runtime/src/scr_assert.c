@@ -440,6 +440,8 @@ void scr_assert_ref_eq_fn(const ScrClosure *a, const ScrClosure *b, bool negated
 static bool scr_assert_dyn_same_value(const ScrDyn *a, const ScrDyn *b) {
   if (a->kind != b->kind) return false;
   switch (a->kind) {
+    case SCR_DYN_SYMBOL:
+      return a->v.symbol.value == b->v.symbol.value;
     case SCR_DYN_UNDEF:
     case SCR_DYN_NULL:
       return true;
@@ -509,6 +511,8 @@ static bool scr_assert_dyn_deep_eq(const ScrDyn *a, const ScrDyn *b) {
     return false;
   }
   switch (a->kind) {
+    case SCR_DYN_SYMBOL:
+      return a->v.symbol.value == b->v.symbol.value;
     case SCR_DYN_UNDEF:
     case SCR_DYN_NULL:
       return true;
@@ -545,10 +549,16 @@ static bool scr_assert_dyn_deep_eq(const ScrDyn *a, const ScrDyn *b) {
       for (size_t i = 0; i < a->v.arr.len; i++) {
         if (!scr_assert_dyn_deep_eq(a->v.arr.items[i], b->v.arr.items[i])) return false;
       }
+      if (a->v.arr.properties || b->v.arr.properties) {
+        if (!a->v.arr.properties || !b->v.arr.properties) {
+          const ScrDyn *table = a->v.arr.properties ? a->v.arr.properties : b->v.arr.properties;
+          if (table->v.obj.len != 0) return false;
+        } else if (!scr_assert_dyn_deep_eq(a->v.arr.properties, b->v.arr.properties)) return false;
+      }
       return true;
     }
     case SCR_DYN_OBJ: {
-      if (a->null_proto != b->null_proto) return false; /* the prototype gate */
+      if (a->null_proto != b->null_proto || a->prototype != b->prototype) return false;
       if (a->v.obj.len != b->v.obj.len) return false;
       for (size_t i = 0; i < a->v.obj.len; i++) {
         const ScrDynEntry *ent = &a->v.obj.entries[i];
@@ -637,6 +647,12 @@ static void scr_assert_cf_value(ScrAssertBuf *b, const ScrDyn *d, size_t indent,
       return;
     case SCR_DYN_BIGINT: {
       ScrStr *text = scr_bigint_inspect(d->v.bigint);
+      ab_str(b, text);
+      scr_str_release(text);
+      return;
+    }
+    case SCR_DYN_SYMBOL: {
+      ScrStr *text = d->v.symbol.render(d->v.symbol.value);
       ab_str(b, text);
       scr_str_release(text);
       return;

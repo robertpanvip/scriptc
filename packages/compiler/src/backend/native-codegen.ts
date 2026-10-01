@@ -28,34 +28,16 @@ import {
 } from "./targets.js";
 import { compilerReleaseVersion } from "../library/sidecar.js";
 
+import {
+  NativeCodegenError, validateNativeCodegenVersion as validateHelperVersion,
+  type NativeCodegenVersion, type NativeCodegenOutputKind,
+} from "./native-codegen-core.js";
+export {
+  NATIVE_CODEGEN_PROTOCOL_VERSION, NATIVE_CODEGEN_LLVM_VERSION, NativeCodegenError,
+  type NativeCodegenVersion, type NativeCodegenOutputKind,
+} from "./native-codegen-core.js";
+
 const execFileAsync = promisify(execFile);
-export const NATIVE_CODEGEN_PROTOCOL_VERSION = "1";
-export const NATIVE_CODEGEN_LLVM_VERSION = "22.1.8";
-
-export type NativeCodegenOutputKind = "asm" | "obj";
-
-export class NativeCodegenError extends Error {
-  constructor(
-    readonly diagnosticCode: "SC3002" | "SC3003" | "SC3004",
-    message: string,
-    readonly detailCode?: string,
-  ) {
-    super(message);
-    this.name = "NativeCodegenError";
-  }
-}
-
-export interface NativeCodegenVersion {
-  ok: true;
-  protocol_version: string;
-  scriptc_package_version: string;
-  llvm_version: string;
-  host_triple: string;
-  targets: string[];
-  supported_targets: string[];
-  default_target: string;
-  data_layout: string;
-}
 
 interface HelperIdentity {
   packageName: string;
@@ -86,7 +68,7 @@ export interface NativeCodegenOptions {
   sanitize?: boolean;
   target?: NativeTargetSpec;
   /** Test seam for package selection on a simulated host. */
-  helperHost?: { platform: NodeJS.Platform; arch: string };
+  helperHost?: { platform: NodeJS.Platform; arch: string; linuxLibc?: "gnu" | "musl" };
   /** Test seam: still resolves a package path, never searches PATH. */
   resolvePackageJson?: (specifier: string) => string;
   /** Internal/test override; omitted production calls use the shared cache. */
@@ -132,53 +114,21 @@ async function invoke(binaryPath: string, args: string[]): Promise<{ stdout: str
 }
 
 export function validateNativeCodegenVersion(
-  value: Record<string, unknown>,
-  target: NativeTargetSpec,
-  helper: NativeHelperSpec,
+  value: Record<string, unknown>, target: NativeTargetSpec, helper: NativeHelperSpec,
 ): NativeCodegenVersion {
-  const expectedPackageVersion = compilerReleaseVersion();
-  const mismatch = (field: string, expected: string): never => {
-    throw new NativeCodegenError(
-      "SC3003",
-      `LLVM native helper is incompatible: ${field} is ${JSON.stringify(value[field])}, expected ${JSON.stringify(expected)}; reinstall scriptc so its compiler and ${helper.packageName} packages have matching versions`,
-      "version_mismatch",
-    );
-  };
-  if (value["ok"] !== true) mismatch("ok", "true");
-  if (value["protocol_version"] !== NATIVE_CODEGEN_PROTOCOL_VERSION) {
-    mismatch("protocol_version", NATIVE_CODEGEN_PROTOCOL_VERSION);
-  }
-  if (value["scriptc_package_version"] !== expectedPackageVersion) {
-    mismatch("scriptc_package_version", expectedPackageVersion);
-  }
-  if (value["llvm_version"] !== NATIVE_CODEGEN_LLVM_VERSION) {
-    mismatch("llvm_version", NATIVE_CODEGEN_LLVM_VERSION);
-  }
-  if (value["default_target"] !== helper.defaultTarget) {
-    mismatch("default_target", helper.defaultTarget);
-  }
-  if (value["data_layout"] !== helper.defaultDataLayout) {
-    mismatch("data_layout", helper.defaultDataLayout);
-  }
-  if (!Array.isArray(value["targets"]) || !value["targets"].includes(target.llvmBackend)) {
-    mismatch("targets", `an array containing ${target.llvmBackend}`);
-  }
-  if (!Array.isArray(value["supported_targets"]) || !value["supported_targets"].includes(target.llvmTriple)) {
-    mismatch("supported_targets", `an array containing ${target.llvmTriple}`);
-  }
-  if (typeof value["host_triple"] !== "string") mismatch("host_triple", "a string");
-  return value as unknown as NativeCodegenVersion;
+  return validateHelperVersion(value, target, helper, compilerReleaseVersion());
 }
 
 async function resolveHelper(
   target: NativeTargetSpec,
   resolver?: (specifier: string) => string,
-  host?: { platform: NodeJS.Platform; arch: string },
+  host?: { platform: NodeJS.Platform; arch: string; linuxLibc?: "gnu" | "musl" },
 ): Promise<ResolvedHelper> {
   const helper = nativeHelperForTarget(
     target,
     host?.platform,
     host?.arch,
+    host?.linuxLibc,
   );
   if (helper === null) {
     throw new NativeCodegenError(
@@ -242,7 +192,7 @@ async function resolveHelper(
   // host-native ISA plus WebAssembly). Cache only after the target backend
   // has also been checked; otherwise a prior X86 lookup could accidentally
   // bless a later WASI request against an older X86-only package.
-  const cacheKey = JSON.stringify({ dependencies, targetBackend: target.llvmBackend });
+  const cacheKey = JSON.stringify({ dependencies, targetTriple: target.llvmTriple });
   const load = async (): Promise<ResolvedHelper> => {
     let stdout: string;
     let binary: Buffer;

@@ -17,7 +17,7 @@ import { trackedReadFile } from "../input-tracker.js";
 import { requireResolvePathsRuntime, resolveImportMetaRuntime, resolveRequireRuntime, type RuntimeResolveError, type RuntimeResolveResult } from "../runtime-resolve.js";
 import { invalidJsonModuleDiag, nativeAddonDiag, requiresDynamicImportDiag } from "../../diagnostics/diagnostic.js";
 import {
-  BuiltinModuleFn,
+  type BuiltinModuleFn,
   builtinModuleFnOf,
   FS_READDIR_DOCUMENTED_OPTIONS,
   FS_WATCH_DOCUMENTED_OPTIONS,
@@ -41,10 +41,11 @@ import { registerHttpClientFnBinding, voidizedCallback } from "./lower-server.js
 import { pairsSnapshotHelper } from "./pairs-snapshot.js";
 import { isJsonStringifyDynamicType } from "../../ir/ir.js";
 import { bufEncoding } from "./containers/bytes.js";
-import { BOOL, BYTES_U8, CHILD_T, CHILDSTREAM_T, CHILDWRITER_T, CRYPTOHASH_T, CRYPTOHMAC_T, DYN, F64, FILEHANDLE_T, FSWATCHER_T, PROCSTREAM_T, IrExpr, IrFunction, IrLibFn, IrLocal, IrStmt, IrType, JSVAL, NULL_T, SEARCH_PARAMS_T, SPAWNRES_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, funcOf, isUnitType, typeEquals, typeKey } from "../../ir/ir.js";
+import { BOOL, BYTES_U8, CHILD_T, CHILDSTREAM_T, CHILDWRITER_T, CRYPTOHASH_T, CRYPTOHMAC_T, DYN, F64, FILEHANDLE_T, FSWATCHER_T, PROCSTREAM_T, type IrExpr, type IrFunction, type IrLibFn, type IrLocal, type IrStmt, type IrType, JSVAL, NULL_T, SEARCH_PARAMS_T, SPAWNRES_T, STRING, type SrcLoc, UNDEFINED_T, VOID, arrayOf, canBoxFuncIntoDyn, canConvertToDyn, funcOf, isUnitType, typeEquals, typeKey } from "../../ir/ir.js";
 import { boolLit, countedFor, numLit, strLit, varRef } from "../../ir/build.js";
 import { staticForkModulePath } from "../fork-target.js";
 import { tsgoPath } from "../dts-paths.js";
+import { lowerFfiMemoryModule } from "./native-ffi.js";
 import { lowerBuiltinLoaderValue } from "./lower-builtin-values.js";
 
 function optionalStringTags(lowerer: Lowerer, type: IrType): { stringTag: number; undefinedTag: number } | null {
@@ -476,6 +477,14 @@ function lowerBuiltinOptionalDefault(
     return { spec: ts.isStringLiteralLike(a) ? a.text : null, baseFile };
   }
 
+/** node:ffi is a checked native module value, so its require binding needs
+ * storage even when the createRequire loader is named `require`. */
+export function isNativeFfiRequire(lowerer: Lowerer, expr: ts.Expression | undefined): boolean {
+  if (expr === undefined) return false;
+  const call = stripTypeCasts(expr);
+  return ts.isCallExpression(call) && createRequireSpecOf(lowerer, call)?.spec === "node:ffi";
+}
+
 /** True for `const fs = require("node:fs")` through a createRequire
    * binding — a builtin namespace import in const clothing: alias
    * plumbing with no storage (uses resolve through
@@ -503,7 +512,7 @@ function lowerBuiltinOptionalDefault(
     const cr = createRequireSpecOf(lowerer, call);
     if (cr === null || cr.spec === null || canonicalBuiltinModule(cr.spec) !== null) return null;
     const dep = resolveImport(lowerer.program, cr.baseFile, cr.spec) ??
-      npmStaticDepSf7(lowerer.program, cr.baseFile, cr.spec);
+      npmStaticDepSf7(lowerer.program, cr.baseFile, cr.spec, "require");
     if (dep === null || dep.fileName.endsWith(".json")) return null;
     return { spec: cr.spec, baseFile: cr.baseFile, dep };
   }
@@ -645,6 +654,9 @@ function lowerBuiltinOptionalDefault(
       );
     }
     const spec = cr.spec;
+    if (spec === "node:ffi") {
+      return lowerFfiMemoryModule(lowerer, loc);
+    }
     if (canonicalBuiltinModule(spec) !== null) {
       lowerer.unsupported(
         "SC1090",
@@ -995,6 +1007,14 @@ function lowerBuiltinOptionalDefault(
     }
     return false;
   }
+
+/** Presence probes do not extract an unbound Performance method value. */
+export function lowerPerfHooksTypeof(lowerer: Lowerer, expression: ts.Expression): IrExpr | null {
+  const value = isPerfHooksPerformanceExpr(lowerer, expression) ? "object" :
+    ts.isPropertyAccessExpression(expression) && !expression.questionDotToken && expression.name.text === "now" &&
+    isPerfHooksPerformanceExpr(lowerer, expression.expression) ? "function" : null;
+  return value === null ? null : { kind: "strLit", value, type: STRING, loc: locOf(expression) };
+}
 
 /** The node:perf_hooks spoke: `performance.now()` reads the runtime's
    * monotonic clock anchored at process start — Node's timeOrigin for a
@@ -2283,6 +2303,12 @@ function lowerFsSyncBufferWindow(
     }
     if (bi.module === "fs" && (bi.member === "writeFileSync" || bi.member === "appendFileSync") && expr.arguments.length === 2) {
       const dataIr = lowerer.mapTypeOf(lowerer.typeOf(expr.arguments[1]!));
+      if (dataIr?.kind === "union") {
+        const arms = lowerer.unions.get(dataIr.unionId)?.arms;
+        if (arms && arms.every((arm) => arm.kind === "string" || (arm.kind === "bytes" && arm.elem === "u8"))) {
+          return lowerStringOrBytesWrite(lowerer, expr, dataIr, arms, bi.member === "appendFileSync");
+        }
+      }
       if (dataIr?.kind === "bytes") {
         if (dataIr.elem !== "u8") {
           lowerer.noLowering(
@@ -2510,6 +2536,7 @@ function lowerFsSyncBufferWindow(
       // undefined, ...) must narrow first, like everywhere else.
       const argNode = expr.arguments[0]!;
       const arg = lowerer.lowerExpr(argNode);
+      if (arg.type.kind === "dyn") return { kind: "libCall", fn: "url.fileURLToPathChecked", args: [arg], type: STRING, loc };
       if (arg.type.kind === "url") {
         return { kind: "libCall", fn: "url.fileURLToPathUrl", args: [arg], type: STRING, loc };
       }
@@ -4974,16 +5001,48 @@ export function lowerForkCall(lowerer: Lowerer, expr: ts.CallExpression, loc: Sr
         );
       }
       const node: IrExpr = { kind: "jsonStringify", value, type: STRING, loc };
-      if (indent !== "") {
-        // The compile-time-resolved indent rides as an extra property (the
-        // node shape in ir/ir.ts is unchanged); the backend re-indents
-        // the compact serializer output with Node's gap algorithm.
-        (node as { indent?: string }).indent = indent;
-      }
+      if (indent !== "") node.indent = indent;
       return node;
     }
     return null; // unknown members are tsc errors before lowering
   }
+
+/** A valid string/byte overload must select its runtime entry from the live
+ * union tag. Coercing the whole argument to the string overload loses bytes. */
+function lowerStringOrBytesWrite(lowerer: Lowerer, call: ts.CallExpression,
+  dataType: Extract<IrType, { kind: "union" }>, arms: readonly IrType[], append: boolean): IrExpr {
+  const loc = locOf(call);
+  const key = `fs.${append ? "append" : "write"}:${dataType.unionId}`;
+  let helper = lowerer.widthHelpers.get(key);
+  if (!helper) {
+    helper = `%fs.writeData.${lowerer.widthHelpers.size}`;
+    lowerer.widthHelpers.set(key, helper);
+    const body: IrStmt[] = [];
+    for (let tag = 0; tag < arms.length; tag++) {
+      const arm = arms[tag]!;
+      const fn: IrLibFn = arm.kind === "bytes"
+        ? append ? "fs.appendFileSyncBytes" : "fs.writeFileSyncBytes"
+        : append ? "fs.appendFileSync" : "fs.writeFileSync";
+      body.push({ kind: "if", loc,
+        cond: { kind: "unionIsTag", unionId: dataType.unionId, tag, negated: false,
+          value: varRef("data.0", dataType, loc), type: BOOL, loc },
+        then: [
+          { kind: "exprStmt", expr: { kind: "libCall", fn, args: [varRef("path.0", STRING, loc),
+            { kind: "unionNarrow", unionId: dataType.unionId, tag, value: varRef("data.0", dataType, loc), type: arm, loc }], type: VOID, loc }, loc },
+          { kind: "return", value: null, loc },
+        ], else_: null,
+      });
+    }
+    body.push({ kind: "return", value: null, loc });
+    lowerer.liftedFns.push({ name: helper, returnType: VOID, loc,
+      params: [{ localId: "path.0", name: "path", type: STRING }, { localId: "data.0", name: "data", type: dataType }],
+      locals: [{ id: "path.0", name: "path", type: STRING, mutable: false }, { id: "data.0", name: "data", type: dataType, mutable: false }],
+      body,
+    });
+  }
+  return { kind: "call", callee: helper, args: [lowerer.lowerExprExpecting(call.arguments[0]!, STRING),
+    lowerer.lowerExprExpecting(call.arguments[1]!, dataType)], type: VOID, loc };
+}
 
 function lowerOptionalStringifyRoot(lowerer: Lowerer, value: IrExpr, indent: string, loc: SrcLoc): IrExpr | null {
   const tags = optionalStringTags(lowerer, value.type);
@@ -5001,7 +5060,7 @@ function lowerOptionalStringifyRoot(lowerer: Lowerer, value: IrExpr, indent: str
       type: STRING,
       loc,
     };
-    if (indent !== "") (serialized as { indent?: string }).indent = indent;
+    if (indent !== "") serialized.indent = indent;
     const missing = lowerer.wrappedUndefined(resultT, loc);
     if (!missing) throw new InternalCompilerError("optional JSON.stringify result needs an undefined arm");
     lowerer.liftedFns.push({
@@ -5106,6 +5165,7 @@ function lowerJsonCallback(lowerer: Lowerer, node: ts.Expression, role: "replace
       if (ts.isVariableDeclaration(varDecl) && varDecl.initializer !== undefined) {
         const spec = requireSpecOf(varDecl.initializer);
         if (spec !== null) {
+          if (isNativeFfiRequire(lowerer, varDecl.initializer)) return null;
           const isBuiltin = spec.startsWith("node:") || builtinModules.includes(spec);
           return isBuiltin && canonicalBuiltinModule(spec) === null ? spec : null;
         }
@@ -6115,7 +6175,11 @@ function lowerOptionalStringSearchParams(lowerer: Lowerer, init: IrExpr, loc: Sr
         lowerer.noLowering(`${receiverType.kind === "cryptoHash" ? "Hash" : "Hmac"}.update with ${call.arguments.length} arguments`, call, "update(stringOrBuffer[, inputEncoding]) is supported");
       }
       const dataNode = call.arguments[0]!;
-      const data = lowerer.lowerExpr(dataNode);
+      const dataType = lowerer.mapTypeOf(lowerer.typeOf(dataNode));
+      // Indexed reads can retain optional storage after a nullish fallback
+      // or narrowing. Use the proven argument type through a checked coercion.
+      const data = dataType?.kind === "string" || dataType?.kind === "bytes"
+        ? lowerer.lowerExprExpecting(dataNode, dataType) : lowerer.lowerExpr(dataNode);
       const prefix = receiverType.kind === "cryptoHash" ? "crypto.hashUpdate" : "crypto.hmacUpdate";
       if (data.type.kind === "bytes" && data.type.elem === "u8") {
         if (call.arguments.length !== 1) {
@@ -6999,7 +7063,7 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
         return { kind: "libCall", fn: "error.domCause", args: [receiver], type: DYN, loc: locOf(expr) };
       }
     }
-    if (expr.name.text !== "code" && expr.name.text !== "cause") return null;
+    if (expr.name.text !== "code" && expr.name.text !== "cause" && expr.name.text !== "stack") return null;
     // Error-rooted classes only — builtin or user subclass (both embed the
     // code and cause slots in their layout prefix).
     let info = lowerer.classes.get(recvT.className) ?? null;
@@ -7009,19 +7073,31 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
     const receiver = lowerer.lowerExpr(expr.expression);
     return {
       kind: "libCall",
-      fn: expr.name.text === "cause" ? "error.cause" : "error.code",
+      fn: expr.name.text === "stack" ? "error.stack" : expr.name.text === "cause" ? "error.cause" : "error.code",
       args: [receiver],
-      type: expr.name.text === "cause" ? DYN : lowerer.envValueType(),
+      type: expr.name.text === "stack" ? STRING : expr.name.text === "cause" ? DYN : lowerer.envValueType(),
       loc: locOf(expr),
     };
   }
 
-/** `JSON.parse` / `JSON.stringify` referenced without a call: rejected
-   * specifically, like process methods as values. Null for non-JSON
-   * receivers (the property chain keeps trying other lowerings). */
+/** Stored stringify uses the same native serializer and keeps omitted roots
+   * as undefined. Other JSON method values retain a named refusal. */
   export function lowerJsonProperty(lowerer: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
     const member = lowerer.stdlibGlobalMember(expr, "JSON");
     if (member === null) return null;
+    if (member === "stringify") {
+      const loc = locOf(expr);
+      const name = "%builtin.JSON.stringify";
+      if (!lowerer.builtinCallableValueFns.has(name)) {
+        lowerer.builtinCallableValueFns.set(name, name);
+        const params = ["value", "replacer", "space"].map((name) => ({ localId: name, name, type: DYN }));
+        lowerer.liftedFns.push({ name, params, returnType: DYN,
+          locals: params.map((p) => ({ id: p.localId, name: p.name, type: DYN, mutable: false })), loc,
+          body: [{ kind: "return", value: { kind: "libCall", fn: "json.stringifyValue", args: params.map((p) => varRef(p.localId, DYN, loc)), type: DYN, loc }, loc }],
+        });
+      }
+      return { kind: "dynFrom", value: { kind: "closure", fnName: name, captures: [], type: { kind: "func", params: [DYN, DYN, DYN], ret: DYN }, loc }, fnName: "stringify", type: DYN, loc };
+    }
     lowerer.unsupported("SC1090", expr, `JSON methods as values (call '${member}' directly)`);
   }
 
@@ -7131,6 +7207,12 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
    * rejected specifically. Null for non-process receivers (the chain keeps
    * trying other property lowerings). */
   export function lowerProcessProperty(lowerer: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
+    if (!expr.questionDotToken && expr.name.text === "bigint" && ts.isPropertyAccessExpression(expr.expression) &&
+        lowerer.stdlibGlobalMember(expr.expression, "process") === "hrtime") {
+      const loc = locOf(expr);
+      return { kind: "dynKeyGet", value: { kind: "libCall", fn: "process.hrtimeValue", args: [], type: DYN, loc },
+        key: { kind: "strLit", value: "bigint", type: STRING, loc }, type: DYN, loc };
+    }
     // node and openssl name the compatibility target, not linked engines.
     // Read the stable object so descriptor edits through aliases stay visible.
     if (
@@ -7195,6 +7277,9 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
     const loc = locOf(expr);
     if (member === "versions") {
       return { kind: "libCall", fn: "process.versions", args: [], type: DYN, loc };
+    }
+    if (member === "hrtime") {
+      return { kind: "libCall", fn: "process.hrtimeValue", args: [], type: DYN, loc };
     }
     if (member === "getBuiltinModule") {
       // Keep the native loader's argument validation when the function is
@@ -7780,6 +7865,12 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
       }
     }
     const directProcessMember = lowerer.stdlibGlobalMember(access, "process");
+    if (directProcessMember === "hrtime") {
+      if (call.arguments.some(ts.isSpreadElement)) lowerer.noLowering("process.hrtime with spread arguments", call);
+      const loc = locOf(call);
+      return { kind: "dynCall", callee: { kind: "libCall", fn: "process.hrtimeValue", args: [], type: DYN, loc },
+        args: call.arguments.map((arg) => lowerer.lowerExprExpecting(arg, DYN)), calleeName: "process.hrtime", type: DYN, loc };
+    }
     if (directProcessMember === "getBuiltinModule") {
       if (call.arguments.some(ts.isSpreadElement)) lowerer.noLowering("process.getBuiltinModule with spread arguments", call);
       const loc = locOf(call);
@@ -8103,7 +8194,7 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
     const member = lowerer.stdlibGlobalMember(access, "process");
     if (member === null) return null;
     const loc = locOf(call);
-    // process.on/once/off: the CLI event slice — the SIGINT/SIGTERM
+    // process.on/once/off: the CLI event slice — named OS
     // signal handlers and the 'exit' hook. Signal listeners run as
     // macrotasks at loop turns, replace the default disposition while
     // registered (removing the last restores Ctrl-C death), and never
@@ -8138,12 +8229,17 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
           loc,
         };
       }
-      // own(), not a bare index: the key is a USER-written event name,
-      // and `{ SIGINT: 2 }["__proto__"]` answers Object.prototype — an
-      // object flowed into a numLit and emitted itself into the C
-      // (test-event-emitter-special-event-names.js's process.on).
-      const SIGNALS: Record<string, number | undefined> = { SIGINT: 2, SIGTERM: 15 };
-      const signo = event !== null ? own(SIGNALS, event) : undefined;
+      if (event === "uncaughtException" || event === "uncaughtExceptionMonitor") {
+        if (!ts.isExpressionStatement(call.parent)) {
+          lowerer.unsupported("SC1090", call, "chaining process exception listener registration");
+        }
+        const cb = dcSubscriberArg(lowerer, call.arguments[1]!);
+        const monitor = boolLit(event === "uncaughtExceptionMonitor", loc);
+        return {
+          kind: "libCall", fn: isOff ? "process.offUncaughtException" : "process.onUncaughtException",
+          args: isOff ? [cb, monitor] : [cb, boolLit(member === "once", loc), monitor], type: VOID, loc,
+        };
+      }
       // 'unhandledRejection': the listener crosses as a dyn function and
       // the completed-checkpoint report dispatches it (reason, promise) per
       // never-observed rejection instead of printing and exiting 1
@@ -8187,12 +8283,23 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
           loc,
         };
       }
-      if (signo === undefined && event !== "exit") {
-        lowerer.noLowering(
-          `process.${member}(${event === null ? "non-literal event" : `"${event}"`}, ...)`,
-          call.arguments[0]!,
-          '"message", "disconnect", "SIGINT", "SIGTERM", "exit", "warning", "unhandledRejection", and "rejectionHandled" are the supported process events (as literals)',
-        );
+      if (event === null || event.startsWith("SIG")) {
+        if (!ts.isExpressionStatement(call.parent)) {
+          lowerer.unsupported("SC1090", call, "chaining process signal listener registration");
+        }
+        const name = lowerer.coerceToExpected(lowerer.lowerExpr(call.arguments[0]!), STRING);
+        if (name.type.kind !== "string" && name.type.kind !== "dyn") {
+          lowerer.noLowering("process signal event name that is not a string", call.arguments[0]!);
+        }
+        const signal = name.type.kind === "string" ? name : { kind: "dynCheck" as const, value: name, type: STRING, loc };
+        const cb = dcSubscriberArg(lowerer, call.arguments[1]!);
+        return {
+          kind: "libCall", fn: isOff ? "process.offSignal" : "process.onSignal",
+          args: isOff ? [signal, cb] : [signal, cb, boolLit(member === "once", loc)], type: VOID, loc,
+        };
+      }
+      if (event !== "exit") {
+        lowerer.noLowering(`process.${member}("${event}", ...)`, call.arguments[0]!);
       }
       if (!ts.isExpressionStatement(call.parent)) {
         lowerer.unsupported(
@@ -8211,7 +8318,7 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
       // result; a non-function dyn value throws the catchable TypeError
       // at REGISTRATION (Node's ERR_INVALID_ARG_TYPE moment).
       {
-        const target = funcOf(signo !== undefined || event !== "exit" ? [] : [F64], VOID);
+        const target = funcOf([F64], VOID);
         const exact =
           cb.type.kind === "func" &&
           cb.type.ret.kind === "void" &&
@@ -8242,20 +8349,6 @@ function lowerProcessIpcSend(lowerer: Lowerer, call: ts.CallExpression): IrExpr 
       }
       const param = cb.type.params[0];
       const onceArg: IrExpr = { kind: "boolLit", value: member === "once", type: BOOL, loc };
-      if (signo !== undefined) {
-        if (param !== undefined) {
-          lowerer.unsupported(
-            "SC1090",
-            call.arguments[1]!,
-            "signal listeners with parameters (the signal name argument has no lowering — use ())",
-          );
-        }
-        const sig: IrExpr = { kind: "numLit", value: signo, type: F64, loc };
-        if (isOff) {
-          return { kind: "libCall", fn: "process.offSignal", args: [sig, cb], type: VOID, loc };
-        }
-        return { kind: "libCall", fn: "process.onSignal", args: [sig, cb, onceArg], type: VOID, loc };
-      }
       if (param !== undefined && param.kind !== "f64") {
         lowerer.unsupported(
           "SC1090",
@@ -8551,7 +8644,7 @@ const NUMBER_STATIC_PREDICATES: Record<string, IrLibFn | undefined> = {
 };
 
 /** The Number constants, baked as literals — non-finite ones included
- * (numLits carry NaN and the infinities; both backends spell them). */
+ * (numLits carry NaN and the infinities; the backend preserves them). */
 const NUMBER_CONSTANTS: Record<string, number | undefined> = {
   MAX_SAFE_INTEGER: 9007199254740991,
   MIN_SAFE_INTEGER: -9007199254740991,
@@ -8694,7 +8787,9 @@ const DATE_METHOD_HINT =
     if (call.arguments.length !== 0) {
       lowerer.noLowering(`Date.prototype.${name} with arguments`, call, DATE_METHOD_HINT);
     }
-    const receiver = lowerer.lowerExpr(access.expression);
+    const raw = lowerer.lowerExpr(access.expression);
+    const receiver: IrExpr = raw.type.kind === "dyn"
+      ? { kind: "libCall", fn: "date.checkedValue", args: [raw], type: { kind: "date" }, loc } : raw;
     if (receiver.type.kind !== "date") lowerer.badType(access.expression, lowerer.typeOf(access.expression));
     if (name === "getTime" || name === "valueOf") {
       return {

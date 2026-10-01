@@ -143,7 +143,11 @@ function nodeOracleArgs(file: string): string[] {
     ? ["--experimental-transform-types", "--disable-warning=ExperimentalWarning"]
     : [];
   const nodep = wantsNoDeprecation(file) ? ["--no-deprecation"] : [];
-  return [...transform, ...nodep, "--import", comptimeShim, "--import", islandShim, nodeOracleFile(file)];
+  // --import makes Node load even a CJS entry through its ESM loader,
+  // changing an entry throw's uncaughtException origin to unhandledRejection.
+  const shims = directiveHead(file).includes("// @no-node-shims")
+    ? [] : ["--import", comptimeShim, "--import", islandShim];
+  return [...transform, ...nodep, ...shims, nodeOracleFile(file)];
 }
 
 /** Runs a binary, tolerating an expected nonzero exit (execFile rejects on
@@ -352,10 +356,7 @@ async function compileAndRun(file: string): Promise<RunResult> {
     outDir,
     sanitize,
     dynamic,
-    // Pinned: this suite IS the C-reference lane — its meaning is "the C
-    // backend matches Node", regardless of what the product default does.
-    // llvm-differential.test.ts owns the LLVM lane over the same corpus.
-    backend: "c",
+    backend: "llvm",
   });
   if (!result.ok) {
     throw new Error(

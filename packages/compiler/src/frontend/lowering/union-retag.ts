@@ -1,5 +1,5 @@
 import { InternalCompilerError } from "../../errors.js";
-import { BOOL, F64, STRING, isUnitType, typeEquals } from "../../ir/ir.js";
+import { BOOL, F64, STRING, isUnitType, shapeHasAccessorSlots, typeEquals, typeKey } from "../../ir/ir.js";
 import type { IrExpr, IrFunction, IrRecordShape, IrStmt, IrType, IrUnionDef, SrcLoc } from "../../ir/ir.js";
 import type { WidthLift } from "./width-lift.js";
 import { discriminantField, discriminantOwners } from "../union-discriminants.js";
@@ -16,6 +16,44 @@ export type UnionRetagArm =
   | { kind: "trap" }
   | { kind: "direct"; route: UnionRetagRoute }
   | { kind: "discriminant"; field: string; fieldType: IrType; routes: UnionRetagRoute[] };
+
+export interface RecordUnionWrapPlan {
+  field: string;
+  fieldType: IrType;
+  routes: UnionRetagRoute[];
+}
+
+/** Recursive variants can retain distinct ids for the same field layout.
+ * An independently inferred record may intern to either id, so that id
+ * alone cannot select its semantic destination when wrapping into a union. */
+export function planRecordUnionWrap(
+  source: IrRecordShape,
+  to: IrUnionDef,
+  shapeOf: (id: string) => IrRecordShape | undefined,
+): RecordUnionWrapPlan | null {
+  const discriminant = to.discriminant;
+  if (!discriminant || source.tuple || source.indexValue || shapeHasAccessorSlots(source)) return null;
+  const fieldType = discriminantField(source, discriminant.field);
+  if (!fieldType) return null;
+  const routes: UnionRetagRoute[] = [];
+  for (let tag = 0; tag < to.arms.length; tag++) {
+    const arm = to.arms[tag]!;
+    if (arm.kind !== "record") continue;
+    const target = shapeOf(arm.shapeId);
+    if (!target || target.tuple || target.indexValue || target.fields.length !== source.fields.length) continue;
+    let same = true;
+    for (let i = 0; i < source.fields.length; i++) {
+      const a = source.fields[i]!, b = target.fields[i]!;
+      if (a.name !== b.name || !typeEquals(a.type, b.type)) { same = false; break; }
+    }
+    if (!same) continue;
+    const entry = discriminant.cases.find((candidate) => candidate.tag === tag);
+    if (!entry) return null;
+    routes.push({ tag, lift: { how: arm.shapeId === source.id ? "copy" : "width" }, values: entry.values });
+  }
+  if (routes.length < 2 || discriminantOwners(to, shapeOf) === null) return null;
+  return { field: discriminant.field, fieldType, routes };
+}
 
 /** Pure conversion planning. A source storage tag need not denote just
  * one semantic variant: refinements can coalesce recursive record layouts.
@@ -35,9 +73,22 @@ export function planUnionRetag(
   const useDiscriminant = discriminant !== undefined && discriminant.field === to.discriminant?.field;
   const owners = useDiscriminant ? discriminantOwners(to, shapeOf) : null;
   if (useDiscriminant && (owners === null || discriminantOwners(from, shapeOf) === null)) return null;
+  // Large unions otherwise compare every source arm with every destination.
+  // Keys narrow the search; exact ABI equality still resolves collisions.
+  // Keep small conversions allocation-light and rebuild for each registry view.
+  const indexed = from.arms.length >= 4 && to.arms.length >= 8;
+  const identities = new Map<string, number[]>();
+  if (indexed) to.arms.forEach((arm, tag) => {
+    const key = typeKey(arm);
+    const tags = identities.get(key);
+    if (tags) tags.push(tag);
+    else identities.set(key, [tag]);
+  });
   for (let tag = 0; tag < from.arms.length; tag++) {
     const source = from.arms[tag]!;
-    const identity = to.arms.findIndex((arm) => typeEquals(arm, source));
+    const identity = indexed
+      ? identities.get(typeKey(source))?.find((candidate) => typeEquals(to.arms[candidate]!, source)) ?? -1
+      : to.arms.findIndex((arm) => typeEquals(arm, source));
     if (isUnitType(source)) {
       result.push(identity < 0 ? { kind: "trap" } : {
         kind: "direct", route: { tag: identity, lift: { how: "copy" }, values: [] },
@@ -112,6 +163,42 @@ function literalTest(field: IrExpr, literal: Literal, loc: SrcLoc): IrExpr {
     ? { kind: "numLit", value: literal, type: F64, loc }
     : { kind: "boolLit", value: literal, type: BOOL, loc };
   return { kind: "bin", op: "===", left: field, right, type: BOOL, loc };
+}
+
+export function buildRecordUnionWrap(
+  name: string,
+  source: IrType & { kind: "record" },
+  to: IrUnionDef,
+  plan: RecordUnionWrapPlan,
+  loc: SrcLoc,
+  applyLift: (lift: WidthLift, value: IrExpr, dst: IrType) => IrExpr,
+): IrFunction {
+  const input: IrExpr = { kind: "varRef", localId: "v.0", type: source, loc };
+  const field: IrExpr = { kind: "varRef", localId: "kind.0", type: plan.fieldType, loc };
+  const result: IrType = { kind: "union", unionId: to.id };
+  const body: IrStmt[] = [{ kind: "varDecl", localId: "kind.0", init: {
+    kind: "recordGet", obj: input, shapeId: source.shapeId, field: plan.field, type: plan.fieldType, loc,
+  }, loc }];
+  for (const route of plan.routes) {
+    let cond: IrExpr | null = null;
+    for (const literal of route.values) {
+      const test = literalTest(field, literal, loc);
+      cond = cond === null ? test : { kind: "logical", op: "||", left: cond, right: test, type: BOOL, loc };
+    }
+    if (cond === null) throw new InternalCompilerError("lowerer bug: empty record discriminator route");
+    body.push({ kind: "if", cond, then: [{ kind: "return", value: {
+      kind: "unionWrap", unionId: to.id, tag: route.tag,
+      value: applyLift(route.lift, input, to.arms[route.tag]!), type: result, loc,
+    }, loc }], else_: null, loc });
+  }
+  body.push(typeError(`invalid '${plan.field}' discriminant in record conversion`, loc));
+  return {
+    name, params: [{ localId: "v.0", name: "value", type: source }], returnType: result,
+    locals: [
+      { id: "v.0", name: "value", type: source, mutable: false },
+      { id: "kind.0", name: "kind", type: plan.fieldType, mutable: false },
+    ], body, loc,
+  };
 }
 
 /** Emit the already validated routes using ordinary typed IR. Each field

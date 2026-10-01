@@ -35,7 +35,6 @@ test.runIf(supported)("WASI helper object plus runtime pack builds and runs with
       ...process.env,
       SCRIPTC_TARGET: "wasm32-wasi",
       SCRIPTC_NO_CACHE: "1",
-      SCRIPTC_LEGACY_C_PIPELINE: "0",
       ZIG_GLOBAL_CACHE_DIR: join(zigCache, "global"),
       ZIG_LOCAL_CACHE_DIR: join(zigCache, "local"),
     },
@@ -43,7 +42,7 @@ test.runIf(supported)("WASI helper object plus runtime pack builds and runs with
   })).resolves.toMatchObject({ stdout: "hello world\n" });
 });
 
-test.runIf(supported)("switching WASI LLVM and native C builds preserves both translation units", async () => {
+test.runIf(supported)("switching WASI and native builds retains both executables", async () => {
   const dir = await mkdtemp(join(tmpdir(), "scriptc-wasi-native-output-"));
   dirs.push(dir);
   const entry = join(dir, "hello.ts");
@@ -59,11 +58,13 @@ test.runIf(supported)("switching WASI LLVM and native C builds preserves both tr
   await build([], wasiEnv);
   const llvm = await readFile(join(outDir, "hello.ll"));
   const wasm = await readFile(join(outDir, "hello.wasm"));
-  await build(["--backend=c", "--keep-c"], nativeEnv);
-  const c = await readFile(join(outDir, "hello.c"));
-  expect(await readFile(join(outDir, "hello.ll"))).toEqual(llvm);
+  await build(["--backend=llvm", "--keep-llvm"], nativeEnv);
+  const native = await readFile(join(outDir, process.platform === "win32" ? "hello.exe" : "hello"));
+  const nativeLlvm = await readFile(join(outDir, "hello.ll"));
+  expect(nativeLlvm.equals(llvm)).toBe(false);
   expect(await readFile(join(outDir, "hello.wasm"))).toEqual(wasm);
 
   await build([], wasiEnv);
-  expect(await readFile(join(outDir, "hello.c"))).toEqual(c);
+  expect(await readFile(join(outDir, "hello.ll"))).toEqual(llvm);
+  expect(await readFile(join(outDir, process.platform === "win32" ? "hello.exe" : "hello"))).toEqual(native);
 });

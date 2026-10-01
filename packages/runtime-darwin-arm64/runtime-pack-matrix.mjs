@@ -1,3 +1,5 @@
+import { withLibraryRuntimeFlavors } from "../runtime-pack-common/library-matrix.mjs";
+
 /**
  * The executable runtime-pack matrix. This is the single source of truth for
  * both release compilation and the generated feature predicates consumed by
@@ -29,7 +31,7 @@ const optional = [
   ["scr_file_handle.c", "fileHandle"],
   ["scr_regex.c", "regex"],
   ["scr_assert.c", any("assert", "regex", "symbol")],
-  ["scr_inspect.c", "inspect"],
+  ["scr_inspect.c", "inspect"], ["scr_console_native.c", "inspect"],
   ["scr_dyn_invoke.c", any("dynInvoke", "nativeFetch")],
   ["scr_dc.c", "dc"],
   ["scr_async_dyn.c", any("dynAsync", "dynInvoke", "dc", "fileHandle", "nativeFetch")],
@@ -91,7 +93,7 @@ function variantsFor(source) {
   return variants;
 }
 
-export const RUNTIME_PACK_MATRIX = {
+export const RUNTIME_PACK_MATRIX = withLibraryRuntimeFlavors({
   schema: "scriptc.runtime-pack-matrix.v1",
   target: {
     name: "macos-arm64",
@@ -113,4 +115,4 @@ export const RUNTIME_PACK_MATRIX = {
     { id: "mbedtls", predicate: "tlsEffective" },
   ],
   system_libraries: [{ name: "System", predicate: true }, { name: "m", predicate: "dynamic" }],
-};
+});

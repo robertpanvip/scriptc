@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "compilerVersion": "0.1.7",
+  "compilerVersion": "0.2.0",
   "coverage": [
     "Entries are projected mechanically from the compiler's own decision tables: the diagnostics registry, the unsupported-syntax dispatch tables, the stdlib and node-builtin lowering tables, and the supported-builtin-module list. Nothing is hand-maintained; the manifest regenerates byte-identically from the source tree at this version.",
     "Absence from this manifest means 'not projected', never 'unsupported'. Surfaces lowered through dedicated code paths rather than tables are not yet projected: console, JSON, Promise/async and the timer surface, the net/http/tls/https/dgram/dns/assert/test/stream/readline module member surfaces, template literals, the regex slice, global functions (parseInt, parseFloat, isNaN, isFinite), and the process surface outside its ambient slice.",
@@ -1621,6 +1621,13 @@
       "kind": "node-builtin",
       "name": "process.getuid",
       "status": "static"
+    },
+    {
+      "id": "node-builtin.process.hrtime",
+      "kind": "node-builtin",
+      "name": "process.hrtime",
+      "status": "static",
+      "note": "native monotonic tuple clock and bigint member; direct calls and stored JavaScript callable values"
     },
     {
       "id": "node-builtin.process.isTTY",
@@ -3858,13 +3865,6 @@
       "name": "bigint literals",
       "status": "static",
       "note": "arbitrary-precision values in decimal, binary, octal, and hexadecimal spelling"
-    },
-    {
-      "id": "syntax.class-declarations-inside-functions",
-      "kind": "syntax",
-      "name": "class declarations inside functions",
-      "status": "unsupported",
-      "code": "SC1090"
     },
     {
       "id": "syntax.class-expressions",

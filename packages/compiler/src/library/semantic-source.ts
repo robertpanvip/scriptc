@@ -1,7 +1,10 @@
 import { InternalCompilerError } from "../errors.js";
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 import { extname } from "node:path";
-import ts from "typescript5";
+import type ts from "typescript5";
+
+const require = createRequire(import.meta.url);
 
 interface SemanticToken {
   kind: "token" | "comment";
@@ -32,15 +35,16 @@ function semanticTokens(path: string, source: string): SemanticToken[] | null {
   // both syntax validity (including a shebang's byte-zero requirement) and
   // exact regular-expression spans, then keep the cheap scanner for trivia
   // equivalence and location mapping.
-  const sourceFile = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true);
+  const parser = require("typescript5") as typeof ts;
+  const sourceFile = parser.createSourceFile(path, source, parser.ScriptTarget.Latest, true);
   const parseDiagnostics = (sourceFile as ts.SourceFile & {
     parseDiagnostics: readonly ts.Diagnostic[];
   }).parseDiagnostics;
   if (parseDiagnostics.length > 0) return null;
   const regexEnds = new Map<number, number>();
   const collectRegex = (node: ts.Node): void => {
-    if (ts.isRegularExpressionLiteral(node)) regexEnds.set(node.getStart(sourceFile), node.end);
-    ts.forEachChild(node, collectRegex);
+    if (parser.isRegularExpressionLiteral(node)) regexEnds.set(node.getStart(sourceFile), node.end);
+    parser.forEachChild(node, collectRegex);
   };
   collectRegex(sourceFile);
 
@@ -175,7 +179,7 @@ function lineAt(starts: readonly number[], offset: number): number {
 }
 
 /** Build a cheap old-line to current-line mapper for semantically identical
- * sources. C emission records only a location's line, not its byte offset, so
+ * sources. The emitted location metadata uses line numbers, so
  * representative semantic tokens anchor each old line across trivia edits. */
 export function createSourceLineRebaser(
   path: string,
@@ -220,7 +224,7 @@ export function sourceLineRebaseIsIdentity(
   }
   const oldStarts = lineStarts(previous);
   const newStarts = lineStarts(current);
-  // The C emitter counts only LF bytes. TypeScript also treats bare CR and
+  // The emitted location metadata counts LF bytes. TypeScript also treats bare CR and
   // the Unicode separators as line breaks, so normalizing one of those to LF
   // preserves semantic tokens while moving later annotations to a different
   // emitter line. Check every corresponding token, including multiple

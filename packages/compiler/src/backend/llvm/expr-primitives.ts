@@ -69,6 +69,12 @@ export function emitOperatorExpr(host: LlvmEmitterContext, e: ExprOf<"bin" | "un
     const B = host.B;
     switch (e.kind) {
       case "bin": {
+        // JavaScript folds literal 0 / 0 to its positive NaN constant.
+        // An unoptimized x86 division produces a negative NaN instead,
+        // whose sign is observable through Buffer and typed-array writes.
+        if (e.op === "/" && e.left.kind === "numLit" && e.right.kind === "numLit" && e.left.value === 0 && e.right.value === 0) {
+          return { name: f64Lit(NaN), type: e.type };
+        }
         const l = host.emitExpr(e.left);
         const r = host.emitExpr(e.right);
         const t = B.tmp();
@@ -197,7 +203,7 @@ export function emitOperatorExpr(host: LlvmEmitterContext, e: ExprOf<"bin" | "un
       case "assignExpr": {
         // `x = e` in expression position: the binding takes its OWN
         // reference (retain for ref kinds), the temp stays the yielded
-        // value — CEmitter's order exactly (release old, store retained).
+        // value — release the old value before storing the retained value.
         const concat = e.value;
         const suffix = matchStringSelfConcat(e.localId, concat);
         if (suffix && concat.kind === "strConcat") {
@@ -225,8 +231,7 @@ export function emitOperatorExpr(host: LlvmEmitterContext, e: ExprOf<"bin" | "un
       case "seqExpr": {
         // Statements mid-expression: each emits in place (its own frame,
         // exactly statement position); the result is an ordinary temp of
-        // the current frame. The validator restricted stmts to straight-
-        // line writes — no jump can leave the region.
+        // the current frame. No jump can leave the expression's region.
         for (const s of e.stmts) host.emitStmt(s);
         return host.emitExpr(e.result);
       }
@@ -390,7 +395,7 @@ export function emitStringExpr(host: LlvmEmitterContext, e: ExprOf<"strConcat" |
         // One immortal static per (pattern, flags) pair; the +1 retain is
         // a no-op on immortals but keeps the owned-temps discipline
         // uniform. Pattern/flags strings intern NOW (the literal table is
-        // still open — the C emitter's regex-literal discipline).
+        // still open — the runtime ABI’s regex-literal discipline).
         const key = `${e.flags}/${e.pattern}`;
         let re = host.regexInstances.get(key);
         if (!re) {
@@ -572,14 +577,14 @@ export function emitRecordExpr(host: LlvmEmitterContext, e: ExprOf<"fieldGet" | 
     const B = host.B;
     switch (e.kind) {
       case "fieldGet": {
-        const obj = host.emitExpr(e.obj);
+        const obj = host.emitReadReceiver(e.obj);
         const { ptr, type } = host.classFieldPtr(obj.name, e.className, e.field);
         const v = host.loadField(ptr, type);
         if (isRefCounted(e.type)) return host.own({ name: host.retainValue(v, e.type), type: e.type });
         return { name: v, type: e.type };
       }
       case "recordGet": {
-        const obj = host.emitExpr(e.obj);
+        const obj = host.emitReadReceiver(e.obj);
         const { ptr, type } = host.recordFieldPtr(obj.name, e.shapeId, e.field);
         const v = host.loadField(ptr, type);
         if (isRefCounted(e.type)) return host.own({ name: host.retainValue(v, e.type), type: e.type });

@@ -1,7 +1,6 @@
 import { release } from "node:os";
 
-/** A helper package is host-specific, even when it emits a portable target
- * (the WASI helpers are the first intentionally cross-host case). */
+/** Helpers run on the build host and emit every supported target ABI. */
 export interface NativeHelperSpec {
   packageName: string;
   /** The helper protocol reports this primary target and its layout. */
@@ -18,7 +17,10 @@ export type NativeTargetName =
   | "windows-x64-msvc"
   | "linux-x64-musl"
   | "linux-arm64-musl"
-  | "wasm32-wasi";
+  | "wasm32-wasi"
+  | "ios-arm64"
+  | "ios-simulator-arm64"
+  | "android-arm64";
 
 export type NativeObjectFormat = "macho" | "elf" | "coff" | "wasm";
 export type NativeTargetPlatform = "darwin" | "linux" | "win32" | "wasi";
@@ -191,7 +193,7 @@ export const MACOS_ARM64_TARGET: NativeTargetSpec = {
   defaultLinker: "clang", defaultLinkerArgs: [], runtimeSystemLibraries: ["System"],
   linkerTargetTriple: "arm64-apple-macosx14.0.0",
   runtimeCompileDefines: [],
-  supports: { asm: true, obj: true, exe: true, library: false },
+  supports: { asm: true, obj: true, exe: true, library: true },
   helperPackage: DARWIN_ARM64_HELPER.packageName, helper: DARWIN_ARM64_HELPER,
   llvmBackend: "AArch64",
   runtimePackPackage: "@scriptc/runtime-darwin-arm64",
@@ -206,7 +208,7 @@ export const MACOS_X64_TARGET: NativeTargetSpec = {
   defaultLinker: "clang", defaultLinkerArgs: [], runtimeSystemLibraries: ["System"],
   linkerTargetTriple: "x86_64-apple-macosx14.0.0",
   runtimeCompileDefines: [],
-  supports: { asm: true, obj: true, exe: true, library: false },
+  supports: { asm: true, obj: true, exe: true, library: true },
   helperPackage: DARWIN_X64_HELPER.packageName, helper: DARWIN_X64_HELPER,
   llvmBackend: "X86",
   runtimePackPackage: "@scriptc/runtime-darwin-x64",
@@ -292,7 +294,7 @@ export const WASM32_WASI_TARGET: NativeTargetSpec = {
   linkerTargetTriple: "wasm32-wasi",
   runtimeSystemLibraries: ["wasi-emulated-signal", "wasi-emulated-process-clocks"],
   runtimeCompileDefines: ["_GNU_SOURCE", "_WASI_EMULATED_SIGNAL", "_WASI_EMULATED_PROCESS_CLOCKS"],
-  supports: { asm: true, obj: true, exe: true, library: false },
+  supports: { asm: true, obj: true, exe: true, library: true },
   helperPackage: DARWIN_ARM64_HELPER.packageName, helper: DARWIN_ARM64_HELPER,
   llvmBackend: "WebAssembly",
   hostHelpers: {
@@ -307,30 +309,60 @@ export const WASM32_WASI_TARGET: NativeTargetSpec = {
   runtimePackPackage: "@scriptc/runtime-wasm32-wasi",
 };
 
+export const IOS_ARM64_TARGET: NativeTargetSpec = {
+  ...MACOS_ARM64_TARGET,
+  name: "ios-arm64", llvmTriple: "arm64-apple-ios15.0.0",
+  minimumOs: "15.0", linkerTargetTriple: "aarch64-ios.15.0",
+  supports: { asm: true, obj: true, exe: false, library: true },
+  runtimePackPackage: "@scriptc/runtime-ios-arm64",
+};
+
+export const IOS_SIMULATOR_ARM64_TARGET: NativeTargetSpec = {
+  ...IOS_ARM64_TARGET,
+  name: "ios-simulator-arm64", llvmTriple: "arm64-apple-ios15.0.0-simulator",
+  linkerTargetTriple: "aarch64-ios.15.0-simulator",
+  runtimePackPackage: "@scriptc/runtime-ios-simulator-arm64",
+};
+
+export const ANDROID_ARM64_TARGET: NativeTargetSpec = {
+  ...LINUX_ARM64_GNU_TARGET,
+  name: "android-arm64", llvmTriple: "aarch64-unknown-linux-android26",
+  minimumOs: "Android 26", defaultLinker: "zig", defaultLinkerArgs: ["cc"],
+  linkerTargetTriple: "aarch64-linux-android.26",
+  supports: { asm: true, obj: true, exe: false, library: true },
+  runtimePackPackage: "@scriptc/runtime-android-arm64",
+};
+
 export const NATIVE_TARGETS = [
   MACOS_ARM64_TARGET, MACOS_X64_TARGET, LINUX_X64_GNU_TARGET,
   LINUX_ARM64_GNU_TARGET, WINDOWS_X64_MSVC_TARGET, LINUX_X64_MUSL_TARGET,
   LINUX_ARM64_MUSL_TARGET, WASM32_WASI_TARGET,
+  IOS_ARM64_TARGET, IOS_SIMULATOR_ARM64_TARGET, ANDROID_ARM64_TARGET,
 ] as const;
 
+let linuxLibcMemo: LinuxLibc | undefined;
+
 function detectedLinuxLibc(): LinuxLibc {
+  if (linuxLibcMemo !== undefined) return linuxLibcMemo;
   // Node exposes glibc's runtime version without any external command or
   // filesystem probe. Its absence on Linux is the portable musl signal used
-  // by npm's own optional-dependency selection conventions.
+  // by npm's own optional-dependency selection conventions. The host libc
+  // cannot change within this process, and generating a full report is costly.
   const report = process.report?.getReport() as { header?: { glibcVersionRuntime?: unknown } } | undefined;
   const header = report?.header;
-  return typeof header?.glibcVersionRuntime === "string" ? "gnu" : "musl";
+  linuxLibcMemo = typeof header?.glibcVersionRuntime === "string" ? "gnu" : "musl";
+  return linuxLibcMemo;
 }
 
 function helperHost(
   platform: NodeJS.Platform,
   arch: string,
-  linuxLibc: LinuxLibc = detectedLinuxLibc(),
+  linuxLibc?: LinuxLibc,
 ): NativeHelperHost | null {
   if (platform === "darwin" && arch === "arm64") return "darwin-arm64";
   if (platform === "darwin" && arch === "x64") return "darwin-x64";
-  if (platform === "linux" && arch === "x64") return `linux-x64-${linuxLibc}`;
-  if (platform === "linux" && arch === "arm64") return `linux-arm64-${linuxLibc}`;
+  if (platform === "linux" && arch === "x64") return `linux-x64-${linuxLibc ?? detectedLinuxLibc()}`;
+  if (platform === "linux" && arch === "arm64") return `linux-arm64-${linuxLibc ?? detectedLinuxLibc()}`;
   if (platform === "win32" && arch === "x64") return "win32-x64";
   return null;
 }
@@ -343,28 +375,33 @@ export function nativeHelperForTarget(
 ): NativeHelperSpec | null {
   const host = helperHost(hostPlatform, hostArch, linuxLibc);
   if (host === null) return null;
-  return target.hostHelpers?.[host] ?? (
-    target.platform === hostPlatform && target.architecture === hostArch ? target.helper : null
-  );
+  switch (host) {
+    case "darwin-arm64": return DARWIN_ARM64_HELPER;
+    case "darwin-x64": return DARWIN_X64_HELPER;
+    case "linux-x64-gnu": return LINUX_X64_HELPER;
+    case "linux-arm64-gnu": return LINUX_ARM64_HELPER;
+    case "linux-x64-musl": return LINUX_X64_MUSL_HELPER;
+    case "linux-arm64-musl": return LINUX_ARM64_MUSL_HELPER;
+    case "win32-x64": return WINDOWS_X64_HELPER;
+  }
 }
 
 function nativeHostTarget(
   hostPlatform: NodeJS.Platform,
   hostArch: string,
   hostRelease: string,
-  linuxLibc: LinuxLibc,
+  linuxLibc?: LinuxLibc,
 ): NativeTargetSpec | null {
   if (hostPlatform === "darwin") {
     const major = Number.parseInt(hostRelease.split(".", 1)[0] ?? "", 10);
     if (!Number.isFinite(major) || major < 24) return null;
     return hostArch === "arm64" ? MACOS_ARM64_TARGET : hostArch === "x64" ? MACOS_X64_TARGET : null;
   }
-  if (hostPlatform === "linux") {
+  if (hostPlatform === "linux" && (hostArch === "x64" || hostArch === "arm64")) {
+    const libc = linuxLibc ?? detectedLinuxLibc();
     return hostArch === "x64"
-      ? linuxLibc === "musl" ? LINUX_X64_MUSL_TARGET : LINUX_X64_GNU_TARGET
-      : hostArch === "arm64"
-        ? linuxLibc === "musl" ? LINUX_ARM64_MUSL_TARGET : LINUX_ARM64_GNU_TARGET
-        : null;
+      ? libc === "musl" ? LINUX_X64_MUSL_TARGET : LINUX_X64_GNU_TARGET
+      : libc === "musl" ? LINUX_ARM64_MUSL_TARGET : LINUX_ARM64_GNU_TARGET;
   }
   return hostPlatform === "win32" && hostArch === "x64" ? WINDOWS_X64_MSVC_TARGET : null;
 }
@@ -373,32 +410,51 @@ function requestedTarget(
   raw: string,
   host: NativeTargetSpec | null,
   hostPlatform: NodeJS.Platform,
-  hostArch: string,
-  linuxLibc: LinuxLibc,
 ): NativeTargetSpec | null {
   if (raw === "") return host;
   switch (raw) {
-    case "arm64-apple-macosx14.0.0": return host?.name === "macos-arm64" ? MACOS_ARM64_TARGET : null;
+    case "arm64-apple-macosx14.0.0":
+    case "aarch64-macos": return MACOS_ARM64_TARGET;
     case "x86_64-apple-macosx14.0.0":
-    case "x86_64-apple-macos": return host?.name === "macos-x64" ? MACOS_X64_TARGET : null;
+    case "x86_64-apple-macos":
+    case "x86_64-macos": return MACOS_X64_TARGET;
     case "x86_64-unknown-linux-gnu":
     case "x86_64-linux-gnu":
-    case "x86_64-linux-gnu.2.36": return host?.name === "linux-x64-gnu" ? LINUX_X64_GNU_TARGET : null;
+    case "x86_64-linux-gnu.2.36": return LINUX_X64_GNU_TARGET;
     case "aarch64-unknown-linux-gnu":
     case "aarch64-linux-gnu":
-    case "aarch64-linux-gnu.2.36": return host?.name === "linux-arm64-gnu" ? LINUX_ARM64_GNU_TARGET : null;
+    case "aarch64-linux-gnu.2.36": return LINUX_ARM64_GNU_TARGET;
     case "x86_64-unknown-linux-musl":
-    case "x86_64-linux-musl":
-      return host?.platform === "linux" && host.architecture === "x64" ? LINUX_X64_MUSL_TARGET : null;
+    case "x86_64-linux-musl": return LINUX_X64_MUSL_TARGET;
     case "aarch64-unknown-linux-musl":
-    case "aarch64-linux-musl":
-      return host?.platform === "linux" && host.architecture === "arm64" ? LINUX_ARM64_MUSL_TARGET : null;
+    case "aarch64-linux-musl": return LINUX_ARM64_MUSL_TARGET;
     case "wasm32-wasi":
-    case "wasm32-unknown-wasi":
-      return helperHost(hostPlatform, hostArch, linuxLibc) === null ? null : WASM32_WASI_TARGET;
-    case "x86_64-pc-windows-msvc": return host?.name === "windows-x64-msvc" ? WINDOWS_X64_MSVC_TARGET : null;
+    case "wasm32-unknown-wasi": return WASM32_WASI_TARGET;
+    case "x86_64-windows-gnu":
+    case "x86_64-pc-windows-msvc": return WINDOWS_X64_MSVC_TARGET;
+    case "aarch64-apple-ios": return hostPlatform === "darwin" ? IOS_ARM64_TARGET : null;
+    case "aarch64-apple-ios-simulator": return hostPlatform === "darwin" ? IOS_SIMULATOR_ARM64_TARGET : null;
+    case "aarch64-linux-android": return ANDROID_ARM64_TARGET;
     default: return null;
   }
+}
+
+/** Native distributions already know their host ABI, including Linux libc. */
+export function selectNativeTarget(
+  raw: string, host: NativeTargetSpec, hostPlatform: string = process.platform,
+): NativeTargetSpec | null {
+  const target = requestedTarget(raw, host, hostPlatform as NodeJS.Platform);
+  if (target === null) return null;
+  if (target.platform === "linux" && target.name !== host.name && target.name !== "android-arm64") {
+    return {
+      ...target, defaultLinker: "zig", defaultLinkerArgs: ["cc"],
+      linkerTargetTriple: `${target.architecture === "x64" ? "x86_64" : "aarch64"}-linux-${target.name.endsWith("musl") ? "musl" : "gnu.2.36"}`,
+    };
+  }
+  if (target.platform === "darwin" && hostPlatform !== "darwin") {
+    return { ...target, defaultLinker: "zig", defaultLinkerArgs: ["cc"], linkerTargetTriple: `${target.architecture === "x64" ? "x86_64" : "aarch64"}-macos.14.0` };
+  }
+  return target;
 }
 
 /** Select only a fully described scriptc target. LLVM accepting an arbitrary
@@ -408,11 +464,12 @@ export function nativeCodegenTarget(
   hostPlatform: NodeJS.Platform = process.platform,
   hostArch: string = process.arch,
   hostRelease: string = release(),
-  linuxLibc: LinuxLibc = detectedLinuxLibc(),
+  linuxLibc?: LinuxLibc,
 ): NativeTargetSpec | null {
   const host = nativeHostTarget(hostPlatform, hostArch, hostRelease, linuxLibc);
-  const target = requestedTarget(env["SCRIPTC_TARGET"] ?? "", host, hostPlatform, hostArch, linuxLibc);
-  return target !== null && nativeHelperForTarget(target, hostPlatform, hostArch, linuxLibc) !== null ? target : null;
+  const target = host === null ? null : selectNativeTarget(env["SCRIPTC_TARGET"] ?? "", host, hostPlatform);
+  if (host === null || target === null || nativeHelperForTarget(target, hostPlatform, hostArch, linuxLibc) === null) return null;
+  return target;
 }
 
 export function nativeCodegenTargetRefusal(
@@ -420,7 +477,7 @@ export function nativeCodegenTargetRefusal(
   hostPlatform: NodeJS.Platform = process.platform,
   hostArch: string = process.arch,
   hostRelease: string = release(),
-  linuxLibc: LinuxLibc = detectedLinuxLibc(),
+  linuxLibc?: LinuxLibc,
 ): string | null {
   if (nativeCodegenTarget(env, hostPlatform, hostArch, hostRelease, linuxLibc) !== null) return null;
   const requested = env["SCRIPTC_TARGET"] ?? "";

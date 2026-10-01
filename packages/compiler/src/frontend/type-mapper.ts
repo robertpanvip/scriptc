@@ -25,6 +25,11 @@ export function jsOpenObjectType(
   if (!decl || !isJsSourceFile(decl.getSourceFile())) return type;
   const arms = type.kind === "union" ? unions.get(type.unionId)?.arms : [type];
   const present = arms?.filter((arm) => arm.kind !== "undefinedT");
+  const parameter = ts.isParameter(decl) ? decl : decl.parent && ts.isParameter(decl.parent) ? decl.parent : null;
+  // Numeric array parameters in JavaScript also accept typed arrays. Keep
+  // their runtime storage at the boundary, including default [] parameters.
+  if (parameter && !parameter.dotDotDotToken && present?.length === 1 &&
+      present[0]!.kind === "array" && present[0]!.elem.kind === "f64") return DYN;
   if (present?.length !== 1 || present[0]!.kind !== "record") return type;
   const shape = shapes.get(present[0]!.shapeId);
   return shape && shape.fields.length === 0 && !shape.indexValue && !shape.tuple ? DYN : type;
@@ -801,7 +806,7 @@ export interface TypeMapperCtx {
    * inside members, self-referential member types), null outside any
    * mixin context (the type alone cannot name a call site). */
   mixinClassInstance?: (decl: ts.ClassLikeDeclaration) => IrType | null;
-  localClassInstance?: (decl: ts.ClassExpression) => IrType | null;
+  localClassInstance?: (decl: ts.ClassLikeDeclaration) => IrType | null;
   /** MIXIN instance INTERSECTIONS (`Tagged.C & Derived` — values built
    * through a mixin result): resolved by chain structure to the unique
    * pinned instantiation they describe; null when ambiguous or when no
@@ -862,8 +867,8 @@ export interface TypeMapperCtx {
  * - next: void/undefined/never mean valueless resumes (the undefined
  *   unit); any/unknown ride dyn; else the mapped type (`.next(v)` then
  *   requires its argument — fenced at the call site).
- * Mixed dyn/concrete value channels stay unmapped (the shared result
- * record's value slot is one representation). */
+ * Mixed dyn/concrete value channels both use checked values because the
+ * shared result record's value slot has one representation. */
 function genChannels(
   yieldTs: ts.Type | undefined,
   retTs: ts.Type | undefined,
@@ -892,7 +897,7 @@ function genChannels(
   const dynMix =
     (yieldT.kind === "dyn" && retT.kind !== "dyn" && retT.kind !== "void") ||
     (retT.kind === "dyn" && yieldT.kind !== "dyn" && yieldT.kind !== "void");
-  if (dynMix) return null;
+  if (dynMix) return { yieldT: DYN, retT: DYN, nextT };
   return { yieldT, retT, nextT };
 }
 
@@ -949,7 +954,6 @@ export function mapType(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
 /** Local class types need the enclosing specialization's registered layout.
  * Static-block classes are sent through the same hook for an explicit fence. */
 function classExprNeedsContext(decl: ts.ClassLikeDeclaration): boolean {
-  if (!ts.isClassExpression(decl)) return false;
   for (let p: ts.Node | undefined = decl.parent; p !== undefined && !ts.isSourceFile(p); p = p.parent) {
     if (ts.isFunctionLike(p) || ts.isClassStaticBlockDeclaration(p)) return true;
   }
@@ -1041,17 +1045,25 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // user aliases with the same names on the normal structural path.
   {
     const parseArgsSym = widened.getAliasSymbol() ?? widened.getSymbol();
-    if (
-      parseArgsSym &&
-      PARSE_ARGS_DYN_TYPES.has(parseArgsSym.name) &&
-      checker.declarationsOf(parseArgsSym).some(
-        (d) =>
-          ctx.isStdlibFile(d.getSourceFile()) &&
-          isDeclaredInAmbientModule(d as ts.Declaration, "util"),
-      )
-    ) {
-      return DYN;
-    }
+    const belongs = (declaration: ts.Node): boolean => {
+      if (!ctx.isStdlibFile(declaration.getSourceFile())) return false;
+      let family = false;
+      for (let node: ts.Node | undefined = declaration; node; node = node.parent) {
+        if ((ts.isTypeAliasDeclaration(node) || ts.isInterfaceDeclaration(node)) &&
+          PARSE_ARGS_DYN_TYPES.has(node.name.text)) family = true;
+        if (ts.isModuleDeclaration(node) && ts.isStringLiteral(node.name)) {
+          return family && (node.name.text === "util" || node.name.text === "node:util");
+        }
+      }
+      return false;
+    };
+    if (parseArgsSym && PARSE_ARGS_DYN_TYPES.has(parseArgsSym.name) &&
+      checker.declarationsOf(parseArgsSym).some(belongs)) return DYN;
+    // ReturnType and instantiated conditional types can erase the alias.
+    // Require every member to retain the util declaration provenance so
+    // unrelated records with similar property names keep their own layout.
+    const members = checker.getPropertiesOfType(widened);
+    if (members.length > 0 && members.every((member) => checker.declarationsOf(member).some(belongs))) return DYN;
   }
   // The lib's BOXED wrapper interfaces used as TYPES (`const n: Number =
   // 5`): every value such a slot can hold IS the primitive — `new
@@ -1425,7 +1437,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       }
     }
     if (classExprNeedsContext(classDecl)) {
-      const local = ts.isClassExpression(classDecl) ? ctx.localClassInstance?.(classDecl) : null;
+      const local = ctx.localClassInstance?.(classDecl);
       if (local) contextResolutions++;
       return local ?? null;
     }
@@ -1462,7 +1474,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       }
     }
     if (classExprNeedsContext(classDecl)) {
-      const local = ts.isClassExpression(classDecl) ? ctx.localClassInstance?.(classDecl) : null;
+      const local = ctx.localClassInstance?.(classDecl);
       if (local?.kind === "object") {
         contextResolutions++;
         return { kind: "classval", className: local.className };
@@ -1866,6 +1878,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // space, so clearTimeout of an Immediate no-ops like Node.
   if (isStdlibInterface("Immediate")) return F64;
   if (isStdlibInterface("ArrayBuffer") || isStdlibInterface("PropertyDescriptor") || isStdlibInterface("ProcessVersions")) return DYN;
+  if (Object.values(BYTES_ELEMENT_NAME).some((name) => isStdlibInterface(`${name}Constructor`))) return DYN;
   if (isStdlibInterface("Uint8Array")) return bytesOf("u8");
   if (isStdlibInterface("Uint32Array")) return bytesOf("u32");
   if (isStdlibInterface("Uint8ClampedArray")) return bytesOf("u8c");
@@ -2342,8 +2355,8 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   //                    boxes; the yield expression reads checked-dynamic);
   //                    else the mapped type (`.next(v)` requires its
   //                    argument — fenced at the call).
-  // Mixed dyn/concrete channels stay unmapped: the shared result record's
-  // value slot would need a dyn union arm, which does not exist.
+  // Mixed dyn/concrete value channels share checked storage, so either
+  // branch of the result record has the same representation.
   if (isStdlibInterface("Generator") || isStdlibInterface("AsyncGenerator") || isStdlibInterface("IterableIterator")) {
     const args = checker.getTypeArguments(widened as ts.TypeReference);
     const channels = genChannels(args[0], args[1], args[2], ctx);
@@ -2765,7 +2778,8 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     const sigDecl = checker.signatureDeclaration(sig);
     const jsUnitReturn = sigDecl !== undefined && isJsSourceFile(sigDecl.getSourceFile()) &&
       (retT.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)) !== 0;
-    const ret = jsUnitReturn ? DYN : retT.flags & ts.TypeFlags.Never ? VOID : mapType(retT, ctx);
+    let ret = jsUnitReturn ? DYN : retT.flags & ts.TypeFlags.Never ? VOID : mapType(retT, ctx);
+    if (sigDecl && isJsSourceFile(sigDecl.getSourceFile()) && ret?.kind === "array" && ret.elem.kind === "f64") ret = DYN;
     if (!ret) return null;
     return typedRest
       ? { kind: "func", params, ret, rest: true, restAbi: "typed" }
@@ -3543,12 +3557,19 @@ export function isUnitOnlyTsType(t: ts.Type, resolveTypeParam?: TypeParamResolve
  * admits, `(() => void) | undefined`) so the interned union is IDENTICAL
  * to what mapping the checker's own `T | undefined` produces. */
 export function withUndefinedArm(t: IrType, unions: UnionRegistry): IrType | null {
+  return withUnitArm(t, "undefinedT", unions);
+}
+
+/** Preserve a nullish runtime value that JavaScript inference omitted. */
+export function withUnitArm(t: IrType, kind: "nullT" | "undefinedT", unions: UnionRegistry): IrType | null {
+  const unit: IrType = { kind };
+  if (t.kind === "jsval") return t;
   if (t.kind === "union") {
     const def = unions.get(t.unionId);
     if (!def) return null;
     if (def.arms.some((a) => a.kind === "date")) return null;
-    if (def.arms.some((a) => a.kind === "undefinedT")) return t;
-    const arms = [...def.arms, UNDEFINED_T];
+    if (def.arms.some((a) => a.kind === kind)) return t;
+    const arms = [...def.arms, unit];
     arms.sort((a, b) => (typeKey(a) < typeKey(b) ? -1 : 1));
     return { kind: "union", unionId: unions.transform(def, arms) };
   }
@@ -3560,7 +3581,7 @@ export function withUndefinedArm(t: IrType, unions: UnionRegistry): IrType | nul
   ) {
     return null;
   }
-  const arms = [t, UNDEFINED_T];
+  const arms = [t, unit];
   arms.sort((a, b) => (typeKey(a) < typeKey(b) ? -1 : 1));
   return { kind: "union", unionId: unions.intern(arms) };
 }

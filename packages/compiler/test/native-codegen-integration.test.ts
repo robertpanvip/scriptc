@@ -65,7 +65,7 @@ describe.runIf(supported)("LLVM native helper integration", () => {
     expect(await readFile(output, "utf8")).toBe("existing\n");
 
     await writeFile(input, "define i32 @answer() { ret i32 42 }\n");
-    const unsupported = await run(helper, helperArgs(input, output, "x86_64-apple-macosx14.0.0"));
+    const unsupported = await run(helper, helperArgs(input, output, "riscv64-unknown-linux-gnu"));
     expect(JSON.parse(unsupported.stderr.toString("utf8"))).toMatchObject({
       ok: false,
       code: "unsupported_target",
@@ -166,7 +166,7 @@ describe.runIf(supported)("LLVM native helper integration", () => {
     expect(await symbols(helperObject, ["-gU"]))
       .toEqual(await symbols(clangObject, ["-gU"]));
     expect(await symbols(helperObject, ["-gU"])).toEqual(["0000000000000000 T _main"]);
-    expect(await symbols(helperObject, ["-u"])).toContain("_scr_runtime_abi_v4");
+    expect(await symbols(helperObject, ["-u"])).toContain("_scr_runtime_abi_v5");
 
     const clangExe = join(dir, "clang-program");
     const linkDriver = join(dir, "clang-driver.c");
@@ -460,7 +460,7 @@ describe.runIf(supported)("LLVM native helper integration", () => {
       .stdout.trim().split("\n");
     expect(undefinedSymbols).toContain("_sf_scale");
     expect(undefinedSymbols).toContain("_sf_callback_mix");
-    expect(undefinedSymbols).toContain("_scr_runtime_abi_v4");
+    expect(undefinedSymbols).toContain("_scr_runtime_abi_v5");
   });
 
   test("helper and clang object paths retain the same outbound FFI C ABI", async () => {

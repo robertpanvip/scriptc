@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
-import { analyze, compile, compileC, deserializeModule, emitCModule, serializeModule, validateModule } from "@scriptc/compiler";
+import { analyze, compile, compileC, deserializeModule, emitLlvmModule, serializeModule, validateModule } from "@scriptc/compiler";
 import { IR_VERSION } from "../../packages/compiler/src/ir/serialize.js";
 import { F64, VOID, type IrModule } from "../../packages/compiler/src/ir/ir.js";
 import { numLit } from "../../packages/compiler/src/ir/build.js";
@@ -43,7 +43,7 @@ test("the production IR serialization and validation pipeline lowers entirely st
   expect(coverage.stats.functionsSkipped).toBe(0);
 });
 
-for (const backend of ["c", "llvm"] as const) {
+for (const backend of ["llvm"] as const) {
   test(`self-hosting serialization: ${backend} round-trips IR and produces a working program`, async () => {
     const dir = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "scriptc-native-serialize-"));
     const sanitize = process.env["SCRIPTC_SAN"] === "1";
@@ -83,6 +83,11 @@ for (const backend of ["c", "llvm"] as const) {
       };
 
       const numeric = roundTrip(numericModule());
+      const compact = run(serializeModule(numeric), ["compact"]);
+      expect(compact.native.status).toBe(0);
+      expect(compact.native.stdout.toString().trimEnd()).not.toContain("\n");
+      expect(deserializeModule(compact.native.stdout.toString())).toEqual(numeric);
+      expect(deserializeModule(compact.native.stdout.toString())).toEqual(deserializeModule(compact.oracle.stdout.toString()));
       const print = numeric.functions[0]!.body[1]!;
       expect(print.kind).toBe("exprStmt");
       if (print.kind !== "exprStmt" || print.expr.kind !== "intrinsic") throw new Error("numeric IR changed");
@@ -90,8 +95,8 @@ for (const backend of ["c", "llvm"] as const) {
       expect(third.kind).toBe("numLit");
       if (third.kind !== "numLit") throw new Error("literal changed");
       expect(Object.is(third.value, -0)).toBe(true);
-      const cPath = join(dir, "numbers.c");
-      writeFileSync(cPath, emitCModule(numeric));
+      const cPath = join(dir, "numbers.ll");
+      writeFileSync(cPath, emitLlvmModule(numeric));
       await compileC({ cPath, outPath: executable("numbers"), sanitize });
       const program = spawnSync(executable("numbers"), [], runOptions);
       expect(program.error).toBeUndefined();
@@ -114,6 +119,7 @@ for (const backend of ["c", "llvm"] as const) {
         "tests/corpus/3089-array-find-narrowing.ts",
         "tests/corpus/3091-json-recursive-discriminants.ts",
         "tests/corpus/3094-json-replacer-traversal.ts",
+        "tests/corpus/1010-json-stringify-space.ts",
       ]) {
         const path = join(dir, "emitted.json");
         const emitted = await compile(join(root, source), { outDir: dir, outPath: path, outputKind: "ir", dynamic: false });
