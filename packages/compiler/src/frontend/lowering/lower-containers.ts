@@ -15,7 +15,7 @@ import { islandPrimitiveExit, lowerDynDispatchMethodCall } from "./lower-calls.j
 import { buildArraySortFn } from "./lower-array-sort.js";
 import { arrayIndexPresent, arrayValueRead, arrayValueStore, arrayValueType, currentArrayIndexPresent } from "./array-values.js";
 import { typeKey } from "../type-mapper.js";
-import { type WidthLift, nodeThrowExpr } from "./lowerer.js";
+import { type WidthLift, newFnCtx, nodeThrowExpr } from "./lowerer.js";
 import { boolLit, countedFor, numLit, strLit, varRef } from "../../ir/build.js";
 import { defaultAfterUndefined, lowerPositionArgument, lowerStaticallyUndefinedArgument, positionNumber } from "./optional-arguments.js";
 import { lowerArrayCopyWithin, lowerArrayFill } from "./array-indexed-mutation.js";
@@ -162,13 +162,6 @@ function lowerArrayJoinSeparator(lowerer: Lowerer, node: ts.Expression | undefin
  * directly from its IR return type. Fence element kinds ScrArr cannot hold
  * before constructing that array type. */
 function fenceProducedArrayElem(lowerer: Lowerer, node: ts.Node, producer: string, elem: IrType): void {
-  if (elem.kind === "dyn") {
-    lowerer.unsupported(
-      "SC1090",
-      node,
-      `${producer} with a callback returning 'unknown'-typed values (the result array has no static element type — annotate the callback's return)`,
-    );
-  }
   if (!isSupportedArrayElem(elem)) {
     lowerer.unsupported(
       "SC1090",
@@ -625,7 +618,11 @@ function fenceProducedArrayElem(lowerer: Lowerer, node: ts.Node, producer: strin
               "concat of a bare inner array onto an array-of-arrays (JS would SPREAD it one level — wrap it: a.concat([inner]))",
             );
           }
-          const arg = lowerer.lowerExpr(argNode);
+          // Declaration-backed JS methods can return checked values even
+          // when their public signature names a concrete array. Validate
+          // that boundary before spreading the represented elements.
+          let arg = lowerer.lowerExpr(argNode);
+          if (arg.type.kind === "dyn") arg = lowerer.coerceInto(argNode, arg, argArrayType);
           if (arg.type.kind !== "array") lowerer.badType(argNode, lowerer.typeOf(argNode));
           shape.push("a");
           args.push(arg);
@@ -695,6 +692,12 @@ function fenceProducedArrayElem(lowerer: Lowerer, node: ts.Node, producer: strin
       return { kind: "arrIntrinsic", method: "shift", receiver, args: [], type: arrayValueType(lowerer, elem), loc };
     }
     if (name === "join") {
+      if (elem.kind === "dyn") {
+        const receiver = lowerer.coerceToExpected(lowerer.lowerExpr(access.expression), DYN);
+        const args = call.arguments.length ? [lowerer.lowerExprExpecting(call.arguments[0]!, DYN)] : [];
+        return lowerer.coerceToExpected({ kind: "dynInvoke", recv: receiver, method: "join",
+          calleeName: access.getText(), args, type: DYN, loc }, STRING);
+      }
       // The ambient declares join on every Array<T> (a per-element-type
       // interface split isn't expressible there), so string-convertible
       // elements are enforced here: nested arrays would need JS's recursive
@@ -2156,8 +2159,7 @@ export function tryLowerNumericIndexRead(lowerer: Lowerer, operand: IrExpr, loc:
    * undefined unit arm (for REF elements that arm is the unit instance, the
    * standard union machinery). The Last pair is the SAME loop walked
    * backwards (`i = n - 1; i >= 0; i--`), exactly the es2023 spec's
-   * descending index walk. All require a bool-returning callback
-   * (JS's ToBoolean of arbitrary predicate results has no lowering). */
+   * descending index walk. Predicate results use JavaScript ToBoolean. */
   function lowerArrayFindLikeCall(lowerer: Lowerer, call: ts.CallExpression,
     access: ts.PropertyAccessExpression,
     method: "find" | "findIndex" | "findLast" | "findLastIndex" | "some" | "every",
@@ -2176,7 +2178,7 @@ export function tryLowerNumericIndexRead(lowerer: Lowerer, operand: IrExpr, loc:
     // returns the index read's `string | undefined`).
     const fnRet = fnArg.type.ret;
     const truthyRet =
-      fnRet.kind === "bool" || fnRet.kind === "f64" || fnRet.kind === "string" ||
+      fnRet.kind === "bool" || fnRet.kind === "f64" || fnRet.kind === "string" || fnRet.kind === "dyn" ||
       (fnRet.kind === "union" &&
         (lowerer.unions.get(fnRet.unionId)?.arms ?? []).every((a) => a.kind !== "dyn" && a.kind !== "caught" && a.kind !== "jsval"));
     if (!truthyRet) lowerer.badType(argNode, lowerer.typeOf(argNode));
@@ -2228,10 +2230,11 @@ export function tryLowerNumericIndexRead(lowerer: Lowerer, operand: IrExpr, loc:
   }
 
 /** ToBoolean of a predicate result inside a synthesized HOF helper — the
-   * ensureBool subset the find-like path admits (bool through; f64/string/
-   * truthy-answerable unions via toBool). */
+   * ensureBool subset the find-like path admits (bool through; checked
+   * values via dynTest; f64/string/truthy-answerable unions via toBool). */
   function predToBool(e: IrExpr): IrExpr {
     if (e.type.kind === "bool") return e;
+    if (e.type.kind === "dyn") return { kind: "dynTest", test: "truthy", value: e, type: BOOL, loc: e.loc };
     return { kind: "toBool", operand: e, type: BOOL, loc: e.loc };
   }
 
@@ -3110,30 +3113,77 @@ export function lowerArrayOfCall(lowerer: Lowerer, call: ts.CallExpression,
 
 /** Mapper-less checked Array.from: acquire once, then step through emitted
  * property and call dispatch so native class iterators retain their methods. */
-function lowerCheckedArrayFrom(lowerer: Lowerer, source: IrExpr, loc: SrcLoc): IrExpr {
+function lowerCheckedArrayFrom(lowerer: Lowerer, source: IrExpr, loc: SrcLoc, mapper?: IrExpr, receiver?: IrExpr): Extract<IrExpr, { kind: "seqExpr" }> {
   const iterator = lowerer.declareHiddenLocal("%fromIterator", DYN);
   const next = lowerer.declareHiddenLocal("%fromNext", DYN);
   const step = lowerer.declareHiddenLocal("%fromStep", DYN);
   const out = lowerer.declareHiddenLocal("%fromArray", DYN);
   const done = lowerer.declareHiddenLocal("%fromDone", BOOL);
   done.mutable = true;
+  const index = mapper ? lowerer.declareHiddenLocal("%fromIndex", F64) : null;
+  if (index) index.mutable = true;
   const get = (value: IrExpr, key: string): IrExpr => ({ kind: "dynKeyGet", value, key: strLit(key, loc), type: DYN, loc });
+  const item = get(varRef(step.id, DYN, loc), "value");
+  const mapped: IrExpr = mapper && index ? { kind: "ternary", cond: { kind: "dynTest", test: "undefined", value: mapper, type: BOOL, loc },
+    then: item, else_: { kind: "dynCall", callee: mapper, ...(receiver ? { receiver } : {}), calleeName: "Array.from mapper", args: [item, lowerer.coerceToExpected(varRef(index.id, F64, loc), DYN)], type: DYN, loc }, type: DYN, loc } : item;
+  let append: IrStmt = { kind: "exprStmt", expr: { kind: "dynInvoke", recv: varRef(out.id, DYN, loc), method: "push", calleeName: "Array.from", args: [mapped], type: DYN, loc }, loc };
+  if (mapper) {
+    const error = lowerer.declareHiddenLocal("%fromError", CAUGHT);
+    const close = lowerer.declareHiddenLocal("%fromReturn", DYN);
+    append = { kind: "tryCatch", tryBody: [append], catchLocalId: error.id, finallyBody: null, loc, catchBody: [
+      { kind: "tryCatch", catchLocalId: null, catchBody: [], finallyBody: null, loc, tryBody: [
+        { kind: "varDecl", localId: close.id, init: get(varRef(iterator.id, DYN, loc), "return"), loc },
+        { kind: "if", cond: { kind: "dynTest", test: "function", value: varRef(close.id, DYN, loc), type: BOOL, loc }, then: [
+          { kind: "exprStmt", expr: { kind: "dynCall", callee: varRef(close.id, DYN, loc), receiver: varRef(iterator.id, DYN, loc), calleeName: "iterator.return", args: [], type: DYN, loc }, loc },
+        ], else_: null, loc },
+      ] },
+      { kind: "rethrow", localId: error.id, loc },
+    ] };
+  }
   const stmts: IrStmt[] = [
+    ...(mapper ? [{ kind: "if" as const, cond: { kind: "dynTest" as const, test: "undefined" as const, value: mapper, type: BOOL, loc }, then: [], else_: [
+      { kind: "if" as const, cond: { kind: "dynTest" as const, test: "function" as const, value: mapper, type: BOOL, loc }, then: [], else_: [
+        { kind: "exprStmt" as const, expr: nodeThrowExpr(1, "", "Array.from mapper is not a function", DYN, loc), loc },
+      ], loc },
+    ], loc }] : []),
     { kind: "varDecl", localId: iterator.id, init: { kind: "libCall", fn: "dyn.iteratorResult", args: [{ kind: "libCall", fn: "dyn.arrayFromIterator", args: [source], type: DYN, loc }], type: DYN, loc }, loc },
     { kind: "varDecl", localId: next.id, init: get(varRef(iterator.id, DYN, loc), "next"), loc },
     { kind: "varDecl", localId: out.id, init: { kind: "dynArrLit", elems: [], type: DYN, loc }, loc },
     { kind: "varDecl", localId: done.id, init: boolLit(false, loc), loc },
+    ...(index ? [{ kind: "varDecl" as const, localId: index.id, init: numLit(0, loc), loc }] : []),
     { kind: "while", cond: { kind: "unary", op: "!", operand: varRef(done.id, BOOL, loc), type: BOOL, loc }, body: [
       { kind: "varDecl", localId: step.id, init: { kind: "libCall", fn: "dyn.iteratorResult", args: [{
         kind: "dynCall", callee: varRef(next.id, DYN, loc), receiver: varRef(iterator.id, DYN, loc), calleeName: "iterator.next", args: [], type: DYN, loc,
       }], type: DYN, loc }, loc },
       { kind: "assign", localId: done.id, value: { kind: "dynTest", test: "truthy", value: get(varRef(step.id, DYN, loc), "done"), type: BOOL, loc }, loc },
       { kind: "if", cond: { kind: "unary", op: "!", operand: varRef(done.id, BOOL, loc), type: BOOL, loc }, then: [
-        { kind: "exprStmt", expr: { kind: "dynInvoke", recv: varRef(out.id, DYN, loc), method: "push", calleeName: "Array.from", args: [get(varRef(step.id, DYN, loc), "value")], type: DYN, loc }, loc },
+        append,
+        ...(index ? [{ kind: "assign" as const, localId: index.id, value: { kind: "bin" as const, op: "+" as const, left: varRef(index.id, F64, loc), right: numLit(1, loc), type: F64, loc }, loc }] : []),
       ], else_: null, loc },
     ], loc },
   ];
   return { kind: "seqExpr", stmts, result: varRef(out.id, DYN, loc), type: DYN, loc };
+}
+
+export function lowerArrayFromValue(lowerer: Lowerer, loc: SrcLoc): IrExpr {
+  const name = "%builtin.Array.from";
+  if (!lowerer.liftedFns.some((fn) => fn.name === name)) {
+    const context = newFnCtx(false, null, null, DYN);
+    lowerer.fnStack.push(context);
+    try {
+      const params = ["source", "options"].map((name) => {
+        const local = lowerer.declareHiddenLocal(name, DYN);
+        return { localId: local.id, name, type: DYN };
+      });
+      const [source, options] = params.map((p) => varRef(p.localId, DYN, loc));
+      const argument = (index: string): IrExpr => ({ kind: "dynKeyGet", value: options!, key: strLit(index, loc), type: DYN, loc });
+      const value = lowerCheckedArrayFrom(lowerer, source!, loc, argument("0"), argument("1"));
+      const constructorCheck: IrStmt = { kind: "if", cond: { kind: "dynTest", test: "function", value: { kind: "libCall", fn: "dyn.this", args: [], type: DYN, loc }, type: BOOL, loc },
+        then: [{ kind: "runtimeFence", code: "SC2020", message: "Array.from with a custom constructor receiver is not supported", loc }], else_: null, loc };
+      lowerer.liftedFns.push({ name, params, returnType: DYN, locals: context.locals, body: [constructorCheck, ...value.stmts, { kind: "return", value: value.result, loc }], loc });
+    } finally { lowerer.fnStack.pop(); }
+  }
+  return { kind: "dynFrom", value: { kind: "closure", fnName: name, captures: [], type: { kind: "func", params: [DYN], ret: DYN, rest: true }, loc }, fnName: "from", type: DYN, loc };
 }
 
 /** `Array.from({ length: n }, mapfn)` — the counted-generation idiom — on
@@ -5500,23 +5550,12 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
           binds.push({ kind: "varDecl", localId: vLocal.id, init: secondRead(), loc });
         }
       } else {
-        // Identifier heads and the remaining patterns bind through the
-        // checker's own element type — the [K, V] tuple for pair yields,
-        // T otherwise — built/read once into a hidden per-iteration
-        // local, the array for-of's exact desugar.
-        const elemT = lowerer.mapTypeOf(lowerer.checker.getTypeAtLocation(decl!.name));
-        if (yieldsPair) {
-          const shape = elemT?.kind === "record" ? lowerer.shapes.get(elemT.shapeId) : null;
-          if (
-            elemT?.kind !== "record" || !shape?.tuple || shape.fields.length !== 2 ||
-            !typeEquals(shape.fields.find((f) => f.name === "0")!.type, keyT) ||
-            !typeEquals(shape.fields.find((f) => f.name === "1")!.type, secondT)
-          ) {
-            lowerer.badType(decl!.name, lowerer.checker.getTypeAtLocation(decl!.name)); // defensive: the lib declares [K, V]
-          }
-        } else if (!elemT || !typeEquals(elemT, singleT)) {
-          lowerer.badType(decl!.name, lowerer.checker.getTypeAtLocation(decl!.name)); // defensive: the lib declares T
-        }
+        // Derive the yielded layout from the represented container. JS
+        // inference can leave the pattern at any even when the Map's
+        // native key/value types are known after specialization.
+        const elemT: IrType = yieldsPair
+          ? { kind: "record", shapeId: lowerer.shapes.intern([{ name: "0", type: keyT }, { name: "1", type: secondT }], true) }
+          : singleT;
         const elemInit: IrExpr = yieldsPair
           ? {
               kind: "recordLit",

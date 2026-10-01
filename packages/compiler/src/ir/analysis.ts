@@ -74,6 +74,7 @@ export function dynDesc(
     case "nullT": return "null";
     case "undefinedT": return "undefined";
     case "dyn": return "unknown";
+    case "promise": return "Promise";
     case "bytes": return BYTES_ELEMENT_NAME[t.elem];
     case "object": return t.className.replace(/^%/, "");
     case "union": {
@@ -88,6 +89,7 @@ export function dynDesc(
     case "set": return "Set";
     case "regex": return "RegExp";
     case "url": return "URL";
+    case "date": return "Date";
     default: {
       const handle = DYN_HANDLE_KINDS.get(t.kind);
       if (handle) return handle.cls;
