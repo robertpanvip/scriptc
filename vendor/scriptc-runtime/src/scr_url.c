@@ -237,7 +237,13 @@ static bool seg_is_dotdot(const char *s, size_t len) {
  * after the authority (or after the scheme's slashes), '?'/'#' excluded.
  * Backslashes act as slashes iff `special`. Output starts with '/' for
  * every non-empty result; empty stays empty (git://host has path ""). */
-static ScrStr *parse_rooted_path(const char *raw, size_t len, bool special) {
+static bool url_drive_letter(const char *raw, size_t len) {
+  return len == 2 && ((raw[0] >= 'a' && raw[0] <= 'z') ||
+                     (raw[0] >= 'A' && raw[0] <= 'Z')) &&
+         (raw[1] == ':' || raw[1] == '|');
+}
+
+static ScrStr *parse_rooted_path_mode(const char *raw, size_t len, bool special, bool file) {
   if (len == 0) return scr_str_new("", 0); /* no path at all (git://host) */
   /* Collected segment list: one output buffer + an index of segment start
    * offsets (popping a ".." truncates to the previous start). */
@@ -259,7 +265,7 @@ static ScrStr *parse_rooted_path(const char *raw, size_t len, bool special) {
     const char *seg = raw + seg_begin;
     size_t seg_len = i - seg_begin;
     if (seg_is_dotdot(seg, seg_len)) {
-      if (seg_count > 0) {
+      if (seg_count > 0 && !(file && seg_count == 1 && url_drive_letter(out.data, out.len))) {
         seg_count--;
         out.len = seg_starts[seg_count];
       }
@@ -292,7 +298,8 @@ static ScrStr *parse_rooted_path(const char *raw, size_t len, bool special) {
       }
       seg_starts[seg_count++] = out.len;
       for (size_t j = 0; j < seg_len; j++) {
-        ub_push_encoded(&out, (unsigned char)seg[j], enc_path);
+        const char c = file && seg_count == 1 && url_drive_letter(seg, seg_len) && j == 1 ? ':' : seg[j];
+        ub_push_encoded(&out, (unsigned char)c, enc_path);
       }
     }
     if (at_end) break;
@@ -309,6 +316,10 @@ static ScrStr *parse_rooted_path(const char *raw, size_t len, bool special) {
   free(out.data);
   free(seg_starts);
   return ub_take(&ser);
+}
+
+static ScrStr *parse_rooted_path(const char *raw, size_t len, bool special) {
+  return parse_rooted_path_mode(raw, len, special, false);
 }
 
 /* Parses `authority` (between the slashes and the path/query/fragment):
@@ -515,7 +526,13 @@ ScrUrl *scr_url_new(ScrStr *input) {
       size_t astart = is_file ? 2 : slashes;
       size_t aend = astart;
       while (aend < body_len && body[aend] != '/' && body[aend] != '\\') aend++;
-      if (!parse_authority(body + astart, aend - astart, special, is_file, scheme, sl,
+      size_t path_start = aend;
+      if (is_file && url_drive_letter(body + astart, aend - astart)) {
+        userinfo = scr_str_new("", 0);
+        host = scr_str_new("", 0);
+        port = scr_str_new("", 0);
+        path_start = astart - 1;
+      } else if (!parse_authority(body + astart, aend - astart, special, is_file, scheme, sl,
                            &userinfo, &host, &port)) {
         scr_str_release(userinfo);
         scr_str_release(host);
@@ -525,7 +542,7 @@ ScrUrl *scr_url_new(ScrStr *input) {
         return NULL;
       }
       has_authority = true;
-      path = parse_rooted_path(body + aend, body_len - aend, special);
+      path = parse_rooted_path_mode(body + path_start, body_len - path_start, special, is_file);
       if (path->len == 0) {
         scr_str_release(path);
         path = scr_str_new("/", 1); /* special URLs never have empty paths */
@@ -542,14 +559,14 @@ ScrUrl *scr_url_new(ScrStr *input) {
       /* Root the path: parse_rooted_path treats one leading sep as the
        * root; prepend one if absent so "tmp" parses as "/tmp". */
       if (plen > 0 && (p[0] == '/' || p[0] == '\\')) {
-        path = parse_rooted_path(p, plen, special);
+        path = parse_rooted_path_mode(p, plen, special, true);
       } else {
         UrlBuf rb;
         ub_init(&rb);
         ub_push(&rb, '/');
         ub_append(&rb, p, plen);
         ScrStr *tmp = ub_take(&rb);
-        path = parse_rooted_path(tmp->data, tmp->len, special);
+        path = parse_rooted_path_mode(tmp->data, tmp->len, special, true);
         scr_str_release(tmp);
       }
       if (path->len == 0) {
@@ -630,6 +647,112 @@ ScrUrl *scr_url_new(ScrStr *input) {
   u->has_authority = has_authority;
   u->sp_cache = NULL;
   return u;
+}
+
+/* Resolve a relative reference using the parsed base's component boundaries.
+ * Reuse the absolute parser for encoding, dot segments, authority validation,
+ * and canonicalization. The base is parsed even for an absolute input: an
+ * invalid supplied base is a constructor error in Node. */
+ScrUrl *scr_url_new_base(ScrStr *input, ScrStr *base_input) {
+  ScrUrl *base = scr_url_new(base_input);
+  if (!base) return NULL;
+  size_t begin = 0, end = input->len;
+  while (begin < end && (unsigned char)input->data[begin] <= 0x20) begin++;
+  while (end > begin && (unsigned char)input->data[end - 1] <= 0x20) end--;
+  UrlBuf cleaned;
+  ub_init(&cleaned);
+  for (size_t i = begin; i < end; i++) {
+    char c = input->data[i];
+    if (c != '\t' && c != '\n' && c != '\r') ub_push(&cleaned, c);
+  }
+  const char *raw = cleaned.data;
+  size_t len = cleaned.len;
+  size_t scheme_len = 0;
+  if (len && ((raw[0] >= 'a' && raw[0] <= 'z') || (raw[0] >= 'A' && raw[0] <= 'Z'))) {
+    size_t i = 1;
+    while (i < len && ((raw[i] >= 'a' && raw[i] <= 'z') ||
+           (raw[i] >= 'A' && raw[i] <= 'Z') || (raw[i] >= '0' && raw[i] <= '9') ||
+           raw[i] == '+' || raw[i] == '-' || raw[i] == '.')) i++;
+    if (i < len && raw[i] == ':') scheme_len = i;
+  }
+  bool special = is_special_scheme(base->scheme->data, base->scheme->len);
+  bool file = base->scheme->len == 4 && memcmp(base->scheme->data, "file", 4) == 0;
+  bool same_scheme = scheme_len == base->scheme->len;
+  for (size_t i = 0; same_scheme && i < scheme_len; i++) {
+    char c = raw[i];
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    if (c != base->scheme->data[i]) same_scheme = false;
+  }
+  ScrUrl *result = NULL;
+  if (scheme_len && (!same_scheme || !special)) {
+    result = scr_url_new(input);
+    goto done;
+  }
+  if (scheme_len) {
+    raw += scheme_len + 1;
+    len -= scheme_len + 1;
+  }
+  bool slash = len && (raw[0] == '/' || (special && raw[0] == '\\'));
+  bool authority = slash && len > 1 && (raw[1] == '/' || (special && raw[1] == '\\'));
+  bool opaque = !base->has_authority && (!base->path->len || base->path->data[0] != '/');
+  if (opaque && (!len || raw[0] != '#')) {
+    scr_url_throw_invalid();
+    goto done;
+  }
+  UrlBuf absolute;
+  ub_init(&absolute);
+  ub_append(&absolute, base->scheme->data, base->scheme->len);
+  ub_push(&absolute, ':');
+  if (authority) {
+    ub_append(&absolute, raw, len);
+  } else {
+    size_t path_len = 0;
+    while (path_len < len && raw[path_len] != '?' && raw[path_len] != '#') path_len++;
+    bool drive = file && path_len >= 2 && url_drive_letter(raw, 2) &&
+                 (path_len == 2 || raw[2] == '/' || raw[2] == '\\');
+    if (base->has_authority) {
+      ub_append(&absolute, "//", 2);
+      if (!drive) {
+        if (base->userinfo->len) {
+          ub_append(&absolute, base->userinfo->data, base->userinfo->len);
+          ub_push(&absolute, '@');
+        }
+        ub_append(&absolute, base->host->data, base->host->len);
+        if (base->port->len) {
+          ub_push(&absolute, ':');
+          ub_append(&absolute, base->port->data, base->port->len);
+        }
+      }
+    }
+    if (!path_len) {
+      ub_append(&absolute, base->path->data, base->path->len);
+      if (!len || raw[0] == '#') ub_append(&absolute, base->query->data, base->query->len);
+    } else if (drive) {
+      ub_push(&absolute, '/');
+    } else if (slash) {
+      // A rooted file reference retains its base drive unless it supplies
+      // a replacement drive. Dot segments must never pop that drive root.
+      bool replacement_drive = path_len >= 3 && url_drive_letter(raw + 1, 2) &&
+                               (path_len == 3 || raw[3] == '/' || raw[3] == '\\');
+      if (file && !replacement_drive && base->path->len >= 3 &&
+          url_drive_letter(base->path->data + 1, 2)) {
+        ub_append(&absolute, base->path->data, 3);
+      }
+    } else {
+      size_t directory = base->path->len;
+      while (directory && base->path->data[directory - 1] != '/') directory--;
+      if (directory) ub_append(&absolute, base->path->data, directory);
+      else ub_push(&absolute, '/');
+    }
+    ub_append(&absolute, raw, len);
+  }
+  ScrStr *resolved = ub_take(&absolute);
+  result = scr_url_new(resolved);
+  scr_str_release(resolved);
+done:
+  free(cleaned.data);
+  scr_url_release(base);
+  return result;
 }
 
 ScrStr *scr_url_protocol(ScrUrl *u) {
@@ -766,10 +889,11 @@ static ScrStr *scr_url_to_path_impl(ScrUrl *u, bool win32) {
         return NULL;
       }
     }
-    /* Forward slashes become backslashes FIRST, then percent-decoding
-     * (Node's decodeURIComponent order). Invalid sequences pass through
-     * verbatim where Node throws URIError — no URIError class exists
-     * here (documented divergence, shared with the posix arm). */
+    /* Encoded separators have already been refused, so decoding first and
+     * replacing the remaining literal slashes has Node's ordering. Use the
+     * strict decoder: malformed escapes and invalid UTF-8 throw URIError. */
+    ScrStr *decoded = scr_str_decode_uri_component(u->path);
+    if (!decoded) return NULL;
     UrlBuf out;
     ub_init(&out);
     if (u->host->len > 0) {
@@ -780,22 +904,9 @@ static ScrStr *scr_url_to_path_impl(ScrUrl *u, bool win32) {
       ub_append(&out, u->host->data, u->host->len);
     }
     size_t path_start = out.len;
-    for (size_t i = 0; i < len; i++) {
-      if (p[i] == '/') {
-        ub_push(&out, '\\');
-        continue;
-      }
-      if (p[i] == '%' && i + 2 < len) {
-        int hi = hex_val(p[i + 1]);
-        int lo = hex_val(p[i + 2]);
-        if (hi >= 0 && lo >= 0) {
-          ub_push(&out, (char)((hi << 4) | lo));
-          i += 2;
-          continue;
-        }
-      }
-      ub_push(&out, p[i]);
-    }
+    for (size_t i = 0; i < decoded->len; i++)
+      ub_push(&out, decoded->data[i] == '/' ? '\\' : decoded->data[i]);
+    scr_str_release(decoded);
     if (u->host->len > 0) return ub_take(&out);
     /* A local path requires a drive letter: pathname[1] in [a-zA-Z] and
      * pathname[2] === ':' (both on the DECODED, backslashed pathname). */
@@ -830,8 +941,6 @@ static ScrStr *scr_url_to_path_impl(ScrUrl *u, bool win32) {
     scr_throw_error_msg(SCR_ERR_TYPE, msg, (size_t)mlen);
     return NULL;
   }
-  UrlBuf out;
-  ub_init(&out);
   for (size_t i = 0; i < len; i++) {
     if (p[i] == '%' && i + 2 < len) {
       int hi = hex_val(p[i + 1]);
@@ -839,19 +948,15 @@ static ScrStr *scr_url_to_path_impl(ScrUrl *u, bool win32) {
       if (hi >= 0 && lo >= 0) {
         unsigned char decoded = (unsigned char)((hi << 4) | lo);
         if (decoded == '/') {
-          free(out.data);
           scr_throw_error_msg(SCR_ERR_TYPE,
                                "File URL path must not include encoded / characters", 51);
           return NULL;
         }
-        ub_push(&out, (char)decoded);
         i += 2;
-        continue;
       }
     }
-    ub_push(&out, p[i]);
   }
-  return ub_take(&out);
+  return scr_str_decode_uri_component(u->path);
 }
 
 /* The target's arm: Node on Windows takes the win32 branch of the same
@@ -1036,6 +1141,10 @@ ScrUrl *scr_url_from_path(ScrStr *path) {
 #endif
 }
 
+ScrUrl *scr_url_from_path_platform(ScrStr *path, bool windows) {
+  return scr_url_from_path_impl(path, windows);
+}
+
 /* The win32 arms as real entry points: the host-side differential tests
  * (test_url.c) exercise the Windows behavior from any platform, the same
  * way Node exposes { windows: true } options on the bridge pair. */
@@ -1053,4 +1162,70 @@ ScrStr *scr_url_search(ScrUrl *u) {
 ScrStr *scr_url_hash(ScrUrl *u) {
   if (u->fragment->len <= 1) return scr_str_new("", 0);
   return scr_str_retain(u->fragment);
+}
+
+/* Checked native URL values preserve their handle across unknown storage. */
+static ScrDyn *scr_native_url_get(void *ptr, const char *key, size_t len) {
+  if (len == 12 && !memcmp(key, "searchParams", len)) {
+    static const char message[] = "Checked URL.searchParams has no native lowering";
+    scr_throw_error_msg_code(SCR_ERR_ERROR, message, sizeof message - 1, "SC2020");
+    return NULL;
+  }
+  ScrStr *text = NULL;
+#define URL_GET(name) if (len == sizeof(#name) - 1 && memcmp(key, #name, len) == 0) text = scr_url_##name(ptr)
+  URL_GET(href);
+  else URL_GET(protocol);
+  else URL_GET(origin);
+  else URL_GET(username);
+  else URL_GET(password);
+  else URL_GET(host);
+  else URL_GET(hostname);
+  else URL_GET(port);
+  else URL_GET(pathname);
+  else URL_GET(search);
+  else URL_GET(hash);
+#undef URL_GET
+  if (!text) return scr_dyn_retain(scr_dyn_undefined());
+  ScrDyn *result = scr_dyn_new_str(text);
+  scr_str_release(text);
+  return result;
+}
+
+static ScrDyn *scr_native_url_invoke(void *ptr, ScrDyn *self, const char *method,
+    ScrDyn *const *args, size_t argc, const char *what) {
+  (void)self; (void)args; (void)argc; (void)what;
+  if (!strcmp(method, "toString") || !strcmp(method, "toJSON")) {
+    ScrStr *text = scr_url_href(ptr);
+    ScrDyn *result = scr_dyn_new_str(text);
+    scr_str_release(text);
+    return result;
+  }
+  static const char message[] = "Native URL method has no lowering";
+  scr_throw_error_msg_code(SCR_ERR_ERROR, message, sizeof message - 1, "SC2020");
+  return NULL;
+}
+
+ScrDyn *scr_dyn_native_url(ScrUrl *value) {
+  static const ScrDynHandleOps ops = {
+    "URL", &scr_url_retain_v, &scr_url_release_v, &scr_native_url_invoke,
+    &scr_native_url_get, NULL, NULL, NULL,
+  };
+  scr_dyn_handle_install(SCR_DYNH_URL, &ops);
+  return scr_dyn_new_handle(value, SCR_DYNH_URL);
+}
+
+bool scr_dyn_native_url_is(const ScrDyn *value) {
+  return value && value->kind == SCR_DYN_HANDLE && value->v.handle.tag == SCR_DYNH_URL;
+}
+
+ScrUrl *scr_dyn_native_url_check(const ScrDyn *value, const ScrDynPath *path) {
+  if (!scr_dyn_native_url_is(value)) { scr_dyn_check_fail(path, "URL", value); return NULL; }
+  return scr_url_retain(value->v.handle.ptr);
+}
+
+ScrStr *scr_url_checked_to_path(const ScrDyn *value) {
+  if (scr_dyn_native_url_is(value)) return scr_url_to_path(value->v.handle.ptr);
+  if (value->kind == SCR_DYN_STR) return scr_url_str_to_path(value->v.str);
+  scr_dyn_arg_type_fail("path", "of type string or an instance of URL", value);
+  return NULL;
 }

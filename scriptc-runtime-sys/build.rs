@@ -19,7 +19,11 @@ fn main() {
     // dirent/clock MSVC shims.
     let base = [
         "scr_number.c",
+        "scr_bigint.c",
         "scr_string.c",
+        // unicode grapheme segmentation tables used by scr_string.c
+        "scr_grapheme.c",
+        "scr_node_builtin.c",
         "scr_array.c",
         "scr_bytes.c",
         "scr_bytes_io.c",
@@ -31,6 +35,8 @@ fn main() {
         "scr_exception.c",
         "scr_error.c",
         "scr_console.c",
+        // stored console methods (inspect surface)
+        "scr_console_native.c",
         "scr_lib.c",
         "scr_path.c",
         "scr_url.c",

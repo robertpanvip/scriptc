@@ -156,6 +156,7 @@ typedef struct ScrFiber ScrFiber;
 struct ScrPromise {
   size_t rc;
   int state;
+  bool top_level_handled; /* uncaughtException handled entry evaluation */
   /* Payload (fulfillment value or rejection reason), ScrExcCell-style.
    * trace_fn is non-NULL iff the REF payload type carries a cycle header
    * (a promise settled with a cycle-capable value can be a cycle member —
@@ -1553,7 +1554,7 @@ int scr_promise_finish_top_level(ScrPromise *p) {
     return 13;
   }
   scr_prom_observe(p);
-  return p->state == SCR_PROM_REJECTED ? 1 : 0;
+  return p->state == SCR_PROM_REJECTED && !p->top_level_handled ? 1 : 0;
 }
 
 void scr_promise_rethrow_top_level(ScrPromise *p) {
@@ -2487,14 +2488,13 @@ void scr_loop_set_stream(bool (*pending)(void), void (*dispatch)(void)) {
  * microtask checkpoints between macrotasks). */
 bool scr_loop_has_ready(void) { return scr_ready_len > 0; }
 
-bool scr_loop_run(ScrPromise *top_level) {
+static bool scr_loop_run_pass(ScrPromise *top_level, bool first_checkpoint) {
   /* The FIRST checkpoint after the synchronous main body runs promise
    * jobs BEFORE the first tick drain: Node's main-module evaluation is
    * itself awaited (the runMain continuation is a microtask queued after
    * the body's own), so microtasks scheduled during the body beat ticks
    * scheduled during the body exactly once, at startup — differentially
    * pinned. Every later checkpoint drains ticks first. */
-  bool first_checkpoint = true;
   bool rejection_failed = false;
   for (;;) {
     if (top_level != NULL && top_level->state == SCR_PROM_REJECTED) break;
@@ -2860,14 +2860,14 @@ bool scr_loop_run(ScrPromise *top_level) {
         scr_firing_refresh = false;
       }
       ((void (*)(ScrClosure *))t.cb->fn)(t.cb);
-      if (t.id != 0 && t.repeat_ms > 0 && !scr_firing_cleared && !scr_exc_pending()) {
+      if (t.id != 0 && t.repeat_ms > 0 && !scr_firing_cleared) {
         /* Re-arm relative to the post-callback clock (libuv's uv_timer
          * repeat behavior: no catch-up bursts after a slow callback). The
          * ref state carries across ticks (a self-unref'd interval stays
          * unref'd). */
         ScrTimer again = {scr_now_ms() + t.repeat_ms, scr_timer_seq++, t.cb, t.repeat_ms, t.id, scr_firing_reffed, t.delay_ms};
         scr_timer_push(again);
-      } else if (t.id != 0 && scr_firing_refresh && !scr_firing_cleared && !scr_exc_pending()) {
+      } else if (t.id != 0 && scr_firing_refresh && !scr_firing_cleared) {
         /* refresh() from inside the one-shot's own callback: re-arm to
          * now + the original delay, ref state carried (Node's
          * Timeout.refresh — the timer fires again). */
@@ -2915,6 +2915,32 @@ bool scr_loop_run(ScrPromise *top_level) {
         scr_nimmediates = 0;
       }
     }
+  }
+  return rejection_failed;
+}
+
+bool scr_loop_run(ScrPromise *top_level) {
+  bool first_checkpoint = true;
+  bool rejection_failed;
+  for (;;) {
+    rejection_failed = scr_loop_run_pass(top_level && !top_level->top_level_handled ? top_level : NULL, first_checkpoint);
+    first_checkpoint = false;
+    if (scr_exc_pending()) {
+      if (scr_exc_handle_uncaught(false)) continue;
+      break; /* main reports the original or handler-thrown exception */
+    }
+    if (rejection_failed) break;
+    if (top_level && top_level->state == SCR_PROM_REJECTED && !top_level->top_level_handled) {
+      scr_promise_rethrow(top_level);
+      if (scr_exc_handle_uncaught(true)) {
+        top_level->top_level_handled = true;
+        scr_prom_observe(top_level);
+        continue;
+      }
+      scr_discard_unhandled_rejections();
+      break;
+    }
+    break;
   }
   /* Exit can now leave UNREF'd timers armed in the heap (ordinary
    * exhaustion, a fatal module root, or an unhandled rejection). They
@@ -3000,7 +3026,15 @@ bool scr_report_unhandled_rejections(void) {
          * (scr_prom_observe). */
         p->rejection_observed = true;
         p->reported_unhandled = true;
-        if (!scr_urj_deliver_fn(p)) crashed = true;
+        if (!scr_urj_deliver_fn(p) && !scr_exc_handle_uncaught(false)) crashed = true;
+      } else if (scr_uncaught_exception_hook != NULL) {
+        scr_promise_rethrow(p);
+        if (scr_exc_handle_uncaught(true)) {
+          p->rejection_observed = true;
+          p->reported_unhandled = true;
+        } else {
+          crashed = true;
+        }
       } else if (!any) {
         any = true;
         fflush(stdout);
@@ -3038,7 +3072,6 @@ bool scr_report_unhandled_rejections(void) {
   scr_nunhandled = remaining;
   if (crashed) {
     scr_exc_print_uncaught();
-    scr_exit_code_note(1);
     return true;
   }
   if (scr_island_rejections_fn != NULL) {
@@ -3248,13 +3281,19 @@ static void scr_gen_exc_reset(ScrExcCell *cell) {
              cell->kind == SCR_EXC_PRIMITIVE_REF) {
     cell->release_fn(cell->payload);
   }
+  ScrStackFrame *stack = cell->stack;
   memset(cell, 0, sizeof *cell);
+  cell->stack = stack;
 }
 
 static void scr_gen_exc_move(ScrExcCell *dst, ScrExcCell *src) {
   scr_gen_exc_reset(dst);
+  ScrStackFrame *dst_stack = dst->stack;
+  ScrStackFrame *src_stack = src->stack;
   *dst = *src;
+  dst->stack = dst_stack;
   memset(src, 0, sizeof *src);
+  src->stack = src_stack;
 }
 
 struct ScrGen {
@@ -3438,6 +3477,41 @@ double scr_gen_take_in_f64(void) { return scr_gen_slot_take_f64(&scr_gen_self()-
 bool scr_gen_take_in_bool(void) { return scr_gen_slot_take_bool(&scr_gen_self()->in); }
 void *scr_gen_take_in_ref(void) { return scr_gen_slot_take_ref(&scr_gen_self()->in); }
 
+ScrDyn *scr_gen_delegate_resume(ScrDyn *(*next_ref)(void *),
+                                ScrDyn *(*return_ref)(void *),
+                                ScrDyn *(*caught_ref)(const ScrCaught *)) {
+  ScrGen *g = scr_gen_self();
+  ScrExcCell *cell = scr_exc_current_cell();
+  int mode = cell->kind == SCR_EXC_GENRET ? 1 : cell->kind != SCR_EXC_NONE ? 2 : 0;
+  ScrDyn *value;
+  if (mode == 2) {
+    ScrCaught *caught = scr_exc_take();
+    value = caught_ref(caught);
+    scr_caught_release(caught);
+  } else {
+    if (mode == 1) scr_exc_clear();
+    ScrGenSlot *slot = mode == 1 ? &g->ret : &g->in;
+    ScrDyn *(*convert)(void *) = mode == 1 ? return_ref : next_ref;
+    switch (slot->kind) {
+    case SCR_EXC_F64: value = scr_dyn_new_num(slot->f64); break;
+    case SCR_EXC_BOOL: value = scr_dyn_new_bool(slot->b); break;
+    case SCR_EXC_REF: value = convert(slot->payload); break;
+    default: value = scr_dyn_retain(scr_dyn_undefined()); break;
+    }
+    scr_gen_slot_reset(slot);
+  }
+  if (scr_exc_pending()) {
+    scr_dyn_release(value);
+    return NULL;
+  }
+  ScrDyn *result = scr_dyn_new_obj();
+  ScrDyn *kind = scr_dyn_new_num(mode);
+  scr_dyn_obj_set(result, "kind", 4, kind);
+  scr_dyn_obj_set(result, "value", 5, value);
+  /* Object insertion takes ownership of both completion fields. */
+  return result;
+}
+
 /* yield: park the value in OUT and hop back to the resumer. Control
  * returns here at the next resume — possibly with an injected .throw
  * payload or the GENRET sentinel pending (the emitted check handles it). */
@@ -3523,8 +3597,7 @@ static void scr_gen_switch_in(ScrGen *g) {
       } else {
         /* The sync body's exception escapes at the resume site. */
         ScrExcCell *mine = scr_exc_current_cell();
-        *mine = f->exc;
-        memset(&f->exc, 0, sizeof f->exc);
+        scr_gen_exc_move(mine, &f->exc);
       }
     }
     scr_fiber_destroy(f);

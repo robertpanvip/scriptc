@@ -70,7 +70,7 @@ ScrDyn *scr_fs_read_file_sync_dyn(ScrStr *path, const ScrDyn *enc) {
   if (enc->kind == SCR_DYN_UNDEF || enc->kind == SCR_DYN_NULL) {
     ScrBytes *b = scr_fs_read_file_bytes(path);
     if (!b) return NULL;
-    ScrDyn *d = scr_dyn_new_buffer_copy(b);
+    ScrDyn *d = scr_dyn_new_buffer(b);
     scr_bytes_release(b);
     return d;
   }
@@ -111,8 +111,8 @@ ScrDyn *scr_fs_read_file_sync_dyn(ScrStr *path, const ScrDyn *enc) {
   }
 }
 
-void scr_fs_write_file_bytes(ScrStr *path, const ScrBytes *data) {
-  FILE *f = fopen(path->data, "wb");
+static void scr_fs_write_bytes_common(ScrStr *path, const ScrBytes *data, const char *mode) {
+  FILE *f = fopen(path->data, mode);
   if (!f) {
     scr_fs_throw(errno, "open", path);
     return;
@@ -125,6 +125,14 @@ void scr_fs_write_file_bytes(ScrStr *path, const ScrBytes *data) {
     return;
   }
   if (fclose(f) != 0) scr_fs_throw(errno, "close", path);
+}
+
+void scr_fs_write_file_bytes(ScrStr *path, const ScrBytes *data) {
+  scr_fs_write_bytes_common(path, data, "wb");
+}
+
+void scr_fs_append_file_bytes(ScrStr *path, const ScrBytes *data) {
+  scr_fs_write_bytes_common(path, data, "ab");
 }
 
 ScrPromise *scr_fsp_read_file_bytes(ScrStr *path) {
@@ -155,14 +163,94 @@ ScrBytes *scr_crypto_random_bytes(double n) {
 
 bool scr_process_stdout_write_bytes(const ScrBytes *b, const ScrStr *encoding) {
   (void)encoding;
-  scr_stdio_write(1, b->data, b->len * scr_bytes_elem_size(b->elem));
-  return true;
+  return scr_stdio_write(1, b->data, b->len * scr_bytes_elem_size(b->elem));
 }
 
 bool scr_process_stderr_write_bytes(const ScrBytes *b, const ScrStr *encoding) {
   (void)encoding;
-  scr_stdio_write(2, b->data, b->len * scr_bytes_elem_size(b->elem));
-  return true;
+  return scr_stdio_write(2, b->data, b->len * scr_bytes_elem_size(b->elem));
+}
+
+/* Buffer.from over checked-native input. Strings use the existing codec;
+ * bytes, arrays and data-only array-like/Buffer-JSON objects always COPY.
+ * A dyn is not an arbitrary JS object: opaque references and custom input
+ * valueOf hooks keep a loud refusal rather than silently skipping hooks. */
+static ScrBytes *scr_buffer_from_refusal(const char *detail) {
+  char msg[192];
+  int n = snprintf(msg, sizeof msg, "Buffer.from %s is not supported yet", detail);
+  scr_throw_error_msg(SCR_ERR_ERROR, msg, (size_t)n);
+  return NULL;
+}
+
+static ScrBytes *scr_buffer_from_array_like(const ScrDyn *value, double length) {
+  if (!(length > 0)) return scr_bytes_new(SCR_BYTES_U8, 0);
+  if (!isfinite(length) || length >= 9007199254740991.0 || length >= (double)SIZE_MAX) {
+    static const char msg[] = "Array buffer allocation failed";
+    scr_throw_error_msg(SCR_ERR_RANGE, msg, sizeof msg - 1);
+    return NULL;
+  }
+  ScrBytes *out = scr_bytes_new(SCR_BYTES_U8, floor(length));
+  if (!out) return NULL;
+  for (size_t i = 0; i < out->len; i++) {
+    ScrDyn *item;
+    if (value->kind == SCR_DYN_ARR) {
+      item = i < value->v.arr.len ? value->v.arr.items[i] : NULL;
+    } else {
+      char key[32];
+      int n = snprintf(key, sizeof key, "%zu", i);
+      item = scr_dyn_obj_get(value, key, (size_t)n);
+    }
+    /* Coercion may run user code that removes or replaces this element. */
+    item = scr_dyn_retain(item ? item : scr_dyn_undefined());
+    double number;
+    bool ok = scr_dyn_number_coerce_js(item, &number);
+    scr_dyn_release(item);
+    if (!ok) {
+      scr_bytes_release(out);
+      return NULL;
+    }
+    out->data[i] = (uint8_t)scr_to_uint32(number);
+  }
+  return out;
+}
+
+ScrBytes *scr_buffer_from_dyn(const ScrDyn *value, const ScrStr *encoding) {
+  if (value->kind == SCR_DYN_STR) return scr_bytes_from_str(value->v.str, encoding);
+  if (value->kind == SCR_DYN_BYTES) return scr_bytes_convert(SCR_BYTES_U8, value->v.bytes);
+  if (value->kind == SCR_DYN_ARR) {
+    return scr_buffer_from_array_like(value, (double)value->v.arr.len);
+  }
+  if (value->kind == SCR_DYN_OBJ) {
+    const ScrDyn *hook = scr_dyn_obj_get(value, "valueOf", 7);
+    if (hook && scr_dyn_truthy(hook)) {
+      return scr_buffer_from_refusal("with a custom valueOf");
+    }
+    const ScrDyn *length = scr_dyn_obj_get(value, "length", 6);
+    if (length && length->kind != SCR_DYN_UNDEF) {
+      return scr_buffer_from_array_like(value, length->kind == SCR_DYN_NUM ? length->v.num : 0);
+    }
+    const ScrDyn *type = scr_dyn_obj_get(value, "type", 4);
+    const ScrDyn *data = scr_dyn_obj_get(value, "data", 4);
+    if (type && type->kind == SCR_DYN_STR && type->v.str->len == 6 &&
+        memcmp(type->v.str->data, "Buffer", 6) == 0 && data && data->kind == SCR_DYN_ARR) {
+      /* Element coercion may mutate the parent and replace `data`. */
+      ScrDyn *held = scr_dyn_retain((ScrDyn *)data);
+      ScrBytes *out = scr_buffer_from_array_like(held, (double)held->v.arr.len);
+      scr_dyn_release(held);
+      return out;
+    }
+  }
+  if (value->kind == SCR_DYN_TYPED_REF || value->kind == SCR_DYN_HANDLE || value->kind == SCR_DYN_JSVAL) {
+    return scr_buffer_from_refusal("with an opaque reference");
+  }
+  char detail[64];
+  const char *received = scr_dyn_specific_type(value, detail, sizeof detail);
+  char msg[256];
+  int n = snprintf(msg, sizeof msg,
+      "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received %s",
+      received);
+  scr_throw_error_msg_code(SCR_ERR_TYPE, msg, (size_t)n, "ERR_INVALID_ARG_TYPE");
+  return NULL;
 }
 
 /* ── the checked-dynamic Buffer compare/equals validators ──────────────
@@ -173,7 +261,7 @@ bool scr_process_stderr_write_bytes(const ScrBytes *b, const ScrStr *encoding) {
 
 /* A bytes payload or the API's own ERR_INVALID_ARG_TYPE (borrowed). */
 static ScrBytes *scr_bytes_chk_u8(const ScrDyn *d, const char *argname) {
-  if (d->kind != SCR_DYN_BYTES) {
+  if (!scr_dyn_bytes_is(d, SCR_BYTES_U8)) {
     scr_dyn_arg_type_fail(argname, "an instance of Buffer or Uint8Array", d);
     return NULL;
   }
@@ -286,7 +374,7 @@ static bool scr_fs_cb_chk(const ScrDyn *cb, const char *name) {
  * these ladders — the checked-dynamic tree has no URL kind here, and Node would accept
  * only file: URLs anyway). */
 static bool scr_fs_path_chk(const ScrDyn *p, const char *name) {
-  if (p->kind == SCR_DYN_STR || p->kind == SCR_DYN_BYTES) return true;
+  if (p->kind == SCR_DYN_STR || scr_dyn_bytes_is(p, SCR_BYTES_U8)) return true;
   scr_dyn_arg_type_fail(name, "of type string or an instance of Buffer or URL", p);
   return false;
 }
@@ -366,7 +454,7 @@ static void scr_fs_exists_fire(ScrClosure *self) {
     ScrStr *p = scr_str_retain(path->v.str);
     ans = scr_fs_exists(p);
     scr_str_release(p);
-  } else if (path->kind == SCR_DYN_BYTES) {
+  } else if (scr_dyn_bytes_is(path, SCR_BYTES_U8)) {
     ScrStr *p = scr_str_new((const char *)path->v.bytes->data, path->v.bytes->len);
     ans = scr_fs_exists(p);
     scr_str_release(p);
@@ -382,7 +470,7 @@ static void scr_fs_exists_fire(ScrClosure *self) {
 
 ScrDyn *scr_fs_exists_async(const ScrDyn *path, const ScrDyn *cb) {
   if (!scr_fs_cb_chk(cb, "cb")) return NULL;
-  if (path->kind != SCR_DYN_STR && path->kind != SCR_DYN_BYTES) {
+  if (path->kind != SCR_DYN_STR && !scr_dyn_bytes_is(path, SCR_BYTES_U8)) {
     /* Node's wart, kept exactly: a path getValidatedPath rejects answers
      * false through the callback SYNCHRONOUSLY (`return callback(false)`
      * in lib/fs.js exists). */
@@ -592,7 +680,7 @@ void scr_fs_read_chk(const ScrDyn *fd, const ScrDyn *buffer, const ScrDyn *offse
     scr_dyn_arg_type_fail("fd", "of type number", fd);
     return;
   }
-  double buflen = (double)buffer->v.bytes->len;
+  double buflen = scr_bytes_byte_len(buffer->v.bytes);
   if (!scr_fs_dyn_absent(offset)) {
     /* validateInteger's MAX_SAFE range first, the buffer bound second —
      * Node renders each with its own max. */

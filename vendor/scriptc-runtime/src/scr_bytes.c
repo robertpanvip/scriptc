@@ -26,7 +26,36 @@ static void scr_bytes_oom(void) {
 }
 
 size_t scr_bytes_elem_size(ScrBytesElem elem) {
-  return elem == SCR_BYTES_U8 ? 1 : elem == SCR_BYTES_F64 ? 8 : 4;
+  switch (elem) {
+    case SCR_BYTES_U8: case SCR_BYTES_U8C: case SCR_BYTES_I8: return 1;
+    case SCR_BYTES_U16: case SCR_BYTES_I16: return 2;
+    case SCR_BYTES_U32: case SCR_BYTES_I32: case SCR_BYTES_F32: return 4;
+    case SCR_BYTES_F64: return 8;
+  }
+  scr_trap("scriptc: invalid typed array element kind\n");
+}
+
+const char *scr_bytes_elem_name(ScrBytesElem elem) {
+  switch (elem) {
+    case SCR_BYTES_U8: return "Uint8Array";
+    case SCR_BYTES_U8C: return "Uint8ClampedArray";
+    case SCR_BYTES_I8: return "Int8Array";
+    case SCR_BYTES_U16: return "Uint16Array";
+    case SCR_BYTES_I16: return "Int16Array";
+    case SCR_BYTES_U32: return "Uint32Array";
+    case SCR_BYTES_I32: return "Int32Array";
+    case SCR_BYTES_F32: return "Float32Array";
+    case SCR_BYTES_F64: return "Float64Array";
+  }
+  scr_trap("scriptc: invalid typed array element kind\n");
+}
+
+double scr_bytes_to_u8_clamp(double value) {
+  if (!(value > 0)) return 0;
+  if (value >= 255) return 255;
+  double lower = floor(value);
+  double fraction = value - lower;
+  return fraction > 0.5 || (fraction == 0.5 && ((unsigned)lower & 1)) ? lower + 1 : lower;
 }
 
 /* ── lifecycle ─────────────────────────────────────────────────────────── */
@@ -40,9 +69,24 @@ static ScrBytes *scr_bytes_alloc(ScrBytesElem elem, size_t len) {
   b->data = calloc(len ? len : 1, scr_bytes_elem_size(elem));
   if (!b->data) scr_bytes_oom();
   b->backing = NULL;
+  b->is_buffer = false;
+  b->external = false;
 #ifdef SCR_RC_AUDIT
   scr_live_bytes++;
 #endif
+  return b;
+}
+
+ScrBytes *scr_bytes_from_external(void *data, size_t length) {
+  ScrBytes *b = scr_bytes_alloc(SCR_BYTES_U8, 0);
+  /* Keep the owned empty allocation for NULL/zero-length views: existing
+   * view operations may add zero to the data pointer. */
+  if (data) {
+    free(b->data);
+    b->data = data;
+    b->external = true;
+  }
+  b->len = length;
   return b;
 }
 
@@ -78,12 +122,30 @@ ScrBytes *scr_bytes_copy(const ScrBytes *src) {
   return b;
 }
 
+ScrBytes *scr_bytes_raw_view(ScrBytes *bytes) {
+  if (bytes->elem == SCR_BYTES_U8) return scr_bytes_retain(bytes);
+  return scr_dataview_new(bytes, scr_bytes_byte_offset(bytes), true, scr_bytes_byte_len(bytes));
+}
+
+ScrBytes *scr_bytes_as_buffer(ScrBytes *bytes) {
+  bytes->is_buffer = true;
+  return scr_bytes_retain(bytes);
+}
+
+ScrBytes *scr_bytes_convert(ScrBytesElem elem, const ScrBytes *src) {
+  if (elem == src->elem) return scr_bytes_copy(src);
+  ScrBytes *out = scr_bytes_alloc(elem, src->len);
+  for (size_t i = 0; i < src->len; i++) scr_bytes_set(out, (double)i, scr_bytes_get(src, (double)i));
+  return out;
+}
+
 void scr_bytes_release(ScrBytes *b) {
   if (!b || b->rc == SIZE_MAX) return; /* NULL: an uninitialized `let` local */
   if (--b->rc == 0) {
+    scr_weak_dispose(b);
     if (b->backing) {
       scr_bytes_release(b->backing); /* a view: data points into the owner */
-    } else {
+    } else if (!b->external) {
       free(b->data);
     }
 #ifdef SCR_RC_AUDIT
@@ -110,9 +172,8 @@ double scr_bytes_byte_len(const ScrBytes *b) {
 }
 
 /* ── element access ────────────────────────────────────────────────────
- * JS reads undefined and IGNORES writes out of bounds on typed arrays;
- * both are unrepresentable here, so any invalid index traps — the array
- * runtime's exact discipline (SEMANTICS.md). */
+ * Invalid writes are ignored. Typed numeric reads cannot represent
+ * undefined, so invalid reads trap; checked reads return undefined. */
 
 static size_t scr_bytes_check_index(const ScrBytes *b, double i) {
   if (!(i >= 0) || i != trunc(i) || i >= (double)b->len) {
@@ -137,8 +198,23 @@ static uint32_t scr_bytes_to_u32(double v) {
 double scr_bytes_get(const ScrBytes *b, double i) {
   size_t idx = scr_bytes_check_index(b, i);
   switch (b->elem) {
-    case SCR_BYTES_U8:
+    case SCR_BYTES_U8: case SCR_BYTES_U8C:
       return (double)b->data[idx];
+    case SCR_BYTES_I8: {
+      int8_t v;
+      memcpy(&v, b->data + idx, 1);
+      return (double)v;
+    }
+    case SCR_BYTES_U16: {
+      uint16_t v;
+      memcpy(&v, b->data + idx * 2, 2);
+      return (double)v;
+    }
+    case SCR_BYTES_I16: {
+      int16_t v;
+      memcpy(&v, b->data + idx * 2, 2);
+      return (double)v;
+    }
     case SCR_BYTES_U32: {
       uint32_t v;
       memcpy(&v, b->data + idx * 4, 4);
@@ -164,11 +240,20 @@ double scr_bytes_get(const ScrBytes *b, double i) {
 }
 
 void scr_bytes_set(ScrBytes *b, double i, double v) {
-  size_t idx = scr_bytes_check_index(b, i);
+  if (!(i >= 0) || i != trunc(i) || i >= (double)b->len) return;
+  size_t idx = (size_t)i;
   switch (b->elem) {
-    case SCR_BYTES_U8:
+    case SCR_BYTES_U8: case SCR_BYTES_I8:
       b->data[idx] = (uint8_t)scr_bytes_to_u32(v);
       break;
+    case SCR_BYTES_U8C:
+      b->data[idx] = (uint8_t)scr_bytes_to_u8_clamp(v);
+      break;
+    case SCR_BYTES_U16: case SCR_BYTES_I16: {
+      uint16_t u = (uint16_t)scr_bytes_to_u32(v);
+      memcpy(b->data + idx * 2, &u, 2);
+      break;
+    }
     case SCR_BYTES_U32: {
       uint32_t u = scr_bytes_to_u32(v);
       memcpy(b->data + idx * 4, &u, 4);
@@ -215,6 +300,17 @@ ScrBytes *scr_bytes_slice(const ScrBytes *b, double start, double end) {
   return out;
 }
 
+ScrBytes *scr_bytes_copy_within(ScrBytes *b, double target, double start, double end) {
+  size_t t = scr_bytes_rel_index(target, b->len);
+  size_t s = scr_bytes_rel_index(start, b->len);
+  size_t e = scr_bytes_rel_index(end, b->len);
+  size_t count = e > s ? e - s : 0;
+  if (count > b->len - t) count = b->len - t;
+  size_t width = scr_bytes_elem_size(b->elem);
+  memmove(b->data + t * width, b->data + s * width, count * width);
+  return scr_bytes_retain(b);
+}
+
 /* TypedArray.prototype.fill on non-u8 receivers: per-ELEMENT fill with
  * the element write's JS-exact coercion (ToUint32/ToInt32 wrap, f32
  * rounding), slice-clamped relative indices; answers the receiver +1
@@ -244,6 +340,8 @@ ScrBytes *scr_bytes_subarray(ScrBytes *b, double start, double end) {
   v->elem = b->elem;
   v->data = b->data + s * scr_bytes_elem_size(b->elem);
   v->backing = scr_bytes_retain(owner);
+  v->is_buffer = b->is_buffer;
+  v->external = false;
 #ifdef SCR_RC_AUDIT
   scr_live_bytes++;
 #endif
@@ -257,8 +355,158 @@ void scr_bytes_set_from(ScrBytes *dst, const ScrBytes *src, double offset) {
     scr_throw_error_msg(SCR_ERR_RANGE, msg, sizeof msg - 1);
     return;
   }
+  if (dst->elem != src->elem) {
+    // Snapshot before writing: views can overlap even with distinct kinds.
+    ScrBytes *copy = scr_bytes_convert(dst->elem, src);
+    memcpy(dst->data + (size_t)t * scr_bytes_elem_size(dst->elem), copy->data,
+           copy->len * scr_bytes_elem_size(copy->elem));
+    scr_bytes_release(copy);
+    return;
+  }
   size_t esize = scr_bytes_elem_size(dst->elem);
   memmove(dst->data + (size_t)t * esize, src->data, src->len * esize);
+}
+
+/* Checked-native array-like sources. Runtime objects with an unsupported
+ * prototype/iterator keep a catchable refusal instead of losing hooks. */
+static bool scr_bytes_source_refusal(void) {
+  static const char msg[] = "typed-array conversion of an opaque reference is not supported yet";
+  scr_throw_error_msg(SCR_ERR_ERROR, msg, sizeof msg - 1);
+  return false;
+}
+
+static bool scr_bytes_source_length(const ScrDyn *value, double *length) {
+  switch (value->kind) {
+  case SCR_DYN_ARR: *length = (double)value->v.arr.len; return true;
+  case SCR_DYN_STR: *length = scr_str_utf16_len(value->v.str); return true;
+  case SCR_DYN_OBJ: {
+    ScrDyn *v = scr_dyn_obj_read(value, "length", 6);
+    if (!v) return false;
+    double n;
+    bool ok = scr_dyn_number_coerce_js(v, &n);
+    scr_dyn_release(v);
+    if (!ok) return false;
+    *length = !(n > 0) ? 0 : fmin(floor(n), 9007199254740991.0);
+    return true;
+  }
+  case SCR_DYN_NULL:
+  case SCR_DYN_UNDEF: {
+    static const char msg[] = "Cannot convert undefined or null to object";
+    scr_throw_error_msg(SCR_ERR_TYPE, msg, sizeof msg - 1);
+    return false;
+  }
+  case SCR_DYN_NUM:
+  case SCR_DYN_BOOL: *length = 0; return true;
+  default: return scr_bytes_source_refusal();
+  }
+}
+
+static ScrDyn *scr_bytes_source_at(const ScrDyn *value, size_t i) {
+  if (value->kind == SCR_DYN_ARR) return scr_dyn_arr_at(value, (double)i);
+  if (value->kind == SCR_DYN_STR) {
+    ScrStr *s = scr_str_char_at(value->v.str, (double)i);
+    ScrDyn *out = scr_dyn_new_str(s);
+    scr_str_release(s);
+    return out;
+  }
+  char key[32];
+  int n = snprintf(key, sizeof key, "%zu", i);
+  return scr_dyn_obj_read(value, key, (size_t)n);
+}
+
+static bool scr_bytes_copy_array_like(ScrBytes *dst, const ScrDyn *src, size_t offset, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    ScrDyn *value = scr_bytes_source_at(src, i);
+    if (!value) return false;
+    double number;
+    bool ok = scr_dyn_number_coerce_js(value, &number);
+    scr_dyn_release(value);
+    if (!ok) return false;
+    scr_bytes_set(dst, (double)(offset + i), number);
+  }
+  return true;
+}
+
+ScrBytes *scr_bytes_from_dyn(ScrBytesElem elem, const ScrDyn *value, bool from) {
+  if (from && (value->kind == SCR_DYN_NULL || value->kind == SCR_DYN_UNDEF)) {
+    const char *msg = value->kind == SCR_DYN_NULL
+        ? "object null is not iterable (cannot read property Symbol(Symbol.iterator))"
+        : "undefined is not iterable (cannot read property Symbol(Symbol.iterator))";
+    scr_throw_error_msg(SCR_ERR_TYPE, msg, strlen(msg));
+    return NULL;
+  }
+  if (value->kind == SCR_DYN_TYPED_REF) {
+    ScrDyn *view = scr_dyn_typed_ref_materialize(value);
+    // Class snapshots omit prototypes, so do not interpret them as plain objects.
+    ScrBytes *out = NULL;
+    if (view->kind == SCR_DYN_BYTES || view->kind == SCR_DYN_ARR) out = scr_bytes_from_dyn(elem, view, from);
+    else scr_bytes_source_refusal();
+    scr_dyn_release(view);
+    return out;
+  }
+  if (value->kind == SCR_DYN_BYTES) return scr_bytes_convert(elem, value->v.bytes);
+  if (!from && scr_array_buffer_is(value)) return scr_array_buffer_view(elem, value, scr_dyn_undefined(), scr_dyn_undefined());
+  if (!from && (value->kind == SCR_DYN_NUM || value->kind == SCR_DYN_BOOL ||
+                value->kind == SCR_DYN_STR || value->kind == SCR_DYN_NULL || value->kind == SCR_DYN_UNDEF)) {
+    double number;
+    if (!scr_dyn_number_coerce_js(value, &number)) return NULL;
+    return scr_bytes_new(elem, number);
+  }
+  // Constructors drain array iterators before element coercion. Node's .from
+  // fast path reads ordinary array elements during conversion instead. Strings
+  // supplied to .from iterate by code point (set reads UTF-16 code units).
+  if ((!from && value->kind == SCR_DYN_ARR) || (from && value->kind == SCR_DYN_STR)) {
+    ScrDyn *items = scr_dyn_iter_pack(value, NULL);
+    if (!items) return NULL;
+    ScrBytes *out = scr_bytes_new(elem, (double)items->v.arr.len);
+    if (out && !scr_bytes_copy_array_like(out, items, 0, out->len)) {
+      scr_bytes_release(out);
+      out = NULL;
+    }
+    scr_dyn_release(items);
+    return out;
+  }
+  double length;
+  if (!scr_bytes_source_length(value, &length)) return NULL;
+  if (length >= 9007199254740991.0 || length >= (double)(SIZE_MAX / scr_bytes_elem_size(elem))) {
+    static const char msg[] = "Array buffer allocation failed";
+    scr_throw_error_msg(SCR_ERR_RANGE, msg, sizeof msg - 1);
+    return NULL;
+  }
+  ScrBytes *out = scr_bytes_new(elem, length);
+  if (out && !scr_bytes_copy_array_like(out, value, 0, out->len)) {
+    scr_bytes_release(out);
+    return NULL;
+  }
+  return out;
+}
+
+void scr_bytes_set_from_dyn(ScrBytes *dst, const ScrDyn *src, double offset) {
+  double t = isnan(offset) ? 0 : trunc(offset);
+  if (!(t >= 0)) {
+    static const char msg[] = "offset is out of bounds";
+    scr_throw_error_msg(SCR_ERR_RANGE, msg, sizeof msg - 1);
+    return;
+  }
+  if (src->kind == SCR_DYN_TYPED_REF) {
+    ScrDyn *view = scr_dyn_typed_ref_materialize(src);
+    if (view->kind == SCR_DYN_BYTES || view->kind == SCR_DYN_ARR) scr_bytes_set_from_dyn(dst, view, t);
+    else scr_bytes_source_refusal();
+    scr_dyn_release(view);
+    return;
+  }
+  if (src->kind == SCR_DYN_BYTES) {
+    scr_bytes_set_from(dst, src->v.bytes, t);
+    return;
+  }
+  double length;
+  if (!scr_bytes_source_length(src, &length)) return;
+  if (t > (double)dst->len || length > (double)dst->len - t) {
+    static const char msg[] = "offset is out of bounds";
+    scr_throw_error_msg(SCR_ERR_RANGE, msg, sizeof msg - 1);
+    return;
+  }
+  scr_bytes_copy_array_like(dst, src, (size_t)t, (size_t)length);
 }
 
 /* ── DataView (the ONE view kind — see the header contract) ────────────── */
@@ -305,10 +553,35 @@ ScrBytes *scr_dataview_new(ScrBytes *src, double byte_off, bool has_len, double 
   v->elem = SCR_BYTES_U8;
   v->data = owner->data + (size_t)off;
   v->backing = scr_bytes_retain(owner);
+  v->is_buffer = false;
+  v->external = false;
 #ifdef SCR_RC_AUDIT
   scr_live_bytes++;
 #endif
   return v;
+}
+
+ScrBytes *scr_bytes_buffer_view(ScrBytes *src, ScrBytesElem elem,
+                               double offset, bool has_len, double length) {
+  ScrBytes *owner = src->backing ? src->backing : src;
+  size_t width = scr_bytes_elem_size(elem);
+  double available = scr_bytes_byte_len(owner);
+  double off = isnan(offset) ? 0 : trunc(offset);
+  double count = isnan(length) ? 0 : trunc(length);
+  if (off < 0 || off > 9007199254740991.0 || off > available ||
+      fmod(off, (double)width) != 0 ||
+      (has_len && (count < 0 || count > 9007199254740991.0 || count > (available - off) / (double)width)) ||
+      (!has_len && fmod(available - off, (double)width) != 0)) {
+    static const char msg[] = "Invalid typed array buffer range";
+    scr_throw_error_msg(SCR_ERR_RANGE, msg, sizeof msg - 1);
+    return NULL;
+  }
+  ScrBytes *view = scr_dataview_new(owner, off, true,
+      has_len ? count * (double)width : available - off);
+  if (!view) return NULL;
+  view->elem = elem;
+  view->len /= width;
+  return view;
 }
 
 static size_t scr_dataview_get_size(ScrDataViewGet kind) {
@@ -1383,6 +1656,8 @@ static ScrStr *scr_bytes_decode_utf16le(const uint8_t *in, size_t n) {
 ScrStr *scr_bytes_to_str(const ScrBytes *b, const ScrStr *enc) {
   const uint8_t *in = b->data;
   size_t n = b->len; /* u8: len == byte length */
+  /* Implicit native string/number coercions have no encoding argument. */
+  if (!enc) return scr_bytes_decode_utf8(in, n);
   if (scr_enc_is(enc, "hex")) {
     char *out = malloc(n * 2 + 1);
     if (!out) scr_bytes_oom();
@@ -1595,33 +1870,9 @@ ScrBytes *scr_bytes_from_str(const ScrStr *s, const ScrStr *enc) {
 ScrBytes *scr_bytes_from_arr(ScrBytesElem elem, const ScrArr *arr) {
   ScrBytes *b = scr_bytes_alloc(elem, arr->len);
   for (size_t i = 0; i < arr->len; i++) {
-    /* Buffer.from(Array) applies Number/ToUint* to each value. A hole is
-     * read as undefined and therefore contributes zero; it must never read
-     * an uninitialized dense slot or assume sparse storage is allocated. */
-    double v = scr_arr_has(arr, (double)i) ? scr_arr_get_f64((ScrArr *)arr, (double)i) : 0;
-    switch (elem) {
-      case SCR_BYTES_U8:
-        b->data[i] = (uint8_t)scr_bytes_to_u32(v);
-        break;
-      case SCR_BYTES_U32: {
-        uint32_t u = scr_bytes_to_u32(v);
-        memcpy(b->data + i * 4, &u, 4);
-        break;
-      }
-      case SCR_BYTES_F32: {
-        float f = (float)v;
-        memcpy(b->data + i * 4, &f, 4);
-        break;
-      }
-      case SCR_BYTES_F64:
-        memcpy(b->data + i * 8, &v, 8);
-        break;
-      case SCR_BYTES_I32: {
-        uint32_t u = scr_bytes_to_u32(v);
-        memcpy(b->data + i * 4, &u, 4); /* same residue reinterpreted */
-        break;
-      }
-    }
+    // Iteration reads holes as undefined: floating arrays store NaN and
+    // integer arrays store zero through their normal element conversion.
+    scr_bytes_set(b, (double)i, scr_arr_get_number(arr, (double)i));
   }
   return b;
 }
@@ -2249,4 +2500,19 @@ bool scr_dataview_write_u64_raw(ScrBytes *b, double offset, bool le, uint64_t va
   uint8_t *p = b->data + (size_t)off;
   for (size_t i = 0; i < 8; i++) p[le ? i : 7 - i] = (uint8_t)(value >> (8 * i));
   return true;
+}
+
+ScrArr *scr_bytes_to_arr(const ScrBytes *b) {
+  ScrArr *out = scr_arr_new(SCR_ELEM_F64, b->len ? b->len : 1);
+  for (size_t i = 0; i < b->len; i++) {
+    scr_arr_push_f64(out, scr_bytes_get(b, (double)i));
+  }
+  return out;
+}
+
+ScrStr *scr_bytes_join(const ScrBytes *b, const ScrStr *separator) {
+  ScrArr *values = scr_bytes_to_arr(b);
+  ScrStr *out = scr_arr_join(values, (ScrStr *)separator);
+  scr_arr_release(values);
+  return out;
 }

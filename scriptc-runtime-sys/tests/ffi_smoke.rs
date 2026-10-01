@@ -1,6 +1,6 @@
 //! FFI smoke test — 成功判断：Rust 中可以导入、调用 FFI 不报错。
 //!
-//! 验证链：link scriptc-runtime.lib → 调 scr_init / scr_runtime_abi_v3 /
+//! 验证链：link scriptc-runtime.lib → 调 scr_init / scr_runtime_abi_v5 /
 //! scr_str_new / scr_str_retain / scr_str_release → 观察引用计数与字节。
 
 use scriptc_runtime_sys::*;
@@ -9,7 +9,7 @@ use scriptc_runtime_sys::*;
 fn ffi_links_and_calls() {
     // 1. ABI 版本符号存在且可调用（mismatched runtime link 在这里直接失败）
     unsafe {
-        scr_runtime_abi_v3();
+        scr_runtime_abi_v5();
     }
 
     // 2. init（私有 stdout formatter / flush-at-exit 注册）

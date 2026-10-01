@@ -168,12 +168,11 @@ void scr_box_set_ref(ScrBox *b, void *v) {
 static void scr_closure_trace(void *o, ScrTraceVisit visit, void *ctx) {
   ScrClosure *c = (ScrClosure *)o;
   for (size_t i = 0; i < c->ncaps; i++) visit(c->caps[i], ctx);
+  visit(c->props, ctx);
 }
 
 static void scr_closure_gcfree(void *o) {
-  /* Caps are all boxes — all traced. The own-property table (props) is
-   * an untraced box: released here like any external owned edge. */
-  scr_box_release(((ScrClosure *)o)->props);
+  /* Captures and the own-property box are all traced. */
 #ifdef SCR_RC_AUDIT
   scr_live_closures--;
 #endif
@@ -187,6 +186,7 @@ ScrClosure *scr_closure_new(void *fn, size_t ncaps) {
   c->fn = fn;
   c->ncaps = ncaps;
   c->props = NULL; /* lazily allocated by Object.defineProperties */
+  c->function_kind = 0;
 #ifdef SCR_RC_AUDIT
   scr_live_closures++;
 #endif

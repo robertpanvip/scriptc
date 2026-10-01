@@ -33,6 +33,64 @@ uint32_t scr_to_uint32(double d) {
   return (uint32_t)t;
 }
 
+/* ── bitwise operators ─────────────────────────────────────────────────
+ * JS-exact (scr_runtime.h has the contract). ToUint32 is the primitive —
+ * ToInt32 and the Int32-typed results are the same 32 bits reinterpreted
+ * as two's complement, spelled portably (no implementation-defined
+ * narrowing casts, no UB shifts of signed values).
+ */
+
+/* The 32 bits as a SIGNED (Int32) JS number. */
+static double scr_bits_as_int32(uint32_t u) {
+  return u >= UINT32_C(0x80000000)
+             ? (double)(int32_t)(u - UINT32_C(0x80000000)) + (double)INT32_MIN
+             : (double)u;
+}
+
+double scr_bit_and(double a, double b) {
+  return scr_bits_as_int32(scr_to_uint32(a) & scr_to_uint32(b));
+}
+
+double scr_bit_or(double a, double b) {
+  return scr_bits_as_int32(scr_to_uint32(a) | scr_to_uint32(b));
+}
+
+double scr_bit_xor(double a, double b) {
+  return scr_bits_as_int32(scr_to_uint32(a) ^ scr_to_uint32(b));
+}
+
+double scr_bit_shl(double a, double b) {
+  return scr_bits_as_int32(scr_to_uint32(a) << (scr_to_uint32(b) & 31u));
+}
+
+double scr_bit_shr(double a, double b) {
+  uint32_t u = scr_to_uint32(a);
+  uint32_t s = scr_to_uint32(b) & 31u;
+  uint32_t r = u >> s;
+  if ((u & UINT32_C(0x80000000)) != 0 && s != 0) {
+    r |= ~(UINT32_C(0xffffffff) >> s); /* arithmetic shift: sign-fill */
+  }
+  return scr_bits_as_int32(r);
+}
+
+double scr_bit_ushr(double a, double b) {
+  /* The one Uint32-typed result: (-1 >>> 0) === 4294967295. */
+  return (double)(scr_to_uint32(a) >> (scr_to_uint32(b) & 31u));
+}
+
+double scr_bit_not(double a) {
+  return scr_bits_as_int32(~scr_to_uint32(a));
+}
+
+/* SameValue on doubles is shared by Object.is and checked-value property
+ * descriptors. Keep it in the numeric core so JSON values do not require
+ * the optional standard-library module just to compare two numbers. */
+bool scr_num_same_value(double a, double b) {
+  if (a != a) return b != b;
+  if (a == 0 && b == 0) return signbit(a) == signbit(b);
+  return a == b;
+}
+
 /* The Ryū digit core, shared by the ECMA placement below and the Intl
  * en-US number formatter (scr_lib.c): the shortest round-tripping digit
  * string for a positive finite double — value = 0.digits × 10^n with no

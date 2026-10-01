@@ -737,6 +737,7 @@ ScrStr *scr_insp_key(ScrStr *k) {
  * synthesized helper. Same engine, same defaults. dyn-boxed bytes render
  * in the checked-dynamic tree's documented Uint8Array identity (SEMANTICS.md). */
 ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
+  if (d->kind == SCR_DYN_PROXY) return scr_insp_dyn(d->v.proxy.target, recurse, depth);
   switch (d->kind) {
     case SCR_DYN_NULL:
       return scr_str_new("null", 4);
@@ -744,6 +745,10 @@ ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
       return scr_str_new("undefined", 9);
     case SCR_DYN_BOOL:
       return d->v.b ? scr_str_new("true", 4) : scr_str_new("false", 5);
+    case SCR_DYN_BIGINT:
+      return scr_bigint_inspect(d->v.bigint);
+    case SCR_DYN_SYMBOL:
+      return d->v.symbol.render(d->v.symbol.value);
     case SCR_DYN_NUM:
       return scr_insp_f64(d->v.num);
     case SCR_DYN_STR:
@@ -871,18 +876,22 @@ ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
         return scr_insp_buffer(b);
       }
       char prefix[48];
-      int pn = snprintf(prefix, sizeof prefix, "Uint8Array(%zu) [", b->len);
+      int pn = snprintf(prefix, sizeof prefix, "%s(%zu) [", scr_bytes_elem_name(b->elem), b->len);
       if (b->len == 0) {
         InspBuf out = {0};
         ib_bytes(&out, prefix, (size_t)pn);
         ib_char(&out, ']');
         return ib_take(&out);
       }
-      if (recurse > depth) return scr_str_new("[Uint8Array]", 12);
+      if (recurse > depth) {
+        char tag[32];
+        int n = snprintf(tag, sizeof tag, "[%s]", scr_bytes_elem_name(b->elem));
+        return scr_str_new(tag, (size_t)n);
+      }
       scr_insp_begin(recurse + 1);
       size_t shown = b->len < 100 ? b->len : 100;
       for (size_t i = 0; i < shown; i++) {
-        ScrStr *s = scr_insp_f64((double)((const unsigned char *)b->data)[i]);
+        ScrStr *s = scr_insp_f64(scr_bytes_get(b, (double)i));
         scr_insp_entry(s, true);
         scr_str_release(s);
       }

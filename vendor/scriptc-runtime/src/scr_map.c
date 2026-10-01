@@ -92,22 +92,37 @@ static uint64_t scr_map_identity(const ScrMap *m, uint64_t key) {
  * crossings; numbers retain SameValueZero and strings compare by content. */
 static uint64_t scr_map_hash_dyn(const ScrDyn *d) {
   uint64_t value;
+  uint64_t kind = (uint64_t)d->kind;
   switch (d->kind) {
   case SCR_DYN_UNDEF:
   case SCR_DYN_NULL: value = 0; break;
   case SCR_DYN_BOOL: value = d->v.b; break;
   case SCR_DYN_NUM: value = scr_map_f64_bits(d->v.num); break;
+  case SCR_DYN_BIGINT: {
+    ScrStr *text = scr_bigint_to_string(d->v.bigint, 10);
+    uint64_t hash = scr_map_hash_str(text);
+    scr_str_release(text);
+    return hash;
+  }
   case SCR_DYN_STR: return scr_map_hash_str(d->v.str);
-  case SCR_DYN_FUNC: value = scr_map_slot_from_ptr(d->v.fn.clo); break;
+  case SCR_DYN_SYMBOL: value = scr_map_slot_from_ptr(d->v.symbol.value); break;
+  case SCR_DYN_FUNC: value = scr_map_slot_from_ptr(d->v.fn.class_obj ? (void *)d->v.fn.class_obj : (void *)d->v.fn.clo); break;
+  case SCR_DYN_BYTES: value = scr_map_slot_from_ptr(d->v.bytes); break;
   case SCR_DYN_HANDLE: value = scr_map_slot_from_ptr(d->v.handle.ptr); break;
   case SCR_DYN_PROMISE: value = scr_map_slot_from_ptr(d->v.promise); break;
-  case SCR_DYN_TYPED_REF: value = scr_map_slot_from_ptr(d->v.typed_ref.ptr); break;
+  case SCR_DYN_OBJ: value = scr_map_slot_from_ptr(d->v.obj.source_identity ? d->v.obj.source_identity : (void *)d); break;
+  case SCR_DYN_TYPED_REF:
+    value = scr_map_slot_from_ptr(d->v.typed_ref.ptr);
+    // A materialized record and its capsule compare equal; their hashes
+    // must also agree when a key crosses the boundary in either form.
+    kind = SCR_DYN_OBJ;
+    break;
   /* The optional island bridge exposes equality but no hash. A shared
    * bucket still preserves correctness without adding an engine dependency. */
   case SCR_DYN_JSVAL: value = 0; break;
   default: value = scr_map_slot_from_ptr((void *)d); break;
   }
-  return scr_map_fnv1a((const unsigned char *)&value, sizeof value) ^ (uint64_t)d->kind;
+  return scr_map_fnv1a((const unsigned char *)&value, sizeof value) ^ kind;
 }
 
 static bool scr_map_dyn_eq(const ScrDyn *a, const ScrDyn *b) {

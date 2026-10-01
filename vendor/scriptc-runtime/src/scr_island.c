@@ -417,12 +417,14 @@ static const char isl_prelude[] =
     /* ISL_H_ITER: GetIterator alone (the for-of head over an island
      * value) — the same not-iterable TypeError text as iterN; the static
      * side drives next() through callMethod. */
-    "v=>{if(v===undefined||v===null||typeof v[Symbol.iterator]!==\"function\"){"
+    "(v,s,a)=>{const m=v==null?undefined:v[Symbol.iterator];"
+    "if(a&&m==null)return Array.from(v)[Symbol.iterator]();"
+    "if(typeof m!==\"function\"){if(s)throw new TypeError(s);"
     "let d;if(v===undefined)d=\"undefined\";else if(v===null)d=\"object null\";"
     "else if(typeof v===\"number\")d=\"number \"+v;else if(typeof v===\"boolean\")d=\"boolean \"+v;"
     "else if(typeof v===\"function\")d=\"function\";else d=\"object\";"
     "throw new TypeError(d+\" is not iterable (cannot read property Symbol(Symbol.iterator))\")}"
-    "return v[Symbol.iterator]()},"
+    "return m.call(v)},"
     /* ISL_H_CALLSPREAD: spread application (`f(...pre, ...s)` — the
      * rest-forwarding idiom's call): REAL spread syntax, so iterator
      * protocols are the engine's own; the guards front-run V8's exact
@@ -998,6 +1000,8 @@ static const char *isl_dyn_unmarshalable(const ScrDyn *d) {
     return "a runtime handle";
   case SCR_DYN_PROMISE:
     return "a promise";
+  case SCR_DYN_PROXY:
+    return "a native Proxy";
   case SCR_DYN_ARR:
     for (size_t i = 0; i < d->v.arr.len; i++) {
       const char *r = isl_dyn_unmarshalable(d->v.arr.items[i]);
@@ -1017,6 +1021,23 @@ static const char *isl_dyn_unmarshalable(const ScrDyn *d) {
 
 static JSValue isl_dynfn_new(const ScrDyn *d); /* the checked-dynamic tree-function shim, below */
 
+static JSValue isl_from_bytes(const ScrBytes *b) {
+  if (b->elem == SCR_BYTES_U8) return JS_NewUint8ArrayCopy(isl_ctx, b->data, b->len);
+  JSValue buf = JS_NewArrayBufferCopy(isl_ctx, b->data, b->len * scr_bytes_elem_size(b->elem));
+  if (JS_IsException(buf)) return buf;
+  JSValueConst argv[3] = {buf, JS_UNDEFINED, JS_UNDEFINED};
+  JSValue v = JS_NewTypedArray(isl_ctx, 3, argv,
+      b->elem == SCR_BYTES_U8C ? JS_TYPED_ARRAY_UINT8C
+      : b->elem == SCR_BYTES_I8 ? JS_TYPED_ARRAY_INT8
+      : b->elem == SCR_BYTES_U16 ? JS_TYPED_ARRAY_UINT16
+      : b->elem == SCR_BYTES_I16 ? JS_TYPED_ARRAY_INT16
+      : b->elem == SCR_BYTES_U32 ? JS_TYPED_ARRAY_UINT32
+      : b->elem == SCR_BYTES_I32 ? JS_TYPED_ARRAY_INT32
+      : b->elem == SCR_BYTES_F64 ? JS_TYPED_ARRAY_FLOAT64 : JS_TYPED_ARRAY_FLOAT32);
+  JS_FreeValue(isl_ctx, buf);
+  return v;
+}
+
 static JSValue isl_from_dyn(const ScrDyn *d) {
   switch (d->kind) {
   case SCR_DYN_FUNC:
@@ -1031,13 +1052,16 @@ static JSValue isl_from_dyn(const ScrDyn *d) {
     return JS_NULL;
   case SCR_DYN_BOOL:
     return JS_NewBool(isl_ctx, d->v.b);
+  case SCR_DYN_BIGINT:
+    return JS_ThrowTypeError(isl_ctx, "native bigint values cannot enter a dynamic island yet");
+  case SCR_DYN_SYMBOL:
+    return JS_ThrowTypeError(isl_ctx, "native symbol values cannot enter a dynamic island yet");
   case SCR_DYN_NUM:
     return JS_NewFloat64(isl_ctx, d->v.num);
   case SCR_DYN_STR:
     return JS_NewStringLen(isl_ctx, d->v.str->data, d->v.str->len);
   case SCR_DYN_BYTES:
-    /* Only u8 payloads reach the checked-dynamic tree today (scr_json.c's stringify note). */
-    return JS_NewUint8ArrayCopy(isl_ctx, d->v.bytes->data, d->v.bytes->len);
+    return isl_from_bytes(d->v.bytes);
   case SCR_DYN_ARR: {
     JSValue arr = JS_NewArray(isl_ctx);
     if (JS_IsException(arr)) return arr;
@@ -1204,7 +1228,11 @@ static ScrDyn *isl_dynjs_call(ScrJsval *cell, ScrDyn *const *args, size_t argc) 
     if (cells != stack_cells) free(cells);
     return NULL;
   }
-  ScrJsval *r = scr_jsval_call(cell, (int)argc, cells);
+  ScrDyn *receiver = scr_dyn_this_get();
+  ScrJsval *receiver_cell = scr_jsval_from_dyn(receiver);
+  scr_dyn_release(receiver);
+  ScrJsval *r = receiver_cell ? scr_jsval_call_this(cell, receiver_cell, (int)argc, cells) : NULL;
+  scr_jsval_release(receiver_cell);
   for (size_t i = 0; i < argc; i++) scr_jsval_release(cells[i]);
   if (cells != stack_cells) free(cells);
   if (!r) return NULL;
@@ -1358,6 +1386,18 @@ static ScrDyn *isl_dynjs_iter_drain(ScrJsval *cell, bool spread, const ScrStr *s
   return out;
 }
 
+static ScrDyn *isl_dynjs_iterator(ScrJsval *cell, const ScrStr *spell, bool array_from) {
+  isl_entry();
+  JSValue s = spell && spell->len ? JS_NewStringLen(isl_ctx, spell->data, spell->len) : JS_UNDEFINED;
+  JSValue argv[3] = {cell->v, s, JS_NewBool(isl_ctx, array_from)};
+  JSValue r = JS_Call(isl_ctx, isl_helpers[ISL_H_ITER], JS_UNDEFINED, 3, argv);
+  JS_FreeValue(isl_ctx, s);
+  if (JS_IsException(r)) { isl_bridge_exception(); return NULL; }
+  ScrDyn *out = isl_dyn_from_value(r);
+  JS_FreeValue(isl_ctx, r);
+  return out;
+}
+
 static const ScrDynJsvalOps isl_dynjs_ops = {
   isl_dynjs_release,
   isl_dynjs_typeof,
@@ -1376,6 +1416,7 @@ static const ScrDynJsvalOps isl_dynjs_ops = {
   isl_dynjs_assign,
   isl_dynjs_to_json,
   isl_dynjs_iter_drain,
+  isl_dynjs_iterator,
 };
 
 ScrDyn *scr_dyn_from_jsval(ScrJsval *cell) {
@@ -9730,29 +9771,7 @@ ScrJsval *scr_jsval_null(void) {
 
 ScrJsval *scr_jsval_from_bytes(const ScrBytes *b) {
   isl_entry();
-  if (b->elem == SCR_BYTES_U8) {
-    JSValue v = JS_NewUint8ArrayCopy(isl_ctx, b->data, b->len);
-    if (JS_IsException(v)) {
-      isl_bridge_exception();
-      return NULL;
-    }
-    return isl_cell_new(v);
-  }
-  JSValue buf = JS_NewArrayBufferCopy(isl_ctx, b->data,
-                                      b->len * scr_bytes_elem_size(b->elem));
-  if (JS_IsException(buf)) {
-    isl_bridge_exception();
-    return NULL;
-  }
-  /* The engine's constructor reads the offset/length slots unconditionally
-   * — pad them with undefined like a real JS call would. */
-  JSValueConst argv[3] = {buf, JS_UNDEFINED, JS_UNDEFINED};
-  JSValue v = JS_NewTypedArray(isl_ctx, 3, argv,
-                               b->elem == SCR_BYTES_U32   ? JS_TYPED_ARRAY_UINT32
-                               : b->elem == SCR_BYTES_I32 ? JS_TYPED_ARRAY_INT32
-                               : b->elem == SCR_BYTES_F64 ? JS_TYPED_ARRAY_FLOAT64
-                                                          : JS_TYPED_ARRAY_FLOAT32);
-  JS_FreeValue(isl_ctx, buf);
+  JSValue v = isl_from_bytes(b);
   if (JS_IsException(v)) {
     isl_bridge_exception();
     return NULL;

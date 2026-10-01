@@ -18,11 +18,11 @@
  * skips only when it already FIRED — mid-emit removal of a not-yet-run
  * once listener does not skip it, matching the wrapper's `fired` check.
  *
- * Literal-name dispatch is C-variadic: the emit call site passes the event tuple as
- * typed C values, and each listener invokes through a compiler-EMITTED
- * adapter `void inv(ScrClosure *cb, va_list ap)` that va_args exactly the
- * listener's own parameter prefix, retains the +1 the callee owns per the
- * universal convention, and calls cb->fn. The frontend's per-event tuple
+ * Literal-name dispatch is C-variadic: LLVM emit sites pass borrowed
+ * pointers, with scalars stored in call-lived stack slots. A runtime shim
+ * reads the listener's parameter prefix and hands it to the emitted
+ * adapter, which loads scalars, retains the references the callee owns,
+ * and calls the original closure. The frontend's per-event tuple
  * unification is what makes every adapter's reads agree with every emit
  * site's writes. Internal (meta-event) emits reuse the same variadic
  * entry, passing the event NAME as the one argument — meta listeners are
@@ -441,6 +441,17 @@ void scr_ee_inv_fixed4(ScrClosure *cb, va_list ap) {
   ((void (*)(ScrClosure *, void *, void *, void *, void *))cb->fn)(cb, a0, a1, a2, a3);
 }
 
+void scr_ee_inv_args(ScrClosure *cb, va_list ap) {
+  va_list cursor;
+  va_copy(cursor, ap);
+  ((void (*)(ScrClosure *, void *))cb->fn)(cb, &cursor);
+  va_end(cursor);
+}
+
+void *scr_ee_arg_next(void *cursor) {
+  return va_arg(*(va_list *)cursor, void *);
+}
+
 /* Removes one entry (by index) from a bucket's live list and fires the
  * 'removeListener' meta event AFTER the removal, Node's order. Drops the
  * bucket when emptied — except in shape mode, where the emptied name
@@ -717,6 +728,17 @@ double scr_emitter_listener_count_fn(ScrEmitter *em, ScrStr *name, ScrClosure *f
     if (scr_ee_entry_fn(b->ls[i]) == fn) count++;
   }
   return (double)count;
+}
+
+/* A checked-dynamic filter must compare the original closure, never a
+ * newly built call adapter. Node treats a nullish filter as omitted;
+ * other non-functions cannot match a registered listener. All borrowed. */
+double scr_emitter_listener_count_dyn(ScrEmitter *em, ScrStr *name, const ScrDyn *fn) {
+  if (fn->kind == SCR_DYN_NULL || fn->kind == SCR_DYN_UNDEF)
+    return scr_emitter_listener_count(em, name);
+  return fn->kind == SCR_DYN_FUNC
+    ? scr_emitter_listener_count_fn(em, name, fn->v.fn.clo)
+    : 0;
 }
 
 /* eventNames(): +1 string[] of the bucket names in first-registration

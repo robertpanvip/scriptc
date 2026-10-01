@@ -56,6 +56,37 @@ ScrSym *scr_sym_new(ScrStr *desc) {
 /* ── the Symbol.for global registry ──────────────────────────────────── */
 
 static SCR_TL ScrSym *g_sym_registry = NULL;
+static SCR_TL ScrSym *g_sym_well_known = NULL;
+
+static void scr_sym_well_known_cleanup(void) {
+  while (g_sym_well_known) {
+    ScrSym *symbol = g_sym_well_known;
+    g_sym_well_known = symbol->reg_next;
+    scr_sym_release(symbol);
+  }
+}
+
+ScrSym *scr_sym_well_known(ScrStr *name) {
+  ScrStr *prefix = scr_str_new("Symbol.", 7);
+  ScrStr *description = scr_str_concat(prefix, name);
+  scr_str_release(prefix);
+  for (ScrSym *symbol = g_sym_well_known; symbol; symbol = symbol->reg_next) {
+    if (!scr_str_eq(description, symbol->desc)) continue;
+    scr_str_release(description);
+    return scr_sym_retain(symbol);
+  }
+  if (!g_sym_well_known) scr_atexit(scr_sym_well_known_cleanup);
+  ScrSym *symbol = scr_sym_new(description);
+  scr_str_release(description);
+  symbol->reg_next = g_sym_well_known;
+  g_sym_well_known = scr_sym_retain(symbol);
+  if (name->len == 8 && !memcmp(name->data, "iterator", 8)) {
+    ScrDyn *key = scr_dyn_new_symbol(symbol);
+    scr_dyn_install_iterator_symbol(key);
+    scr_dyn_release(key);
+  }
+  return symbol;
+}
 
 static void scr_sym_registry_cleanup(void) {
   ScrSym *s = g_sym_registry;
@@ -85,6 +116,10 @@ ScrSym *scr_sym_for(ScrStr *key) {
 ScrStr *scr_sym_desc(ScrSym *s) { return s->desc ? scr_str_retain(s->desc) : NULL; }
 
 ScrStr *scr_sym_key_for(ScrSym *s) { return s->reg_key ? scr_str_retain(s->reg_key) : NULL; }
+
+ScrDyn *scr_dyn_new_symbol(ScrSym *value) {
+  return scr_dyn_symbol_ref(scr_sym_retain(value), scr_sym_release, scr_sym_to_string, scr_sym_desc);
+}
 
 ScrStr *scr_sym_to_string(ScrSym *s) {
   /* "Symbol(desc)" — Symbol.prototype.toString: an absent description
@@ -128,4 +163,72 @@ void scr_assert_eq_sym(ScrSym *a, ScrSym *b, bool negated, bool deep,
                      msg, has_msg);
   scr_str_release(ia);
   scr_str_release(ib);
+}
+
+/* Symbol-keyed globals share the symbol unit's link gate. The always-linked
+ * JSON unit must not depend on optional symbol retain/release functions. */
+typedef struct ScrGlobalSymbolProperty {
+  ScrSym *key;
+  ScrDyn *value;
+  struct ScrGlobalSymbolProperty *next;
+} ScrGlobalSymbolProperty;
+
+static SCR_TL ScrGlobalSymbolProperty *scr_global_symbols = NULL;
+static SCR_TL bool scr_global_symbols_cleanup_registered = false;
+
+static void scr_global_symbols_cleanup(void) {
+  while (scr_global_symbols) {
+    ScrGlobalSymbolProperty *entry = scr_global_symbols;
+    scr_global_symbols = entry->next;
+    scr_sym_release(entry->key);
+    scr_dyn_release(entry->value);
+    free(entry);
+  }
+}
+
+ScrDyn *scr_dyn_global_symbol_get(ScrSym *key) {
+  for (ScrGlobalSymbolProperty *entry = scr_global_symbols; entry; entry = entry->next) {
+    if (entry->key == key) return scr_dyn_retain(entry->value);
+  }
+  return scr_dyn_retain(scr_dyn_undefined());
+}
+
+void scr_dyn_global_symbol_set(ScrSym *key, ScrDyn *value) {
+  for (ScrGlobalSymbolProperty *entry = scr_global_symbols; entry; entry = entry->next) {
+    if (entry->key != key) continue;
+    ScrDyn *previous = entry->value;
+    entry->value = scr_dyn_retain(value);
+    scr_dyn_release(previous);
+    return;
+  }
+  if (!scr_global_symbols_cleanup_registered) {
+    scr_atexit(scr_global_symbols_cleanup);
+    scr_global_symbols_cleanup_registered = true;
+  }
+  ScrGlobalSymbolProperty *entry = malloc(sizeof *entry);
+  if (!entry) scr_trap("scriptc: out of memory\n");
+  entry->key = scr_sym_retain(key);
+  entry->value = scr_dyn_retain(value);
+  entry->next = scr_global_symbols;
+  scr_global_symbols = entry;
+}
+
+bool scr_dyn_global_symbol_has(ScrSym *key) {
+  for (ScrGlobalSymbolProperty *entry = scr_global_symbols; entry; entry = entry->next) {
+    if (entry->key == key) return true;
+  }
+  return false;
+}
+
+void scr_dyn_global_symbol_delete(ScrSym *key) {
+  ScrGlobalSymbolProperty **slot = &scr_global_symbols;
+  while (*slot) {
+    ScrGlobalSymbolProperty *entry = *slot;
+    if (entry->key != key) { slot = &entry->next; continue; }
+    *slot = entry->next;
+    scr_sym_release(entry->key);
+    scr_dyn_release(entry->value);
+    free(entry);
+    return;
+  }
 }

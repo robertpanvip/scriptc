@@ -53,6 +53,25 @@
 #include <lmcons.h>  /* UNLEN for GetUserNameA */
 #include "scr_win_stats.h"
 
+static WCHAR *scr_fs_win_wide(const ScrStr *path);
+static int scr_fs_win_errno(DWORD error);
+
+static ScrStr *scr_fs_win_utf8(const WCHAR *text, size_t length) {
+  if (length > INT_MAX) { SetLastError(ERROR_FILENAME_EXCED_RANGE); return NULL; }
+  int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, (int)length, NULL, 0, NULL, NULL);
+  if (size <= 0) return length == 0 ? scr_str_new("", 0) : NULL;
+  char *bytes = malloc((size_t)size);
+  if (!bytes) scr_trap("scriptc: out of memory\n");
+  if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, (int)length, bytes, size, NULL, NULL) != size) {
+    DWORD error = GetLastError();
+    free(bytes);
+    SetLastError(error);
+    return NULL;
+  }
+  ScrStr *result = scr_str_new(bytes, (size_t)size);
+  free(bytes);
+  return result;
+}
 
 /* The CRT has no symlink view, so its internal lstat users degrade to stat.
  * The public Stats path below bypasses this seam and opens the final component
@@ -107,6 +126,9 @@ extern char **environ; /* env snapshot (scr_env_pairs) */
 static SCR_TL int scr_lib_argc = 0;
 static SCR_TL char **scr_lib_argv = NULL;
 static SCR_TL char **scr_lib_argv_owned = NULL;
+#if defined(_WIN32) && !defined(SCR_LIB)
+static SCR_TL char *scr_lib_argv_utf8 = NULL;
+#endif
 static SCR_TL bool scr_lib_has_fork = false;
 static SCR_TL double scr_lib_fork_target_id = -1;
 static SCR_TL uintptr_t scr_lib_fork_read_handle = 0;
@@ -163,6 +185,10 @@ static void scr_lib_cleanup(void) {
   scr_argv_arr = NULL;
   free(scr_lib_argv_owned);
   scr_lib_argv_owned = NULL;
+#if defined(_WIN32) && !defined(SCR_LIB)
+  free(scr_lib_argv_utf8);
+  scr_lib_argv_utf8 = NULL;
+#endif
   scr_lib_argc = 0;
   scr_lib_argv = NULL;
   scr_lib_has_fork = false;
@@ -210,6 +236,65 @@ static bool scr_lib_same_executable_arg(const char *a, const char *b) {
 #endif
 }
 
+#if defined(_WIN32) && !defined(SCR_LIB)
+/* C main's narrow argv has already lost characters outside the active ANSI
+ * code page. Recover the original Unicode command line before publishing
+ * process.argv to either execution tier. Keep this lazy: programs that do
+ * not read arguments need no converted strings or shell32 initialization.
+ * Load the documented OS parser from System32 without adding an executable-
+ * only shell dependency to the embedding runtime's link contract. */
+static void scr_lib_prepare_utf8_argv(void) {
+  if (scr_lib_argv == NULL || scr_lib_argv_utf8 != NULL) return;
+  HMODULE shell = LoadLibraryExW(L"shell32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  if (shell == NULL) scr_trap("could not load Windows command-line parser");
+  typedef LPWSTR *(WINAPI *ScrParseCommandLine)(LPCWSTR, int *);
+  ScrParseCommandLine parse = (ScrParseCommandLine)(void *)GetProcAddress(shell, "CommandLineToArgvW");
+  if (parse == NULL) {
+    FreeLibrary(shell);
+    scr_trap("Windows command-line parser is unavailable");
+  }
+  int count = 0;
+  LPWSTR *wide = parse(GetCommandLineW(), &count);
+  FreeLibrary(shell);
+  if (wide == NULL || count < 1) scr_trap("could not parse Windows command line");
+  size_t bytes = 0;
+  for (int i = 0; i < count; i++) {
+    int size = WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, NULL, 0, NULL, NULL);
+    if (size == 0 || bytes > SIZE_MAX - (size_t)size) {
+      LocalFree(wide);
+      scr_trap("could not encode Windows argument");
+    }
+    bytes += (size_t)size;
+  }
+  char *text = malloc(bytes);
+  char **args = calloc((size_t)count + 1, sizeof(char *));
+  if (text == NULL || args == NULL) {
+    free(text); free(args); LocalFree(wide);
+    scr_trap("out of memory");
+  }
+  char *next = text;
+  int used = 0;
+  for (int i = 0; i < count; i++) {
+    // scr_lib_init already consumed this private ASCII fork marker. Do not
+    // reintroduce it when replacing the narrow argument storage.
+    if (i == 1 && scr_lib_has_fork) continue;
+    int size = WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, NULL, 0, NULL, NULL);
+    if (size == 0 || WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, next, size, NULL, NULL) != size) {
+      free(text); free(args); LocalFree(wide);
+      scr_trap("could not encode Windows argument");
+    }
+    args[used++] = next;
+    next += size;
+  }
+  LocalFree(wide);
+  free(scr_lib_argv_owned);
+  scr_lib_argv_owned = args;
+  scr_lib_argv_utf8 = text;
+  scr_lib_argv = args;
+  scr_lib_argc = used;
+}
+#endif
+
 /* A child_process call spelling Node's self-reexec shape:
  * spawn(process.execPath, [process.argv[1], ...args]). The parent still
  * knows these two path-like arguments are the executable and script marker,
@@ -217,7 +302,7 @@ static bool scr_lib_same_executable_arg(const char *a, const char *b) {
  * unrelated child's raw user arguments. Library sessions have no argv and
  * always answer false. */
 bool scr_lib_should_collapse_reexec_arg(ScrStr *cmd, ScrArr *args) {
-  if (scr_lib_argv == NULL || scr_lib_argc < 1 || scr_arr_len(args) < 1) return false;
+  if (scr_lib_arg_count() < 1 || scr_arr_len(args) < 1) return false;
   ScrStr *first = (ScrStr *)scr_arr_get_ref(args, 0);
   bool collapse = scr_lib_same_executable_arg(cmd->data, scr_lib_argv[0]) &&
                   scr_lib_same_executable_arg(first->data, scr_lib_argv[0]);
@@ -418,8 +503,18 @@ ScrArr *scr_module_cache_keys(void) {
 /* Raw argv accessors for the island's process shim (scr_island.c): the
  * island's process.argv must match the static world's ["scriptc",
  * argv[0], ...] shape exactly, so both build from the same stash. */
-int scr_lib_arg_count(void) { return scr_lib_argc; }
-const char *scr_lib_arg(int i) { return scr_lib_argv[i]; }
+int scr_lib_arg_count(void) {
+#if defined(_WIN32) && !defined(SCR_LIB)
+  scr_lib_prepare_utf8_argv();
+#endif
+  return scr_lib_argc;
+}
+const char *scr_lib_arg(int i) {
+#if defined(_WIN32) && !defined(SCR_LIB)
+  scr_lib_prepare_utf8_argv();
+#endif
+  return scr_lib_argv[i];
+}
 
 bool scr_lib_fork_info(double *target, uintptr_t *read_handle,
                        uintptr_t *write_handle) {
@@ -521,6 +616,30 @@ ScrStr *scr_process_versions_openssl(void) {
 #endif
   }
   return scr_str_retain(scr_versions_openssl_str);
+}
+
+static SCR_TL ScrDyn *scr_versions_object;
+
+static void scr_versions_object_cleanup(void) {
+  scr_dyn_release(scr_versions_object);
+  scr_versions_object = NULL;
+}
+
+ScrDyn *scr_process_versions(void) {
+  if (!scr_versions_object) {
+    scr_versions_object = scr_dyn_new_obj();
+    ScrStr *node = scr_process_versions_node();
+    ScrStr *openssl = scr_process_versions_openssl();
+    scr_dyn_obj_set(scr_versions_object, "node", 4, scr_dyn_new_str(node));
+    scr_dyn_obj_set(scr_versions_object, "openssl", 7, scr_dyn_new_str(openssl));
+    scr_str_release(node);
+    scr_str_release(openssl);
+    for (size_t i = 0; i < scr_versions_object->v.obj.len; i++) {
+      scr_versions_object->v.obj.entries[i].writable = false;
+    }
+    scr_atexit(&scr_versions_object_cleanup);
+  }
+  return scr_dyn_retain(scr_versions_object);
 }
 
 /* process.execPath — the running binary's own resolved absolute path,
@@ -731,7 +850,7 @@ static int scr_signal_by_name(const char *name) {
 /* The table above for other units (scr_child.c's child.kill shares Node's
  * one signal-name story): the resolved number, or -1 for unknown names. */
 int scr_signal_from_name(const ScrStr *signal) {
-  return scr_signal_by_name(signal->data);
+  return strlen(signal->data) == signal->len ? scr_signal_by_name(signal->data) : -1;
 }
 
 /* The reverse walk, for spawnSync's result.signal: the FIRST name with
@@ -885,11 +1004,23 @@ bool scr_process_kill_named(double pid, const ScrStr *signal) {
 }
 
 ScrStr *scr_process_cwd(void) {
+#ifdef _WIN32
+  DWORD size = GetCurrentDirectoryW(0, NULL);
+  if (!size) scr_trap("scriptc: process.cwd() failed\n");
+  WCHAR *wide = malloc((size_t)size * sizeof *wide);
+  if (!wide) scr_trap("scriptc: out of memory\n");
+  DWORD length = GetCurrentDirectoryW(size, wide);
+  ScrStr *result = length > 0 && length < size ? scr_fs_win_utf8(wide, length) : NULL;
+  free(wide);
+  if (!result) scr_trap("scriptc: process.cwd() failed\n");
+  return result;
+#else
   char buf[4096];
   if (!getcwd(buf, sizeof buf)) {
     scr_trap("scriptc: process.cwd() failed\n");
   }
   return scr_str_new(buf, strlen(buf));
+#endif
 }
 
 /* The raw byte writes use the SAME stdio stream as console, and each call
@@ -898,13 +1029,11 @@ ScrStr *scr_process_cwd(void) {
  * — this synchronous runtime has no queued backpressure, so it is constantly
  * true. */
 bool scr_process_stdout_write(const ScrStr *data) {
-  scr_stdio_write(1, data->data, data->len);
-  return true;
+  return scr_stdio_write(1, data->data, data->len);
 }
 
 bool scr_process_stderr_write(const ScrStr *data) {
-  scr_stdio_write(2, data->data, data->len);
-  return true;
+  return scr_stdio_write(2, data->data, data->len);
 }
 
 /* The FIRST-CLASS stream write (`output.write(line)` where output is a
@@ -1489,6 +1618,21 @@ double scr_perf_now(void) {
   return scr_uptime_now_ms() - scr_uptime_t0_ms;
 }
 
+uint64_t scr_hrtime_ns(void) {
+#ifdef _WIN32
+  LARGE_INTEGER counter, frequency;
+  QueryPerformanceCounter(&counter);
+  QueryPerformanceFrequency(&frequency);
+  uint64_t whole = (uint64_t)(counter.QuadPart / frequency.QuadPart);
+  uint64_t remainder = (uint64_t)(counter.QuadPart % frequency.QuadPart);
+  return whole * UINT64_C(1000000000) + remainder * UINT64_C(1000000000) / (uint64_t)frequency.QuadPart;
+#else
+  struct timespec time;
+  clock_gettime(CLOCK_MONOTONIC, &time);
+  return (uint64_t)time.tv_sec * UINT64_C(1000000000) + (uint64_t)time.tv_nsec;
+#endif
+}
+
 #ifdef _WIN32
 /* GetProcessTimes/GetThreadTimes answer 100ns units; Node reports µs. */
 static double scr_filetime_us(FILETIME ft) {
@@ -1739,7 +1883,11 @@ double scr_process_umask(double mask) {
 
 void scr_process_chdir(ScrStr *dir) {
 #ifdef _WIN32
-  if (_chdir(dir->data) != 0) scr_fs_throw(errno, "chdir", dir);
+  WCHAR *wide = scr_fs_win_wide(dir);
+  BOOL changed = wide && SetCurrentDirectoryW(wide);
+  DWORD error = changed ? ERROR_SUCCESS : GetLastError();
+  free(wide);
+  if (!changed) scr_fs_throw(scr_fs_win_errno(error), "chdir", dir);
 #else
   if (chdir(dir->data) != 0) scr_fs_throw(errno, "chdir", dir);
 #endif
@@ -1889,8 +2037,26 @@ void scr_fs_throw(int e, const char *op, const ScrStr *path) {
 
 /* ── fs operations ───────────────────────────────────────────────────── */
 
+static FILE *scr_fs_fopen(const ScrStr *path, const char *mode) {
+#ifdef _WIN32
+  WCHAR *wide = scr_fs_win_wide(path);
+  if (!wide) { errno = scr_fs_win_errno(GetLastError()); return NULL; }
+  WCHAR wide_mode[4] = {0};
+  size_t length = strlen(mode);
+  if (length >= 4) scr_trap("scriptc: invalid internal file mode\n");
+  for (size_t i = 0; i < length; i++) wide_mode[i] = (WCHAR)mode[i];
+  FILE *file = _wfopen(wide, wide_mode);
+  int error = errno;
+  free(wide);
+  errno = error;
+  return file;
+#else
+  return fopen(path->data, mode);
+#endif
+}
+
 ScrStr *scr_fs_read_file(ScrStr *path) {
-  FILE *f = fopen(path->data, "rb");
+  FILE *f = scr_fs_fopen(path, "rb");
   if (!f) {
     scr_fs_throw(errno, "open", path);
     return NULL;
@@ -1925,11 +2091,6 @@ ScrStr *scr_fs_read_file(ScrStr *path) {
   free(buf);
   return s;
 }
-
-#ifdef _WIN32
-static WCHAR *scr_fs_win_wide(const ScrStr *path);
-static int scr_fs_win_errno(DWORD error);
-#endif
 
 static ScrStr *scr_fs_realpath_common(ScrStr *path, const char *op) {
 #ifdef _WIN32
@@ -2015,7 +2176,7 @@ ScrStr *scr_fs_realpath_promise(ScrStr *path) {
 }
 
 static void scr_fs_write_common(ScrStr *path, ScrStr *data, const char *mode) {
-  FILE *f = fopen(path->data, mode);
+  FILE *f = scr_fs_fopen(path, mode);
   if (!f) {
     scr_fs_throw(errno, "open", path);
     return;
@@ -2825,6 +2986,8 @@ void scr_fs_rename(ScrStr *oldpath, ScrStr *newpath) {
   if (error != 0) scr_fs_rename_error(error, oldpath, newpath);
 }
 
+static int scr_rm_unlink(const char *path, size_t len);
+
 void scr_fs_rm(ScrStr *path) {
   /* Node's rmSync: lstat first (a missing path reports the lstat syscall),
    * refuse directories (Node requires `recursive`, which the scriptc
@@ -2839,7 +3002,7 @@ void scr_fs_rm(ScrStr *path) {
     scr_fs_throw(EISDIR, "rm", path);
     return;
   }
-  if (unlink(path->data) != 0) scr_fs_throw(errno, "unlink", path);
+  if (scr_rm_unlink(path->data, path->len) != 0) scr_fs_throw(errno, "unlink", path);
 }
 
 void scr_fs_rmdir(ScrStr *path) {
@@ -2948,6 +3111,35 @@ static void scr_rm_fail_set(ScrRmFail *f, int err, const char *op, const char *p
   f->path = scr_str_new(path, len);
 }
 
+static int scr_rm_unlink(const char *path, size_t len) {
+  if (unlink(path) == 0) return 0;
+#ifdef _WIN32
+  /* Node's Windows removal clears a file's read-only attribute before
+   * retrying. Private staged runtime objects intentionally use mode 0400. */
+  const int original = errno;
+  if (original != EACCES && original != EPERM) return -1;
+  ScrStr *text = scr_str_new(path, len);
+  WCHAR *wide = scr_fs_win_wide(text);
+  scr_str_release(text);
+  if (!wide) { errno = original; return -1; }
+  const DWORD attributes = GetFileAttributesW(wide);
+  if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY) &&
+      SetFileAttributesW(wide, attributes & ~FILE_ATTRIBUTE_READONLY)) {
+    if (DeleteFileW(wide)) { free(wide); return 0; }
+    const DWORD error = GetLastError();
+    SetFileAttributesW(wide, attributes);
+    free(wide);
+    errno = scr_fs_win_errno(error);
+    return -1;
+  }
+  free(wide);
+  errno = original;
+#else
+  (void)len;
+#endif
+  return -1;
+}
+
 /* Post-order tree removal for rmSync's recursive form. Stops at (and
  * records) the first failure, with the failing path and syscall name. */
 static void scr_rm_tree_e(const char *path, size_t len, ScrRmFail *f) {
@@ -2957,7 +3149,7 @@ static void scr_rm_tree_e(const char *path, size_t len, ScrRmFail *f) {
     return;
   }
   if (!S_ISDIR(st.st_mode)) {
-    if (unlink(path) != 0) scr_rm_fail_set(f, errno, "unlink", path, len);
+    if (scr_rm_unlink(path, len) != 0) scr_rm_fail_set(f, errno, "unlink", path, len);
     return;
   }
   DIR *d = opendir(path);
@@ -3007,7 +3199,7 @@ static void scr_fs_rm_attempt(ScrStr *path, bool recursive, bool force, ScrRmFai
     scr_rm_tree_e(path->data, path->len, f);
     return;
   }
-  if (unlink(path->data) != 0) scr_rm_fail_set(f, errno, "unlink", path->data, path->len);
+  if (scr_rm_unlink(path->data, path->len) != 0) scr_rm_fail_set(f, errno, "unlink", path->data, path->len);
 }
 
 void scr_fs_rm_opts(ScrStr *path, bool recursive, bool force) {
@@ -3709,6 +3901,14 @@ ScrStats *scr_fs_fstat(double fd) {
 }
 
 ScrArr *scr_fs_readdir(ScrStr *path) {
+#ifdef _WIN32
+  ScrScandir *scan = scr_fs_scandir(path);
+  if (!scan) return NULL;
+  ScrArr *arr = scr_arr_new(SCR_ELEM_STR, scr_fs_scandir_count(scan));
+  for (size_t i = 0; i < scr_fs_scandir_count(scan); i++) scr_arr_push_ref(arr, scr_fs_scandir_name(scan, i));
+  scr_fs_scandir_free(scan);
+  return arr;
+#else
   DIR *d = opendir(path->data);
   if (!d) {
     scr_fs_throw(errno, "scandir", path); /* Node reports scandir */
@@ -3722,6 +3922,7 @@ ScrArr *scr_fs_readdir(ScrStr *path) {
   }
   closedir(d);
   return arr; /* OS order, exactly like Node (unsorted) */
+#endif
 }
 
 /* ── the withFileTypes scandir snapshot ──────────────────────────────
@@ -3738,6 +3939,7 @@ struct ScrScandir {
   unsigned char *kinds;
 };
 
+#ifndef _WIN32
 static unsigned char scr_dirent_kind_of_mode(mode_t m) {
   if (S_ISREG(m)) return 1;
   if (S_ISDIR(m)) return 2;
@@ -3752,8 +3954,72 @@ static unsigned char scr_dirent_kind_of_mode(mode_t m) {
   if (S_ISBLK(m)) return 7;
   return 0;
 }
+#endif
+
+#ifdef _WIN32
+static ScrScandir *scr_fs_scandir_windows(ScrStr *path) {
+  WCHAR *wide = scr_fs_win_wide(path);
+  if (!wide) { scr_fs_throw(scr_fs_win_errno(GetLastError()), "scandir", path); return NULL; }
+  DWORD attrs = GetFileAttributesW(wide);
+  if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+    int error = attrs == INVALID_FILE_ATTRIBUTES ? scr_fs_win_errno(GetLastError()) : ENOTDIR;
+    free(wide);
+    scr_fs_throw(error, "scandir", path);
+    return NULL;
+  }
+  size_t length = wcslen(wide);
+  WCHAR *pattern = realloc(wide, (length + 3) * sizeof *wide);
+  if (!pattern) { free(wide); scr_trap("scriptc: out of memory\n"); }
+  if (length && pattern[length - 1] != L'\\' && pattern[length - 1] != L'/') pattern[length++] = L'\\';
+  pattern[length++] = L'*';
+  pattern[length] = 0;
+  WIN32_FIND_DATAW entry;
+  HANDLE search = FindFirstFileW(pattern, &entry);
+  DWORD error = search == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+  free(pattern);
+  if (search == INVALID_HANDLE_VALUE && error != ERROR_FILE_NOT_FOUND) {
+    scr_fs_throw(scr_fs_win_errno(error), "scandir", path);
+    return NULL;
+  }
+  ScrScandir *scan = calloc(1, sizeof *scan);
+  if (!scan) { if (search != INVALID_HANDLE_VALUE) FindClose(search); scr_trap("scriptc: out of memory\n"); }
+  if (search == INVALID_HANDLE_VALUE) return scan;
+  do {
+    if (wcscmp(entry.cFileName, L".") == 0 || wcscmp(entry.cFileName, L"..") == 0) continue;
+    ScrStr *name = scr_fs_win_utf8(entry.cFileName, wcslen(entry.cFileName));
+    if (!name) {
+      error = GetLastError();
+      FindClose(search);
+      scr_fs_scandir_free(scan);
+      scr_fs_throw(scr_fs_win_errno(error), "scandir", path);
+      return NULL;
+    }
+    if (scan->len == scan->cap) {
+      scan->cap = scan->cap ? scan->cap * 2 : 8;
+      scan->names = realloc(scan->names, scan->cap * sizeof *scan->names);
+      scan->kinds = realloc(scan->kinds, scan->cap);
+      if (!scan->names || !scan->kinds) scr_trap("scriptc: out of memory\n");
+    }
+    scan->names[scan->len] = name;
+    scan->kinds[scan->len++] = (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+        scr_stats_is_link_tag(entry.dwReserved0) ? 3 :
+        (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 2 : 1;
+  } while (FindNextFileW(search, &entry));
+  error = GetLastError();
+  FindClose(search);
+  if (error != ERROR_NO_MORE_FILES) {
+    scr_fs_scandir_free(scan);
+    scr_fs_throw(scr_fs_win_errno(error), "scandir", path);
+    return NULL;
+  }
+  return scan;
+}
+#endif
 
 ScrScandir *scr_fs_scandir(ScrStr *path) {
+#ifdef _WIN32
+  return scr_fs_scandir_windows(path);
+#else
   DIR *d = opendir(path->data);
   if (!d) {
     scr_fs_throw(errno, "scandir", path); /* Node reports scandir */
@@ -3818,6 +4084,7 @@ ScrScandir *scr_fs_scandir(ScrStr *path) {
   }
   closedir(d);
   return s;
+#endif
 }
 
 size_t scr_fs_scandir_count(const ScrScandir *s) { return s ? s->len : 0; }
@@ -5140,6 +5407,69 @@ ScrStr *scr_str_from_char_code_bytes(ScrBytes *codes) {
   return scr_str_from_units(codes->len, scr_fcc_bytes_unit, codes);
 }
 
+static double scr_fcp_array_value(void *source, size_t i) {
+  return scr_arr_get_number((ScrArr *)source, (double)i);
+}
+
+static double scr_fcp_bytes_value(void *source, size_t i) {
+  return scr_bytes_get((const ScrBytes *)source, (double)i);
+}
+
+static ScrStr *scr_str_from_points(size_t n, double (*value)(void *, size_t), void *source) {
+  /* Validate before allocating the result. The frontend supplies numeric
+   * elements, so these reads invoke no user conversions. */
+  for (size_t i = 0; i < n; i++) {
+    double point = value(source, i);
+    if (!isfinite(point) || point < 0 || point > 0x10ffff || trunc(point) != point) {
+      char number[64], message[96];
+      size_t len = scr_f64_to_str(point, number);
+      int size = snprintf(message, sizeof message, "Invalid code point %.*s", (int)len, number);
+      scr_throw_error_msg(SCR_ERR_RANGE, message, (size_t)size);
+      return NULL;
+    }
+  }
+  if (n > (SIZE_MAX - 1) / 4) scr_trap("scriptc: out of memory\n");
+  char *out = malloc(n * 4 + 1);
+  if (!out) scr_trap("scriptc: out of memory\n");
+  size_t offset = 0;
+  for (size_t i = 0; i < n; i++) {
+    uint32_t point = (uint32_t)value(source, i);
+    if (point >= 0xd800 && point <= 0xdbff && i + 1 < n) {
+      uint32_t next = (uint32_t)value(source, i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        point = 0x10000 + ((point - 0xd800) << 10) + (next - 0xdc00);
+        i++;
+      }
+    }
+    if (point >= 0xd800 && point <= 0xdfff) point = 0xfffd;
+    if (point < 0x80) out[offset++] = (char)point;
+    else if (point < 0x800) {
+      out[offset++] = (char)(0xc0 | (point >> 6));
+      out[offset++] = (char)(0x80 | (point & 0x3f));
+    } else if (point < 0x10000) {
+      out[offset++] = (char)(0xe0 | (point >> 12));
+      out[offset++] = (char)(0x80 | ((point >> 6) & 0x3f));
+      out[offset++] = (char)(0x80 | (point & 0x3f));
+    } else {
+      out[offset++] = (char)(0xf0 | (point >> 18));
+      out[offset++] = (char)(0x80 | ((point >> 12) & 0x3f));
+      out[offset++] = (char)(0x80 | ((point >> 6) & 0x3f));
+      out[offset++] = (char)(0x80 | (point & 0x3f));
+    }
+  }
+  ScrStr *result = scr_str_new(out, offset);
+  free(out);
+  return result;
+}
+
+ScrStr *scr_str_from_code_point(ScrArr *codes) {
+  return scr_str_from_points(codes->len, scr_fcp_array_value, codes);
+}
+
+ScrStr *scr_str_from_code_point_bytes(ScrBytes *codes) {
+  return scr_str_from_points(codes->len, scr_fcp_bytes_value, codes);
+}
+
 /* ── Date, the read-only value slice ───────────────────────────────────
  * Values are TimeClip'd epoch-millisecond scalars. Identity/mutation are
  * frontend-fenced; construction, storage, getters, and ISO formatting
@@ -5836,69 +6166,12 @@ ScrStr *scr_intl_num_format_en_us(double x) {
   return scr_str_new(out, (size_t)o);
 }
 
-/* Object.is over two numbers — the spec's SameValue on doubles: NaN
- * equals NaN, +0 differs from -0, everything else is ==. */
-bool scr_num_same_value(double a, double b) {
-  if (a != a) return b != b;
-  if (a == 0 && b == 0) return signbit(a) == signbit(b);
-  return a == b;
-}
-
 bool scr_num_is_nan(double x) { return isnan(x) != 0; }
 
 bool scr_num_is_integer(double x) { return isfinite(x) && trunc(x) == x; }
 
 bool scr_num_is_safe_integer(double x) {
   return isfinite(x) && trunc(x) == x && fabs(x) <= 9007199254740991.0;
-}
-
-/* ── bitwise operators ─────────────────────────────────────────────────
- * JS-exact (scr_runtime.h has the contract). ToUint32 is the primitive —
- * ToInt32 and the Int32-typed results are the same 32 bits reinterpreted
- * as two's complement, spelled portably (no implementation-defined
- * narrowing casts, no UB shifts of signed values).
- */
-
-/* The 32 bits as a SIGNED (Int32) JS number. */
-static double scr_bits_as_int32(uint32_t u) {
-  return u >= UINT32_C(0x80000000)
-             ? (double)(int32_t)(u - UINT32_C(0x80000000)) + (double)INT32_MIN
-             : (double)u;
-}
-
-double scr_bit_and(double a, double b) {
-  return scr_bits_as_int32(scr_to_uint32(a) & scr_to_uint32(b));
-}
-
-double scr_bit_or(double a, double b) {
-  return scr_bits_as_int32(scr_to_uint32(a) | scr_to_uint32(b));
-}
-
-double scr_bit_xor(double a, double b) {
-  return scr_bits_as_int32(scr_to_uint32(a) ^ scr_to_uint32(b));
-}
-
-double scr_bit_shl(double a, double b) {
-  return scr_bits_as_int32(scr_to_uint32(a) << (scr_to_uint32(b) & 31u));
-}
-
-double scr_bit_shr(double a, double b) {
-  uint32_t u = scr_to_uint32(a);
-  uint32_t s = scr_to_uint32(b) & 31u;
-  uint32_t r = u >> s;
-  if ((u & UINT32_C(0x80000000)) != 0 && s != 0) {
-    r |= ~(UINT32_C(0xffffffff) >> s); /* arithmetic shift: sign-fill */
-  }
-  return scr_bits_as_int32(r);
-}
-
-double scr_bit_ushr(double a, double b) {
-  /* The one Uint32-typed result: (-1 >>> 0) === 4294967295. */
-  return (double)(scr_to_uint32(a) >> (scr_to_uint32(b) & 31u));
-}
-
-double scr_bit_not(double a) {
-  return scr_bits_as_int32(~scr_to_uint32(a));
 }
 
 /* ── checked catch-binding cast (`e as C`) ────────────────────────────
@@ -5952,4 +6225,80 @@ ScrArr *scr_set_to_arr_ref(const ScrMap *s) {
     scr_arr_push_ref(out, scr_map_iter_key_ref(s, (double)i));
   }
   return out;
+}
+
+/* JS Date storage owns an identity; the typed read-only Date ABI continues
+ * to use milliseconds and explicitly extracts them for native getters. */
+typedef struct { size_t rc; double milliseconds; } ScrNativeDate;
+static void *scr_native_date_retain(void *ptr) { ((ScrNativeDate *)ptr)->rc++; return ptr; }
+static void scr_native_date_release(void *ptr) { if (--((ScrNativeDate *)ptr)->rc == 0) free(ptr); }
+
+bool scr_dyn_native_date_is(const ScrDyn *value) {
+  return value && value->kind == SCR_DYN_HANDLE && value->v.handle.tag == SCR_DYNH_DATE;
+}
+
+double scr_dyn_native_date_value(const ScrDyn *value) {
+  if (!scr_dyn_native_date_is(value)) { scr_dyn_check_fail(NULL, "Date", value); return NAN; }
+  return ((ScrNativeDate *)value->v.handle.ptr)->milliseconds;
+}
+
+static ScrDyn *scr_native_date_invoke(void *ptr, ScrDyn *self, const char *method,
+    ScrDyn *const *args, size_t argc, const char *what) {
+  (void)self; (void)args; (void)argc; (void)what;
+  double ms = ((ScrNativeDate *)ptr)->milliseconds;
+  if (!strcmp(method, "getTime") || !strcmp(method, "valueOf")) return scr_dyn_new_num(ms);
+  if (!strcmp(method, "toISOString") || !strcmp(method, "toJSON")) {
+    if (!strcmp(method, "toJSON") && !isfinite(ms)) return scr_dyn_new_null();
+    ScrStr *text = scr_date_to_iso(ms);
+    if (!text) return NULL;
+    ScrDyn *result = scr_dyn_new_str(text);
+    scr_str_release(text);
+    return result;
+  }
+#define DATE_GET(name, fn) if (!strcmp(method, name)) return scr_dyn_new_num(fn(ms))
+  DATE_GET("getFullYear", scr_date_get_full_year_local);
+  DATE_GET("getUTCFullYear", scr_date_get_full_year_utc);
+  DATE_GET("getMonth", scr_date_get_month_local);
+  DATE_GET("getUTCMonth", scr_date_get_month_utc);
+  DATE_GET("getDate", scr_date_get_date_local);
+  DATE_GET("getUTCDate", scr_date_get_date_utc);
+  DATE_GET("getDay", scr_date_get_day_local);
+  DATE_GET("getUTCDay", scr_date_get_day_utc);
+  DATE_GET("getHours", scr_date_get_hours_local);
+  DATE_GET("getUTCHours", scr_date_get_hours_utc);
+  DATE_GET("getMinutes", scr_date_get_minutes_local);
+  DATE_GET("getUTCMinutes", scr_date_get_minutes_utc);
+  DATE_GET("getSeconds", scr_date_get_seconds_local);
+  DATE_GET("getUTCSeconds", scr_date_get_seconds_utc);
+  DATE_GET("getMilliseconds", scr_date_get_milliseconds);
+  DATE_GET("getUTCMilliseconds", scr_date_get_milliseconds);
+  DATE_GET("getTimezoneOffset", scr_date_get_timezone_offset);
+#undef DATE_GET
+  static const char message[] = "Native Date method has no lowering";
+  scr_throw_error_msg_code(SCR_ERR_ERROR, message, sizeof message - 1, "SC2020");
+  return NULL;
+}
+
+ScrDyn *scr_dyn_native_date_new(const ScrDyn *arguments) {
+  double ms;
+  if (arguments->v.arr.len == 0) ms = scr_date_now();
+  else {
+    ScrDyn *value = arguments->v.arr.items[0];
+    if (scr_dyn_native_date_is(value)) ms = scr_dyn_native_date_value(value);
+    else if (value->kind == SCR_DYN_STR) ms = scr_date_parse_get_time(value->v.str);
+    else if (!scr_dyn_number_coerce_js(value, &ms)) return NULL;
+    ms = scr_date_new_ms(ms);
+  }
+  static const ScrDynHandleOps ops = {
+    "Date", &scr_native_date_retain, &scr_native_date_release, &scr_native_date_invoke,
+    NULL, NULL, NULL, NULL,
+  };
+  scr_dyn_handle_install(SCR_DYNH_DATE, &ops);
+  ScrNativeDate *date = malloc(sizeof *date);
+  if (!date) scr_trap("scriptc: out of memory\n");
+  date->rc = 1;
+  date->milliseconds = ms;
+  ScrDyn *result = scr_dyn_new_handle(date, SCR_DYNH_DATE);
+  scr_native_date_release(date);
+  return result;
 }
